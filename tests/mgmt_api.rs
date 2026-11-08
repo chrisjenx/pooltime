@@ -2124,4 +2124,237 @@ mod mgmt {
         let r = call(&srv, "POST", "/api/v1/models/refresh", None).await;
         assert_eq!(r.status, 503, "{}", r.text());
     }
+
+    // ---- dashboard ----
+
+    const APP_JS: &str = include_str!("../web/app.js");
+    const STYLE_CSS: &str = include_str!("../web/style.css");
+
+    /// Every dashboard response carries the CSP and the referrer/sniffing guards.
+    fn assert_dashboard_headers(r: &HttpResp) {
+        let csp = r.header("content-security-policy").expect("CSP header");
+        assert!(csp.contains("default-src 'self'"), "{csp}");
+        assert!(!csp.contains("unsafe-inline"), "{csp}");
+        assert!(!csp.contains("unsafe-eval"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert_eq!(r.header("referrer-policy"), Some("no-referrer"));
+        assert_eq!(r.header("x-content-type-options"), Some("nosniff"));
+    }
+
+    #[tokio::test]
+    async fn index_served_with_csp_header() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        let r = http_get(srv.addr, "/", &[]).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert!(r.header("content-type").unwrap().starts_with("text/html"));
+        assert_dashboard_headers(&r);
+        // The page depends on the session cookie, so it is never cached.
+        assert_eq!(r.header("cache-control"), Some("no-store"));
+        let html = r.text();
+        assert!(html.contains(r#"<script src="/assets/app.js"#), "{html}");
+        assert!(html.contains(r#"href="/assets/style.css"#), "{html}");
+        // Nothing inline: no script bodies, no style attributes or blocks, no remote URLs.
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(!html.contains("<style"), "{html}");
+        assert!(!html.contains("style="), "{html}");
+        assert!(!html.contains("https://"), "{html}");
+        // Wrong verb: 405 like every other route.
+        let r = http_req(srv.addr, "POST", "/", &[], b"").await;
+        assert_eq!(r.status, 405);
+        // DNS rebinding: a foreign Host never gets the page.
+        let r = http_get(srv.addr, "/", &[("host", "evil.example:80")]).await;
+        assert_eq!(r.status, 403);
+    }
+
+    #[tokio::test]
+    async fn assets_embedded_and_cached() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        for (path, body, mime) in [
+            ("/assets/app.js", APP_JS, "text/javascript"),
+            ("/assets/style.css", STYLE_CSS, "text/css"),
+        ] {
+            let r = http_get(srv.addr, path, &[]).await;
+            assert_eq!(r.status, 200, "{path}");
+            assert!(
+                r.header("content-type").unwrap().starts_with(mime),
+                "{path}"
+            );
+            assert_eq!(r.text(), body, "{path} is the embedded file");
+            assert_dashboard_headers(&r);
+            // ETag revalidation: cached copies are checked every load, so an upgraded binary is
+            // picked up at once and an unchanged one costs a 304.
+            assert_eq!(r.header("cache-control"), Some("no-cache"), "{path}");
+            let etag = r.header("etag").expect("etag").to_string();
+            assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+            let again = http_get(srv.addr, path, &[]).await;
+            assert_eq!(again.header("etag"), Some(etag.as_str()), "stable etag");
+
+            let r = http_get(srv.addr, path, &[("if-none-match", &etag)]).await;
+            assert_eq!(r.status, 304, "{path}");
+            assert!(r.body.is_empty());
+            assert_eq!(r.header("etag"), Some(etag.as_str()));
+            let r = http_get(srv.addr, path, &[("if-none-match", "\"stale\"")]).await;
+            assert_eq!(r.status, 200, "{path}");
+        }
+        assert_ne!(
+            http_get(srv.addr, "/assets/app.js", &[])
+                .await
+                .header("etag"),
+            http_get(srv.addr, "/assets/style.css", &[])
+                .await
+                .header("etag"),
+        );
+        let r = http_get(srv.addr, "/assets/nope.js", &[]).await;
+        assert_eq!(r.status, 404);
+        let r = http_get(srv.addr, "/assets/app.js", &[("host", "evil.example:80")]).await;
+        assert_eq!(r.status, 403);
+    }
+
+    #[tokio::test]
+    async fn query_key_exchanges_for_cookie_and_redirects() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        let r = http_get(srv.addr, &format!("/?k={KEY}"), &[]).await;
+        assert_eq!(r.status, 303, "{}", r.text());
+        // The key leaves the address bar (and history) at once.
+        assert_eq!(r.header("location"), Some("/"));
+        assert_eq!(r.header("cache-control"), Some("no-store"));
+        assert_eq!(r.header("referrer-policy"), Some("no-referrer"));
+        let set = r.header("set-cookie").expect("set-cookie").to_string();
+        assert!(
+            set.starts_with(&format!("{SESSION_COOKIE}={};", session_token(KEY))),
+            "{set}"
+        );
+        assert!(
+            set.contains("HttpOnly") && set.contains("SameSite=Strict"),
+            "{set}"
+        );
+        assert!(!set.contains(KEY), "{set}");
+        assert!(!r.text().contains(KEY));
+
+        // The cookie opens the managing view and authorizes mutations.
+        let pair = set.split(';').next().unwrap().to_string();
+        let r = http_get(srv.addr, "/", &[("cookie", &pair)]).await;
+        assert_eq!(r.status, 200);
+        assert!(r.text().contains(r#"data-mode="manage""#), "{}", r.text());
+        let r = raw(
+            srv.addr,
+            "POST",
+            "/api/v1/tuning",
+            Some(json!({"min_headroom": 0.05})),
+            &[
+                ("cookie", &pair),
+                ("origin", &format!("http://{}", srv.addr)),
+            ],
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+
+        // Percent-encoding is decoded; other parameters do not matter.
+        let r = http_get(srv.addr, &format!("/?x=1&k={KEY}"), &[]).await;
+        assert_eq!(r.status, 303);
+        assert!(r.header("set-cookie").is_some());
+
+        // A foreign Host cannot trade the key for a cookie.
+        let r = http_get(
+            srv.addr,
+            &format!("/?k={KEY}"),
+            &[("host", "evil.example:80")],
+        )
+        .await;
+        assert_eq!(r.status, 403);
+        assert!(r.header("set-cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn index_without_session_is_read_only() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        for path in ["/", "/?k=wrong", "/?k=", "/?k=%zz"] {
+            let r = http_get(srv.addr, path, &[]).await;
+            assert_eq!(r.status, 200, "{path}");
+            assert!(r.header("set-cookie").is_none(), "{path}");
+            let html = r.text();
+            assert!(html.contains(r#"data-mode="read-only""#), "{path}: {html}");
+            assert!(html.contains("pooltime open"), "{path}: hint missing");
+            assert!(!html.contains("wrong"), "the rejected key is not echoed");
+        }
+        // A stale or forged cookie is read-only too.
+        let r = http_get(
+            srv.addr,
+            "/",
+            &[(
+                "cookie",
+                &format!("{SESSION_COOKIE}={}", session_token("other")),
+            )],
+        )
+        .await;
+        assert!(r.text().contains(r#"data-mode="read-only""#));
+        // The bearer key also counts (CLI-style clients).
+        let r = http_get(
+            srv.addr,
+            "/",
+            &[("authorization", &format!("Bearer {KEY}"))],
+        )
+        .await;
+        assert!(r.text().contains(r#"data-mode="manage""#));
+    }
+
+    #[tokio::test]
+    async fn status_reports_profiles_and_storage() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        let v = http_get(srv.addr, "/api/v1/status", &[]).await.json();
+        assert_eq!(v["profiles"], json!([]));
+        assert_eq!(
+            v["storage"]["home"].as_str(),
+            Some(pool.dir.path().to_str().unwrap())
+        );
+        assert!(v["storage"]["db_bytes"].as_u64().unwrap() > 0, "{v}");
+        assert!(v["storage"]["logs_bytes"].as_u64().is_some(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn fixture_state_replaces_status() {
+        let raw_fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/fixtures/dashboard.json"
+        ))
+        .unwrap();
+        let fixture: Value = serde_json::from_str(&raw_fixture).unwrap();
+        // The fixture covers every status word, and a dead account still carrying a stale
+        // snapshot (the dashboard must show "—" for it, not leftover headroom).
+        let accounts = fixture["accounts"].as_array().unwrap();
+        for word in [
+            "ready",
+            "needs_login",
+            "rate_limited",
+            "billing",
+            "access_denied",
+        ] {
+            assert!(accounts.iter().any(|a| a["status"] == word), "{word}");
+        }
+        assert!(accounts
+            .iter()
+            .any(|a| a["status"] == "needs_login" && !a["windows"].as_array().unwrap().is_empty()));
+
+        let pool = Pool::new();
+        let srv = pool
+            .boot(Boot {
+                fixture_state: Some(fixture.clone()),
+                ..Boot::default()
+            })
+            .await;
+        let r = http_get(srv.addr, "/api/v1/status", &[]).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(r.json(), fixture);
+        assert_eq!(r.header("cache-control"), Some("no-store"));
+        // Without the hook the live state is served.
+        let live = Pool::new();
+        let srv = live.boot(Boot::default()).await;
+        let v = http_get(srv.addr, "/api/v1/status", &[]).await.json();
+        assert_eq!(v["accounts"][0]["id"], "work");
+    }
 }

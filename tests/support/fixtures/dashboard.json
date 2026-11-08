@@ -1,0 +1,187 @@
+{
+  "accounts": [
+    {
+      "id": "personal",
+      "provider": "anthropic",
+      "status": "ready",
+      "status_since": "2026-11-05T08:30:00Z",
+      "reason": null,
+      "until": null,
+      "priority": 10,
+      "weight": 2.0,
+      "weight_override": { "weight": 5.0, "until": "2026-11-08T00:00:00Z" },
+      "effective_weight": 5.0,
+      "windows": [
+        { "key": "5h", "model": null, "utilization": 0.25, "reset": "2026-11-07T15:00:00Z" },
+        { "key": "7d", "model": null, "utilization": 0.37, "reset": "2026-11-12T09:00:00Z" },
+        { "key": "7d-fable", "model": "fable", "utilization": 0.9, "reset": "2026-11-12T09:00:00Z" }
+      ],
+      "seven_day_left": 0.63,
+      "expires_at": "2026-11-07T18:00:00Z",
+      "refresh_expires_at": "2026-12-01T00:00:00Z",
+      "identity": { "email": "personal@example.com" },
+      "in_flight": 2,
+      "sessions": 3,
+      "last_error": null
+    },
+    {
+      "id": "team-1",
+      "provider": "anthropic",
+      "status": "ready",
+      "status_since": "2026-11-06T10:00:00Z",
+      "reason": null,
+      "until": null,
+      "priority": 100,
+      "weight": 1.0,
+      "weight_override": null,
+      "effective_weight": 1.0,
+      "windows": [
+        { "key": "5h", "model": null, "utilization": 0.05, "reset": "2026-11-07T16:30:00Z" },
+        { "key": "7d", "model": null, "utilization": 0.12, "reset": "2026-11-10T21:00:00Z" }
+      ],
+      "seven_day_left": 0.88,
+      "expires_at": "2026-11-07T19:00:00Z",
+      "refresh_expires_at": "2026-11-09T06:00:00Z",
+      "identity": { "email": "team1@example.com" },
+      "in_flight": 0,
+      "sessions": 1,
+      "last_error": null
+    },
+    {
+      "id": "team-2",
+      "provider": "anthropic",
+      "status": "rate_limited",
+      "status_since": "2026-11-07T11:58:00Z",
+      "reason": "quota:5h",
+      "until": "2026-11-07T15:00:00Z",
+      "priority": 100,
+      "weight": 1.0,
+      "weight_override": null,
+      "effective_weight": 1.0,
+      "windows": [
+        { "key": "5h", "model": null, "utilization": 1.0, "reset": "2026-11-07T15:00:00Z" },
+        { "key": "7d", "model": null, "utilization": 0.9, "reset": "2026-11-12T09:00:00Z" }
+      ],
+      "seven_day_left": 0.1,
+      "expires_at": "2026-11-07T18:00:00Z",
+      "refresh_expires_at": "2026-12-01T00:00:00Z",
+      "identity": { "email": "team2@example.com" },
+      "in_flight": 0,
+      "sessions": 0,
+      "last_error": { "at": "2026-11-07T11:58:00Z", "reason": "quota" }
+    },
+    {
+      "id": "old-laptop",
+      "provider": "anthropic",
+      "status": "needs_login",
+      "status_since": "2026-11-06T00:00:00Z",
+      "reason": "refresh_token_dead",
+      "until": null,
+      "priority": 100,
+      "weight": 1.0,
+      "weight_override": null,
+      "effective_weight": 1.0,
+      "windows": [
+        { "key": "5h", "model": null, "utilization": 0.0, "reset": null },
+        { "key": "7d", "model": null, "utilization": 0.0, "reset": "2026-11-03T09:00:00Z" }
+      ],
+      "seven_day_left": null,
+      "expires_at": "2026-11-05T18:00:00Z",
+      "refresh_expires_at": "2026-11-06T00:00:00Z",
+      "identity": { "email": "old@example.com" },
+      "in_flight": 0,
+      "sessions": 0,
+      "last_error": { "at": "2026-11-06T00:00:00Z", "reason": "invalid_grant" }
+    },
+    {
+      "id": "spare",
+      "provider": "anthropic",
+      "status": "needs_login",
+      "status_since": "2026-11-07T09:00:00Z",
+      "reason": "never_logged_in",
+      "until": null,
+      "priority": 100,
+      "weight": 1.0,
+      "weight_override": null,
+      "effective_weight": 1.0,
+      "windows": [],
+      "seven_day_left": null,
+      "expires_at": null,
+      "refresh_expires_at": null,
+      "identity": { "email": null },
+      "in_flight": 0,
+      "sessions": 0,
+      "last_error": null
+    },
+    {
+      "id": "lapsed",
+      "provider": "anthropic",
+      "status": "billing",
+      "status_since": "2026-11-04T12:00:00Z",
+      "reason": "billing",
+      "until": null,
+      "priority": 100,
+      "weight": 1.0,
+      "weight_override": null,
+      "effective_weight": 1.0,
+      "windows": [],
+      "seven_day_left": null,
+      "expires_at": "2026-11-07T20:00:00Z",
+      "refresh_expires_at": "2026-12-03T00:00:00Z",
+      "identity": { "email": "lapsed@example.com" },
+      "in_flight": 0,
+      "sessions": 0,
+      "last_error": { "at": "2026-11-04T12:00:00Z", "reason": "billing" }
+    },
+    {
+      "id": "org-seat",
+      "provider": "anthropic",
+      "status": "access_denied",
+      "status_since": "2026-11-07T11:00:00Z",
+      "reason": "access_denied",
+      "until": "2026-11-07T13:00:00Z",
+      "priority": 200,
+      "weight": 0.5,
+      "weight_override": null,
+      "effective_weight": 0.5,
+      "windows": [
+        { "key": "7d", "model": null, "utilization": 0.4, "reset": "2026-11-11T00:00:00Z" }
+      ],
+      "seven_day_left": 0.6,
+      "expires_at": "2026-11-07T17:00:00Z",
+      "refresh_expires_at": "2026-11-28T00:00:00Z",
+      "identity": { "email": "seat@example.org" },
+      "in_flight": 0,
+      "sessions": 0,
+      "last_error": { "at": "2026-11-07T11:00:00Z", "reason": "access_denied" }
+    }
+  ],
+  "pool": {
+    "seven_day_left_total": 2.21,
+    "accounts": 7,
+    "available": 2
+  },
+  "tuning": {
+    "five_hour_exp": 1.0,
+    "min_headroom": 0.1,
+    "headroom_taper_start": 0.2
+  },
+  "mapping": {
+    "enabled": true,
+    "mappings": [
+      { "from": "fable", "to": "gpt-6-astra", "effort": { "high": "xhigh" } },
+      { "from": "haiku", "to": "gpt-6-mini" }
+    ]
+  },
+  "profiles": [
+    { "id": "default", "settings_dir": "/Users/example/.claude" },
+    { "id": "claude-personal", "settings_dir": "/Users/example/.claude-personal" }
+  ],
+  "storage": {
+    "home": "/Users/example/.pooltime",
+    "db_bytes": 18874368,
+    "logs_bytes": 4194304
+  },
+  "version": "0.1.0",
+  "now": "2026-11-07T12:00:00Z"
+}
