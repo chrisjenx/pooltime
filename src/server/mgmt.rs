@@ -61,7 +61,7 @@ use crate::providers::anthropic::anthropic_error;
 use crate::providers::ProviderId;
 use crate::routing::Tuning;
 use crate::signin::claude::ClaudeSignIn;
-use crate::signin::openai::OpenAiSignIn;
+use crate::signin::openai::{ActiveSignIn, CallbackPortsBusy, OpenAiSignIn};
 use crate::signin::{
     PendingSignIn, SignInFlow, SignInHandle, SignInMode, SignInResult, SubmitError,
 };
@@ -1322,6 +1322,8 @@ async fn models_refresh(State(app): State<Arc<AppState>>) -> Response {
 #[derive(Default)]
 pub struct SignIns {
     inner: Arc<Mutex<HashMap<String, SignInEntry>>>,
+    /// The pending ChatGPT sign-in, superseded by the next one.
+    openai: ActiveSignIn,
 }
 
 struct SignInEntry {
@@ -1477,21 +1479,28 @@ async fn login(
             Err(r) => return r,
         }
     }
-    let flow: Box<dyn SignInFlow> = match provider {
-        ProviderId::Anthropic => Box::new(ClaudeSignIn::new(
+    let started = match provider {
+        ProviderId::Anthropic => ClaudeSignIn::new(
             app.cfg.anthropic.clone(),
             app.registry.clone(),
             app.state.clone(),
             app.upstream.clone(),
-        )),
-        ProviderId::OpenAi => Box::new(OpenAiSignIn::new(
-            app.cfg.openai.clone(),
-            app.registry.clone(),
-            app.state.clone(),
-            app.upstream.clone(),
-        )),
+        )
+        .start(&id, hint.as_deref(), mode),
+        // One pending ChatGPT sign-in at a time (fixed callback ports): a new one supersedes it.
+        ProviderId::OpenAi => {
+            OpenAiSignIn::new(
+                app.cfg.openai.clone(),
+                app.registry.clone(),
+                app.state.clone(),
+                app.upstream.clone(),
+            )
+            .with_active(app.signins.openai.clone())
+            .start_superseding(&id, hint.as_deref(), mode)
+            .await
+        }
     };
-    match flow.start(&id, hint.as_deref(), mode) {
+    match started {
         Ok(pending) => {
             let out = json!({
                 "signin_id": pending.id,
@@ -1507,6 +1516,9 @@ async fn login(
             if created {
                 let (a, rid) = (app.clone(), id.clone());
                 let _ = blocking(move || a.registry.remove(&rid)).await;
+            }
+            if let Some(busy) = e.downcast_ref::<CallbackPortsBusy>() {
+                return anthropic_error(409, "invalid_request_error", &busy.to_string());
             }
             internal(&format!("could not start sign-in: {e:#}"))
         }

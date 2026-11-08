@@ -170,7 +170,16 @@ pub async fn run(paths: &Paths, cmd: AccountsCmd) -> anyhow::Result<i32> {
                 }
                 Some(p) => Some(codex_auth_json_import(&codex_auth_path(p)?)?),
             };
-            let email = email.or_else(|| imported.as_ref().and_then(|i| i.identity.email.clone()));
+            let token_email = imported.as_ref().and_then(|i| i.identity.email.clone());
+            if let (Some(given), Some(signed_in)) = (&email, &token_email) {
+                if !given.trim().eq_ignore_ascii_case(signed_in.trim()) {
+                    eprintln!(
+                        "warning: --email {given} differs from the Codex sign-in's email \
+                         {signed_in}; the account will expect {given} on its next sign-in"
+                    );
+                }
+            }
+            let email = email.or(token_email);
             let c = client::require(paths).await?;
             let v = c
                 .post(
@@ -188,8 +197,21 @@ pub async fn run(paths: &Paths, cmd: AccountsCmd) -> anyhow::Result<i32> {
                 v["provider"].as_str().unwrap_or(&provider)
             );
             if let Some(imp) = imported {
-                save_codex_import(paths, &name, imp)?;
-                println!("imported the Codex CLI sign-in into '{name}'");
+                // The id the server created (it may normalise what was typed).
+                let id = v["id"].as_str().unwrap_or(&name).to_string();
+                if let Err(e) = save_codex_import(paths, &id, imp) {
+                    eprintln!(
+                        "the account '{id}' was created but its credentials could not be saved; \
+                         retry with `pooltime accounts login {id}` or remove it with \
+                         `pooltime accounts remove {id}`"
+                    );
+                    return Err(e);
+                }
+                println!("imported the Codex CLI sign-in into '{id}'");
+                println!(
+                    "note: pooltime now owns this sign-in (its refresh token rotates); run \
+                     `codex login` again to keep using the Codex CLI"
+                );
                 return Ok(0);
             }
             if !then_login {
@@ -302,13 +324,14 @@ fn codex_auth_path(given: &std::path::Path) -> anyhow::Result<std::path::PathBuf
 }
 
 /// Write the imported credentials (the registry reads them from disk, so a running daemon picks
-/// them up) and record the ChatGPT account id as the account's identity baseline.
+/// them up) and record the ChatGPT user / workspace ids as the account's identity baseline.
 fn save_codex_import(paths: &Paths, name: &str, imp: CodexAuthImport) -> anyhow::Result<()> {
     let id: AccountId = name.parse()?;
     let reg = Registry::load(paths)?;
     reg.write_creds(&id, &imp.creds)?;
     if let Some(mut meta) = reg.get(&id) {
         meta.identity.account_uuid = imp.identity.account_uuid;
+        meta.identity.org_uuid = imp.identity.org_uuid;
         if meta.identity.email.is_none() {
             meta.identity.email = imp.identity.email;
         }
