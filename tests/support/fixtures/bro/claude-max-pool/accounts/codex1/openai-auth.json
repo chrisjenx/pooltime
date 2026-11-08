@@ -1,0 +1,7 @@
+{
+  "accessToken": "fake-access-codex1",
+  "refreshToken": "fake-refresh-codex1",
+  "accountId": "fake-chatgpt-account-1",
+  "expiresAt": 1762520400000,
+  "planType": "pro"
+}

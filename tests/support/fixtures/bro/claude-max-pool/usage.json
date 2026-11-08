@@ -1,0 +1,55 @@
+{
+  "usage": {
+    "alpha": {
+      "windowStart": 1762500000000,
+      "windowRequests": 3,
+      "totalRequests": 120,
+      "lastUsedAt": 1762500000000,
+      "lastError": null,
+      "rateLimitedUntil": null,
+      "rateLimitStatus": {
+        "unifiedStatus": "allowed",
+        "windows": [
+          { "key": "5h", "model": null, "status": "allowed", "utilization": 0.42, "reset": 4102444800000 },
+          { "key": "7d", "model": null, "status": "allowed", "utilization": 0.9, "reset": 4102444800000 },
+          { "key": "7d-fable", "model": "fable", "status": "allowed", "utilization": 0.06, "reset": 4102444800000 }
+        ],
+        "updatedAt": 1762500000000
+      },
+      "lastUsageCheckAt": null,
+      "lastUsageCheckError": null,
+      "deadRefreshToken": null,
+      "accessDeniedUntil": null,
+      "billingBlockedAt": null
+    },
+    "beta": {
+      "rateLimitStatus": {
+        "unifiedStatus": "allowed",
+        "fiveHourStatus": "allowed",
+        "fiveHourUtilization": 0.25,
+        "fiveHourReset": 4102444800000,
+        "updatedAt": 1762500000000
+      },
+      "deadRefreshToken": null
+    },
+    "dead1": {
+      "rateLimitStatus": null,
+      "deadRefreshToken": "5b35971260e2bb35"
+    },
+    "stale1": {
+      "rateLimitStatus": null,
+      "deadRefreshToken": "5a39747e19fa8547"
+    },
+    "codex1": {
+      "rateLimitStatus": {
+        "unifiedStatus": "allowed",
+        "windows": [
+          { "key": "5h", "model": null, "status": "allowed", "utilization": 0.3, "reset": 4102444800000 }
+        ],
+        "updatedAt": 1762500000000
+      },
+      "rateLimitedUntil": 4102444800000,
+      "deadRefreshToken": null
+    }
+  }
+}

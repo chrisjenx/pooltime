@@ -1,0 +1,7 @@
+{
+  "sessions": {
+    "anthropic:user_fakehash_account_fake_session_one": { "account": "alpha", "provider": "anthropic", "lastSeenAt": 1762500000000 },
+    "openai:user_fakehash_account_fake_session_two": { "account": "codex1", "provider": "openai", "lastSeenAt": 1762500000000 },
+    "anthropic:user_fakehash_account_fake_session_gone": { "account": "no-such-account", "provider": "anthropic", "lastSeenAt": 1762500000000 }
+  }
+}
