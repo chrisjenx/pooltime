@@ -45,19 +45,51 @@ fn parent_of(path: &Path) -> &Path {
     }
 }
 
+/// How hard a write is flushed before it counts as done.
+#[derive(Clone, Copy)]
+enum Durability {
+    /// `File::sync_all` (on macOS `F_FULLFSYNC`: the drive's cache is flushed too).
+    Full,
+    /// Plain `fsync(2)`: in the OS's hands, but on macOS the drive may still hold it in cache.
+    Relaxed,
+}
+
+fn sync(file: &File, d: Durability) -> io::Result<()> {
+    match d {
+        Durability::Full => file.sync_all(),
+        Durability::Relaxed => {
+            use std::os::fd::AsRawFd;
+            // SAFETY: `fsync` only reads the descriptor, which `file` keeps open for the call.
+            if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+    }
+}
+
 /// Write `bytes` to a temp file in the same directory (created 0600, then set
-/// to `mode`), fsync it, and return it ready to `persist`.
-fn staged_temp(path: &Path, bytes: &[u8], mode: u32) -> io::Result<NamedTempFile> {
+/// to `mode`), sync it, and return it ready to `persist`.
+fn staged_temp(path: &Path, bytes: &[u8], mode: u32, d: Durability) -> io::Result<NamedTempFile> {
     let mut tmp = NamedTempFile::new_in(parent_of(path))?;
     tmp.write_all(bytes)?;
     tmp.as_file()
         .set_permissions(fs::Permissions::from_mode(mode))?;
-    tmp.as_file().sync_all()?;
+    sync(tmp.as_file(), d)?;
     Ok(tmp)
 }
 
 fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
+}
+
+fn write_atomically(path: &Path, bytes: &[u8], mode: u32, d: Durability) -> io::Result<()> {
+    let path = resolve_final(path)?;
+    let path = path.as_path();
+    let tmp = staged_temp(path, bytes, mode, d)?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    sync(&File::open(parent_of(path))?, d)
 }
 
 /// Atomically replace `path` with `bytes`: temp file in the same directory,
@@ -66,11 +98,19 @@ fn fsync_dir(dir: &Path) -> io::Result<()> {
 /// content, never a partial file; the temp file is removed on failure. If
 /// `path` is a symlink the file it points to is replaced and the link is kept.
 pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    let path = resolve_final(path)?;
-    let path = path.as_path();
-    let tmp = staged_temp(path, bytes, mode)?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    fsync_dir(parent_of(path))
+    write_atomically(path, bytes, mode, Durability::Full)
+}
+
+/// [`atomic_write`] with plain `fsync(2)` instead of `sync_all` for the file and its directory.
+/// Still atomic (temp + rename: readers see the old or the new content, never a partial file)
+/// and still exactly `mode`, but on macOS a power loss right after the write may lose it, where
+/// `sync_all` (`F_FULLFSYNC`, ~10 ms per write there) would not.
+///
+/// **Only for regenerable files** whose loss costs nothing but a regeneration — today only
+/// `run/mgmt.key` (a lost key just changes the dashboard URL/cookie; `docs/perf.md` "First boot").
+/// Credentials, the database, config, snapshots and Claude Code files use [`atomic_write`].
+pub fn atomic_write_relaxed(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    write_atomically(path, bytes, mode, Durability::Relaxed)
 }
 
 /// What a [`guarded_patch`] closure wants done with the file.
@@ -169,7 +209,7 @@ pub fn guarded_patch(
         if current == Some(new.as_slice()) {
             return Ok(WriteOutcome::Unchanged);
         }
-        let tmp = staged_temp(path, &new, file_mode)?;
+        let tmp = staged_temp(path, &new, file_mode, Durability::Full)?;
         if current_stamp(path)? != stamp {
             continue; // `tmp` is dropped (deleted) here.
         }
@@ -256,6 +296,41 @@ mod tests {
         assert_eq!(mode_of(&p), 0o640);
         // No temp leftovers.
         assert_eq!(dir_names(dir.path()), vec!["f.json"]);
+    }
+
+    #[test]
+    fn atomic_write_relaxed_is_atomic_with_mode_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("mgmt.key");
+        atomic_write_relaxed(&p, b"one\n", 0o600).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"one\n");
+        assert_eq!(mode_of(&p), 0o600);
+        // Replacing goes through a rename: a reader holding the old file keeps the old bytes.
+        let old = File::open(&p).unwrap();
+        atomic_write_relaxed(&p, b"two-longer\n", 0o600).unwrap();
+        let mut held = String::new();
+        (&old).read_to_string(&mut held).unwrap();
+        assert_eq!(held, "one\n");
+        assert_eq!(fs::read(&p).unwrap(), b"two-longer\n");
+        assert_eq!(mode_of(&p), 0o600);
+        assert_eq!(dir_names(dir.path()), vec!["mgmt.key"]);
+    }
+
+    #[test]
+    fn atomic_write_relaxed_failure_keeps_the_old_file_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("run");
+        fs::create_dir(&sub).unwrap();
+        let p = sub.join("mgmt.key");
+        atomic_write_relaxed(&p, b"old\n", 0o600).unwrap();
+        // No temp file can be created in a read-only directory: the write fails, the old file
+        // stays whole and nothing partial is left behind.
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o500)).unwrap();
+        let r = atomic_write_relaxed(&p, b"new\n", 0o600);
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(r.is_err());
+        assert_eq!(fs::read(&p).unwrap(), b"old\n");
+        assert_eq!(dir_names(&sub), vec!["mgmt.key"]);
     }
 
     #[test]
