@@ -1,9 +1,26 @@
-//! Minimal route types consumed by the `Provider` trait. Task 20 extends this
-//! module with the model table, resolution, mapping and families.
+//! Model routing: the table of public model ids and where they are served, id
+//! resolution (`[1m]`-aware, Anthropic passthrough), family mappings to OpenAI routes,
+//! and Claude family detection. Persisted as `models.toml` under the data dir.
+
+mod defaults;
+mod families;
+mod mapping;
+mod resolve;
+mod table;
+#[cfg(test)]
+mod tests;
 
 use serde::{Deserialize, Serialize};
 
 use crate::providers::ProviderId;
+
+pub use defaults::{
+    default_mappings, default_routes, inferred_efforts, CODEX_EFFORTS, CODEX_EXTENDED_CONTEXT_MIN,
+    SOURCE_EFFORT_TIERS,
+};
+pub use families::{family_of, MODEL_FAMILIES};
+pub use mapping::{Mapping, MappingError};
+pub use table::ModelTable;
 
 /// One row of the model table: a public model id and where it is served.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
