@@ -23,6 +23,14 @@ pub fn snapshot_path(snaps: &Paths, p: &Profile) -> PathBuf {
     snaps.run.join("profiles").join(format!("{}.json", p.id))
 }
 
+/// [`snapshot_path`] by profile id alone (the status line wrapper only knows the
+/// id). `None` for an id that could name another file (empty, `.`/`..`, or with
+/// a `/` or NUL).
+pub(crate) fn snapshot_path_for_id(snaps: &Paths, id: &str) -> Option<PathBuf> {
+    let bad = id.is_empty() || id == "." || id == ".." || id.contains(['/', '\0']);
+    (!bad).then(|| snaps.run.join("profiles").join(format!("{id}.json")))
+}
+
 /// `Debug` is hand-written: `prior` may hold the user's real
 /// `ANTHROPIC_AUTH_TOKEN`, so only key names are ever shown.
 #[derive(Clone, PartialEq)]
@@ -30,8 +38,9 @@ pub(crate) struct Snapshot {
     pub managed: bool,
     /// Managed key -> the user's value before us (`null` = was absent).
     pub prior: Map<String, Value>,
-    /// Reserved for the status line override; nothing sets it yet, but it is
-    /// preserved across rewrites.
+    /// The profile's own `statusLine` before `connect --statusline` installed
+    /// the wrapper (`null` = there was none); see [`super::statusline`].
+    /// Preserved across rewrites.
     pub statusline_prior: Value,
     /// Any other top-level fields, kept verbatim.
     extra: Map<String, Value>,

@@ -78,7 +78,13 @@ fn print_profiles(verb: &str, list: &Value) {
     }
 }
 
-pub async fn connect(paths: &Paths, profiles: Vec<String>, all: bool) -> anyhow::Result<i32> {
+/// `statusline`: also install the status line wrapper (`connect --statusline`).
+pub async fn connect(
+    paths: &Paths,
+    profiles: Vec<String>,
+    all: bool,
+    statusline: bool,
+) -> anyhow::Result<i32> {
     let c = client::require(paths).await?;
     if profiles.is_empty() && !all {
         let found = home().as_deref().map(discover).unwrap_or_default();
@@ -99,7 +105,7 @@ pub async fn connect(paths: &Paths, profiles: Vec<String>, all: bool) -> anyhow:
     let v = c
         .post(
             "/api/v1/profiles/connect",
-            json!({ "profiles": normalize(&profiles)?, "all": all }),
+            json!({ "profiles": normalize(&profiles)?, "all": all, "statusline": statusline }),
         )
         .await?;
     print_profiles("connected", &v["profiles"]);

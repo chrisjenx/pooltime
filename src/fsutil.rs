@@ -106,8 +106,9 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
 /// and still exactly `mode`, but on macOS a power loss right after the write may lose it, where
 /// `sync_all` (`F_FULLFSYNC`, ~10 ms per write there) would not.
 ///
-/// **Only for regenerable files** whose loss costs nothing but a regeneration — today only
-/// `run/mgmt.key` (a lost key just changes the dashboard URL/cookie; `docs/perf.md` "First boot").
+/// **Only for regenerable files** whose loss costs nothing but a regeneration — today
+/// `run/mgmt.key` (a lost key just changes the dashboard URL/cookie; `docs/perf.md` "First boot")
+/// and `run/status-cache.json` (rewritten at least every minute).
 /// Credentials, the database, config, snapshots and Claude Code files use [`atomic_write`].
 pub fn atomic_write_relaxed(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     write_atomically(path, bytes, mode, Durability::Relaxed)

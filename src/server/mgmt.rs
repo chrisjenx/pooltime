@@ -1301,9 +1301,17 @@ pub fn profiles_json(profiles: &[Profile], outcomes: &[(String, WriteOutcome)]) 
     )
 }
 
+/// The binary the status line wrapper names: this daemon's own, by its stable path
+/// ([`crate::service::stable_bin`]: Homebrew's `<prefix>/bin/pooltime`, not the versioned keg).
+fn statusline_bin() -> Option<PathBuf> {
+    let bin = std::env::current_exe().ok()?.canonicalize().ok()?;
+    Some(crate::service::stable_bin(&bin))
+}
+
 /// `{profiles: [id | absolute dir, ...]}` or `{all: true}` (every `~/.claude*` profile found under
 /// the daemon's `$HOME`): point them at this pool ([`crate::claude_code::connect`]). Naming
 /// nothing is refused rather than read as "all", so no profile is ever connected by accident.
+/// `statusline: true` also installs the status line wrapper ([`crate::claude_code::connect_with`]).
 async fn profiles_connect(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1321,6 +1329,14 @@ async fn profiles_connect(
         None | Some(Value::Bool(false)) => false,
         Some(Value::Bool(true)) => true,
         Some(_) => return bad("all must be a boolean"),
+    };
+    let statusline = match body.get("statusline") {
+        None | Some(Value::Bool(false)) => None,
+        Some(Value::Bool(true)) => match statusline_bin() {
+            Some(b) => Some(b),
+            None => return internal("could not locate the pooltime binary for the status line"),
+        },
+        Some(_) => return bad("statusline must be a boolean"),
     };
     if names.is_empty() && !all {
         return bad(
@@ -1353,7 +1369,7 @@ async fn profiles_connect(
         Ok(Ok(p)) => p,
         Ok(Err(r)) | Err(r) => return r,
     };
-    match crate::claude_code::connect(&app, &profiles).await {
+    match crate::claude_code::connect_with(&app, &profiles, statusline.as_deref()).await {
         Ok(outcomes) => {
             tracing::info!(profiles = outcomes.len(), "profiles connected");
             ok(json!({ "ok": true, "profiles": profiles_json(&profiles, &outcomes) }))
