@@ -13,6 +13,7 @@ pub mod open;
 pub mod service;
 pub mod setup;
 pub mod status;
+pub mod statusline;
 
 use std::ffi::OsString;
 use std::net::IpAddr;
@@ -50,6 +51,9 @@ pub enum Command {
         /// Every Claude Code profile found under ~/.claude*.
         #[arg(long, conflicts_with = "profiles")]
         all: bool,
+        /// Also wrap each profile's status line to show the pool segment (restored on disconnect).
+        #[arg(long)]
+        statusline: bool,
     },
     /// Restore Claude Code profiles' own settings (all connected ones if none are named).
     Disconnect {
@@ -73,6 +77,13 @@ pub enum Command {
     Setup(setup::SetupArgs),
     /// Check the installation: one line per check, exit 1 on any failure.
     Doctor,
+    /// Print the pool segment for Claude Code's status line (from the daemon's cache).
+    Statusline {
+        /// Run this profile's original status line command (Claude Code's stdin passed on) and
+        /// append the segment to its output.
+        #[arg(long, value_name = "PROFILE_ID")]
+        wrap: Option<String>,
+    },
 }
 
 /// `pooltime serve` flags. `--port`/`--host` override `config.toml` and `POOLTIME_PORT`/`POOLTIME_HOST`.
@@ -102,6 +113,10 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
         return Ok(0);
     };
     let paths = Paths::resolve();
+    // Runs on every status line refresh: no runtime, no network.
+    if let Command::Statusline { wrap } = command {
+        return Ok(statusline::run(&paths, wrap));
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -113,7 +128,11 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
             }
             Command::Status { json } => status::run(&client::require(&paths).await?, json).await,
             Command::Accounts(cmd) => accounts::run(&paths, cmd).await,
-            Command::Connect { profiles, all } => connect::connect(&paths, profiles, all).await,
+            Command::Connect {
+                profiles,
+                all,
+                statusline,
+            } => connect::connect(&paths, profiles, all, statusline).await,
             Command::Disconnect { profiles } => connect::disconnect(&paths, profiles).await,
             Command::Models(cmd) => models::run(&paths, cmd).await,
             Command::Open => open::run(&paths).await,
@@ -125,6 +144,7 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
             Command::Import(cmd) => import::run(&paths, cmd).await,
             Command::Setup(args) => setup::run(&paths, args).await,
             Command::Doctor => doctor::run(&paths).await,
+            Command::Statusline { .. } => unreachable!("handled before the runtime starts"),
         }
     })
 }

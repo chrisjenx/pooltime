@@ -2118,6 +2118,7 @@ mod mgmt {
             json!({"profiles": [bare.to_str().unwrap()]}),
             json!({"profiles": [7]}),
             json!({"profiles": "x"}),
+            json!({"profiles": [path], "statusline": "yes"}),
         ] {
             let r = call(&srv, "POST", "/api/v1/profiles/connect", Some(body.clone())).await;
             assert_eq!(r.status, 400, "{body}: {}", r.text());
@@ -2128,12 +2129,17 @@ mod mgmt {
             &srv,
             "POST",
             "/api/v1/profiles/connect",
-            Some(json!({"profiles": [path]})),
+            Some(json!({"profiles": [path], "statusline": true})),
         )
         .await;
         assert_eq!(r.status, 200, "{}", r.text());
         let v = r.json();
         assert_eq!(v["profiles"][0]["id"], "claude-x");
+        // The wrapper names this (test) binary; disconnect removes it again (none before).
+        let line = settings(&dir)["statusLine"].clone();
+        assert_eq!(line["type"], "command");
+        let cmd = line["command"].as_str().unwrap();
+        assert!(cmd.ends_with(" statusline --wrap claude-x"), "{cmd}");
         assert_eq!(v["profiles"][0]["settings_dir"], path);
         assert_eq!(v["profiles"][0]["outcome"], "written");
         let s = settings(&dir);

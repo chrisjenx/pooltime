@@ -153,6 +153,8 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
             }
         }),
         crate::claude_code::spawn_profile_sync(app.clone()),
+        // run/status-cache.json for `pooltime statusline` (spec §16).
+        crate::claude_code::statusline::spawn_status_cache(app.clone()),
         // Health tick: one probe refresh per passed login expiry (spec §16).
         spawn_every(crate::health::HEALTH_TICK, {
             let app = app.clone();
@@ -179,8 +181,11 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
         }),
     ]);
 
+    let cache = crate::claude_code::statusline::cache_path(&app.paths);
     let outcome = serve_until_signal(app).await;
     drop(tasks);
+    // Status lines say `pool down` right away instead of once the cache goes stale.
+    let _ = std::fs::remove_file(cache);
     match outcome? {
         Outcome::Drained => tracing::info!("pooltime stopped"),
         Outcome::TimedOut | Outcome::Forced => {

@@ -10,9 +10,11 @@ mod safe_write;
 mod scrub;
 mod settings_env;
 pub(crate) mod snapshot;
+pub mod statusline;
 
 pub use connect::{
-    catalog, connect, disconnect, profile_of, spawn_profile_sync, sync_once, SYNC_INTERVAL,
+    catalog, connect, connect_with, disconnect, profile_of, spawn_profile_sync, sync_once,
+    SYNC_INTERVAL,
 };
 pub use fable_cache::rewrite_fable_rows;
 pub use pins::{derive_pins, max_context, newest_fable, newest_of_family, Newest};

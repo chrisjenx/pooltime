@@ -355,7 +355,7 @@ async fn profiles_step(
         )
         .hint(hint);
     }
-    match connect::connect(paths, chosen.clone(), false).await {
+    match connect::connect(paths, chosen.clone(), false, false).await {
         Ok(0) => Check::new(Level::Ok, label, format!("connected {}", chosen.join(", "))),
         Ok(_) => Check::new(Level::Fail, label, "not connected (see above)"),
         Err(e) => Check::new(Level::Fail, label, format!("{e:#}")),

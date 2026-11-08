@@ -17,6 +17,7 @@
 //! never dropped for a flaky fetch.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +28,7 @@ use tokio::task::JoinHandle;
 
 use super::pins::{derive_pins, max_context};
 use super::scrub::{context_is_managed, CONTEXT_KEY};
+use super::statusline::{install as install_statusline, restore as restore_statusline};
 use super::{apply, clear, is_connected, rewrite_fable_rows, EnvBlock, Pin, Pins, Profile};
 use crate::config::{Config, Paths, ProfileRef};
 use crate::fsutil::WriteOutcome;
@@ -220,6 +222,18 @@ pub async fn connect(
     state: &AppState,
     profiles: &[Profile],
 ) -> anyhow::Result<Vec<(String, WriteOutcome)>> {
+    connect_with(state, profiles, None).await
+}
+
+/// [`connect`], and with `statusline: Some(bin)` also install the status line wrapper
+/// (`<bin> statusline --wrap <id>`, [`super::statusline::install`]) into each profile whose `env`
+/// was applied. A profile whose wrapper cannot be installed stays connected and recorded, and is
+/// reported as failed. `None` never touches `statusLine`.
+pub async fn connect_with(
+    state: &AppState,
+    profiles: &[Profile],
+    statusline: Option<&Path>,
+) -> anyhow::Result<Vec<(String, WriteOutcome)>> {
     let addr = probe_addr(state.cfg.host, state.cfg.port);
     match probe(addr).await {
         Probe::Pooltime => {}
@@ -246,13 +260,31 @@ pub async fn connect(
 
     let paths = state.paths.clone();
     let owned: Vec<Profile> = profiles.to_vec();
+    let statusline: Option<PathBuf> = statusline.map(Path::to_path_buf);
     let (outcomes, failures) = tokio::task::spawn_blocking(move || {
         let mut outcomes = Vec::new();
         let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
         for p in &owned {
-            match sync_profile(&paths, p, &url, &key, catalog.as_deref()) {
-                Ok(o) => outcomes.push((p.clone(), o)),
-                Err(e) => failures.push((p.id.clone(), e)),
+            let env = match sync_profile(&paths, p, &url, &key, catalog.as_deref()) {
+                Ok(o) => o,
+                Err(e) => {
+                    failures.push((p.id.clone(), e));
+                    continue;
+                }
+            };
+            let line = match statusline
+                .as_deref()
+                .map(|b| install_statusline(p, &paths, b))
+            {
+                None => Ok(WriteOutcome::Unchanged),
+                Some(r) => r,
+            };
+            match line {
+                Ok(o) => outcomes.push((p.clone(), merge(env, o))),
+                Err(e) => {
+                    outcomes.push((p.clone(), env));
+                    failures.push((p.id.clone(), e.context("installing the status line")));
+                }
             }
         }
         (outcomes, failures)
@@ -288,8 +320,9 @@ pub async fn connect(
     }
 }
 
-/// Release `profiles` ([`clear`]: prior `env` values restored, snapshot deleted)
-/// and forget them in the config. Works without a running pool, so the CLI and
+/// Release `profiles` (the status line wrapper replaced by the user's original,
+/// then [`clear`]: prior `env` values restored, snapshot deleted) and forget
+/// them in the config. Works without a running pool, so the CLI and
 /// `service uninstall` can call it; the proxy key stays in the config.
 ///
 /// A profile whose settings file kept changing under us (`GaveUp`) stays
@@ -305,7 +338,20 @@ pub fn disconnect(
     let mut released: Vec<&str> = Vec::new();
     let mut failure = None;
     for p in profiles {
-        match clear(p, paths) {
+        // The status line first: `clear` deletes the snapshot that holds its original. Unless
+        // that restore landed, the snapshot (and the connection) is kept for a retry.
+        let line = match restore_statusline(p, paths) {
+            Ok(WriteOutcome::GaveUp) => {
+                out.push((p.id.clone(), WriteOutcome::GaveUp));
+                continue;
+            }
+            Ok(o) => o,
+            Err(e) => {
+                failure.get_or_insert(e.context(format!("disconnecting profile {}", p.id)));
+                continue;
+            }
+        };
+        match clear(p, paths).map(|o| merge(o, line)) {
             Ok(o) => {
                 if o != WriteOutcome::GaveUp {
                     released.push(&p.id);

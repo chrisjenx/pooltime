@@ -162,14 +162,22 @@ fn alerts(status: &Value) -> Vec<String> {
     out
 }
 
+/// The pool's "7d N% left" fraction: the summed 7-day headroom over the number of accounts (see
+/// the module docs); `None` with no accounts. The status line shows the same figure.
+pub fn pool_seven_day_left(status: &Value) -> Option<f64> {
+    let pool = &status["pool"];
+    let n = pool["accounts"].as_u64().unwrap_or(0);
+    pool["seven_day_left_total"]
+        .as_f64()
+        .filter(|_| n > 0)
+        .map(|t| t / n as f64)
+}
+
 /// The whole summary.
 pub fn render(status: &Value, addr: &str) -> String {
     let pool = &status["pool"];
     let n = pool["accounts"].as_u64().unwrap_or(0);
-    let left = pool["seven_day_left_total"]
-        .as_f64()
-        .filter(|_| n > 0)
-        .map(|t| t / n as f64);
+    let left = pool_seven_day_left(status);
     let mut out = format!(
         "pooltime {} on {addr}\npool {}/{n} ready · 7d {} left\n\n",
         str_of(status, "version"),

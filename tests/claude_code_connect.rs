@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pooltime::claude_code::{
-    connect, disconnect, is_connected, profile_of, sync_once, Profile, SYNC_INTERVAL,
+    connect, connect_with, disconnect, is_connected, profile_of, sync_once, Profile, SYNC_INTERVAL,
 };
 use pooltime::config::{Config, Paths};
 use pooltime::fsutil::WriteOutcome;
@@ -557,4 +557,61 @@ async fn spawn_profile_sync_runs_a_pass_immediately() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     handle.abort();
+}
+
+fn set_statusline(p: &Profile, v: Value) {
+    let mut s = json_of(&p.settings_json);
+    s["statusLine"] = v;
+    fs::write(&p.settings_json, serde_json::to_vec_pretty(&s).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn connect_disconnect_restores_original_statusline() {
+    let fx = Fix::new().await;
+    let bin = PathBuf::from("/opt/homebrew/bin/pooltime");
+    let wrapper = json!({"type": "command",
+        "command": "/opt/homebrew/bin/pooltime statusline --wrap claude-work"});
+    let original = json!({"type": "command", "command": "~/.claude/ccline", "padding": 0});
+    let snap_of = |id: &str| json_of(&fx.paths().run.join(format!("profiles/{id}.json")));
+
+    // With an original status line: wrapped, snapshotted, restored exactly.
+    let p = fx.profile(".claude-work");
+    set_statusline(&p, original.clone());
+    connect_with(fx.app(), std::slice::from_ref(&p), Some(&bin))
+        .await
+        .unwrap();
+    assert_eq!(json_of(&p.settings_json)["statusLine"], wrapper);
+    assert_eq!(snap_of("claude-work")["statusline_prior"], original);
+    // Re-connecting never snapshots our own wrapper as the prior.
+    connect_with(fx.app(), std::slice::from_ref(&p), Some(&bin))
+        .await
+        .unwrap();
+    assert_eq!(snap_of("claude-work")["statusline_prior"], original);
+    // Without --statusline the installed wrapper is left as it is.
+    connect(fx.app(), std::slice::from_ref(&p)).await.unwrap();
+    assert_eq!(json_of(&p.settings_json)["statusLine"], wrapper);
+    disconnect(&fx.paths(), std::slice::from_ref(&p)).unwrap();
+    assert_eq!(json_of(&p.settings_json)["statusLine"], original);
+    assert_eq!(env_of(&p), json!({"KEEP": "1"}));
+
+    // Without one: the key is removed again on disconnect.
+    let q = fx.profile(".claude-other");
+    connect_with(fx.app(), std::slice::from_ref(&q), Some(&bin))
+        .await
+        .unwrap();
+    assert_eq!(
+        json_of(&q.settings_json)["statusLine"]["command"],
+        "/opt/homebrew/bin/pooltime statusline --wrap claude-other"
+    );
+    assert!(snap_of("claude-other")["statusline_prior"].is_null());
+    disconnect(&fx.paths(), std::slice::from_ref(&q)).unwrap();
+    assert!(json_of(&q.settings_json).get("statusLine").is_none());
+
+    // Plain connect never touches statusLine.
+    let r = fx.profile(".claude-plain");
+    set_statusline(&r, original.clone());
+    connect(fx.app(), std::slice::from_ref(&r)).await.unwrap();
+    assert_eq!(json_of(&r.settings_json)["statusLine"], original);
+    disconnect(&fx.paths(), std::slice::from_ref(&r)).unwrap();
+    assert_eq!(json_of(&r.settings_json)["statusLine"], original);
 }

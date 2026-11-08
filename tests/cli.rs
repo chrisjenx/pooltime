@@ -740,3 +740,34 @@ fn logs_filters_by_request_id() {
     let v: Value = serde_json::from_str(raw.trim()).unwrap();
     assert_eq!(v["fields"]["message"], "other");
 }
+
+#[test]
+fn statusline_reads_the_daemons_cache() {
+    let h = Home::new();
+    // No daemon, no cache: `pool down`, exit 0, for both forms.
+    let out = stdout_of(&h.cli(&["statusline"]).success());
+    assert_eq!(out, "pool down\n");
+    let out = stdout_of(&h.cli(&["statusline", "--wrap", "nope"]).success());
+    assert_eq!(out, "pool down\n");
+
+    let cache = h.pt().join("run/status-cache.json");
+    {
+        let _d = h.serve();
+        let start = Instant::now();
+        while !cache.exists() {
+            assert!(start.elapsed() < BOOT_BUDGET, "no status cache written");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let v: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+        assert_eq!(v["port"], h.port);
+        assert!(
+            v["written_at"].is_i64() && v["counts"]["erroring"] == 0,
+            "{v}"
+        );
+        let out = stdout_of(&h.cli(&["statusline"]).success());
+        assert_eq!(out, "pool 0/0\n");
+        // A profile without a snapshot: the segment alone.
+        let out = stdout_of(&h.cli(&["statusline", "--wrap", "claude-work"]).success());
+        assert_eq!(out, "pool 0/0\n");
+    }
+}
