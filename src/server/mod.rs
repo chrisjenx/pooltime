@@ -1,7 +1,7 @@
 //! The local HTTP server: shared state, routing, auth, health and graceful drain.
 //!
 //! Layout: [`router`] builds the route table and middleware, [`auth`] guards inference and
-//! management traffic, [`health`] serves `/health` and the startup preflight, [`shutdown`] owns
+//! management traffic, [`models_route`] serves `/v1/models`, [`health`] serves `/health` and the startup preflight, [`shutdown`] owns
 //! signal handling and the drain sequence.
 
 pub mod auth;
@@ -9,6 +9,7 @@ pub mod classifier;
 pub mod fallback;
 pub mod health;
 pub mod inference;
+pub mod models_route;
 pub mod router;
 pub mod shutdown;
 

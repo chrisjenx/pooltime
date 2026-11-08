@@ -14,6 +14,7 @@ use crate::accounts::{AccountId, Registry, StateBook};
 use crate::config::AnthropicCfg;
 use crate::upstream::Upstream;
 
+mod catalog;
 mod oauth;
 mod overload;
 mod proxy;
@@ -22,6 +23,7 @@ mod stream;
 pub mod strip;
 mod usage;
 
+pub use catalog::{ANTHROPIC_OWNER, MODELS_CACHE_TTL};
 pub use oauth::expiry_after_refresh;
 pub use overload::{explicit_reset, retry_after_at, OverloadPolicy, Sleeper, TokioSleeper};
 pub use proxy::{
@@ -54,6 +56,10 @@ pub struct AnthropicProvider {
     overload: overload::OverloadPolicy,
     /// Bench length for a quota 429 with no explicit or window reset (default 1 h).
     rate_limit_cooldown: time::Duration,
+    /// Live `/v1/models` list cache and single-flight gate (see [`catalog`]).
+    catalog: catalog::CatalogCache,
+    /// How long a fetched model list is served (default [`MODELS_CACHE_TTL`]).
+    catalog_ttl: Duration,
 }
 
 impl AnthropicProvider {
@@ -77,6 +83,8 @@ impl AnthropicProvider {
             usage_gates: Mutex::new(HashMap::new()),
             overload: overload::OverloadPolicy::default(),
             rate_limit_cooldown: time::Duration::hours(1),
+            catalog: catalog::CatalogCache::default(),
+            catalog_ttl: MODELS_CACHE_TTL,
         }
     }
 
@@ -85,6 +93,13 @@ impl AnthropicProvider {
     pub fn with_refresh_timing(mut self, skew: Duration, timeout: Duration) -> Self {
         self.skew = time::Duration::try_from(skew).unwrap_or(time::Duration::MAX);
         self.refresh_timeout = timeout;
+        self
+    }
+
+    /// Serve a fetched `/v1/models` list for `ttl` instead of [`MODELS_CACHE_TTL`] (tests use
+    /// `Duration::ZERO` so every call re-fetches and the stale list is what a failure falls back to).
+    pub fn with_catalog_ttl(mut self, ttl: Duration) -> Self {
+        self.catalog_ttl = ttl;
         self
     }
 }

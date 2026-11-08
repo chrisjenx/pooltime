@@ -114,6 +114,11 @@ pub trait Provider: Send + Sync {
     ) -> AttemptOutcome;
     async fn poll_usage(&self, acct: &AccountMeta) -> Result<RateLimitSnapshot, UsageError>;
     async fn catalog(&self, acct: &AccountMeta) -> anyhow::Result<Vec<RouteDef>>;
+    /// Live `/v1/models` rows for this provider's own listing (Anthropic: its upstream catalog,
+    /// cached and single-flight). Providers whose rows come from the model table return none.
+    async fn live_models(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
+    }
 }
 
 /// True when an upstream 403/error message indicates an entitlement problem
