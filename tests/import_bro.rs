@@ -24,6 +24,7 @@ use pooltime::store::Store;
 use pooltime::upstream::Upstream;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use support::procs::{self, free_port};
 use support::{FakeAnthropic, Reply};
 use time::OffsetDateTime;
 
@@ -544,18 +545,10 @@ fn tree_digest(root: &Path) -> Vec<(String, Vec<u8>, u32, i64, i64)> {
     out
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// A `pooltime import bro` command over the fixture: temp HOME, temp POOLTIME_HOME, and a port
 /// nothing answers on unless the test says so.
-fn import_cmd(fx: &Fx, port: u16, extra: &[&str]) -> assert_cmd::Command {
-    let mut c = assert_cmd::Command::cargo_bin("pooltime").unwrap();
+fn import_cmd(fx: &Fx, port: u16, extra: &[&str]) -> std::process::Command {
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_pooltime"));
     c.args(["import", "bro"])
         .args(extra)
         .arg("--bro-pool")
@@ -610,8 +603,7 @@ fn cli_import_leaves_bro_files_untouched() {
     )
     .unwrap();
     let before = (tree_digest(&fx.pool), tree_digest(&fx.bro_home));
-    let out = import_cmd(&fx, free_port(), &[])
-        .assert()
+    let out = procs::assert(&mut import_cmd(&fx, free_port(), &[]))
         .success()
         .get_output()
         .clone();
@@ -649,8 +641,7 @@ fn import_refuses_while_pooltime_runs() {
     let fx = fixture();
     let port = fake_pooltime_health();
     let before = (tree_digest(&fx.pool), tree_digest(&fx.bro_home));
-    let out = import_cmd(&fx, port, &[])
-        .assert()
+    let out = procs::assert(&mut import_cmd(&fx, port, &[]))
         .failure()
         .get_output()
         .clone();
@@ -660,8 +651,7 @@ fn import_refuses_while_pooltime_runs() {
     assert!(!fx.paths.home.exists(), "nothing may be written");
     assert_eq!((tree_digest(&fx.pool), tree_digest(&fx.bro_home)), before);
     // A dry run still shows the plan, with a note.
-    let out = import_cmd(&fx, port, &["--dry-run"])
-        .assert()
+    let out = procs::assert(&mut import_cmd(&fx, port, &["--dry-run"]))
         .success()
         .get_output()
         .clone();
@@ -681,8 +671,7 @@ fn dry_run_writes_nothing() {
         tree_digest(&fx.pool),
         tree_digest(&fx.bro_home),
     );
-    let out = import_cmd(&fx, free_port(), &["--dry-run"])
-        .assert()
+    let out = procs::assert(&mut import_cmd(&fx, free_port(), &["--dry-run"]))
         .success()
         .get_output()
         .clone();
@@ -703,9 +692,7 @@ fn dry_run_writes_nothing() {
     assert_eq!(after, before);
     // An absent pooltime home stays absent.
     let fresh = fx.dir.path().join("fresh-pt");
-    import_cmd(&fx, free_port(), &["--dry-run"])
-        .env("POOLTIME_HOME", &fresh)
-        .assert()
+    procs::assert(import_cmd(&fx, free_port(), &["--dry-run"]).env("POOLTIME_HOME", &fresh))
         .success();
     assert!(!fresh.exists());
 }
