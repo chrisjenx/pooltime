@@ -287,7 +287,7 @@ fn poll_replace_keeps_overage_window() {
                 win("5h", None, WindowStatus::Allowed, 0.2, Some(t(100))),
                 win("7d", None, WindowStatus::Allowed, 0.3, Some(t(200))),
                 win("7d-opus", Some("opus"), WindowStatus::Allowed, 0.1, None),
-                win("overage", None, WindowStatus::Allowed, 0.0, None),
+                win("overage", Some("overage"), WindowStatus::Allowed, 0.0, None),
             ],
             t(0),
         ),
@@ -383,7 +383,13 @@ fn poll_extends_cooldown_clears_stale_one_and_synthesizes_reset() {
         snap(
             vec![
                 win("5h", None, WindowStatus::Rejected, 1.0, None),
-                win("overage", None, WindowStatus::Rejected, 1.0, None),
+                win(
+                    "overage",
+                    Some("overage"),
+                    WindowStatus::Rejected,
+                    1.0,
+                    None,
+                ),
             ],
             t(100),
         ),
@@ -402,6 +408,38 @@ fn poll_extends_cooldown_clears_stale_one_and_synthesizes_reset() {
             window: Some("5h".into())
         }
     );
+}
+
+/// Real headers, not hand-built windows: `overage-status: rejected` (extra usage not enabled)
+/// with a future reset is model-scoped to `overage` and never benches the account.
+#[test]
+fn overage_rejected_header_keeps_account_ready() {
+    use crate::providers::anthropic::parse_unified_headers;
+    let f = fixture();
+    let b = &f.book;
+    let a = id("a");
+    let reset = (BASE + 3 * 3600).to_string();
+    let mut h = http::HeaderMap::new();
+    for (k, v) in [
+        ("anthropic-ratelimit-unified-status", "allowed"),
+        ("anthropic-ratelimit-unified-5h-status", "allowed"),
+        ("anthropic-ratelimit-unified-5h-utilization", "0.2"),
+        ("anthropic-ratelimit-unified-5h-reset", reset.as_str()),
+        ("anthropic-ratelimit-unified-overage-status", "rejected"),
+        ("anthropic-ratelimit-unified-overage-utilization", "1.0"),
+        ("anthropic-ratelimit-unified-overage-reset", reset.as_str()),
+    ] {
+        h.insert(
+            http::HeaderName::from_static(k),
+            http::HeaderValue::from_str(v).unwrap(),
+        );
+    }
+    let snap = parse_unified_headers(&h, t(10)).expect("unified headers");
+    let overage = snap.windows.iter().find(|w| w.key == "overage").unwrap();
+    assert_eq!(overage.model.as_deref(), Some("overage"));
+    assert_eq!(overage.status, WindowStatus::Rejected);
+    b.merge_header_snapshot(&a, snap);
+    assert_eq!(b.status(&a, true, t(11)), AccountStatus::Ready);
 }
 
 #[test]
