@@ -1886,4 +1886,152 @@ mod mgmt {
             "{url}"
         );
     }
+
+    // ---- profiles & models (Task 30) ----
+
+    fn settings(dir: &std::path::Path) -> Value {
+        serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn profiles_connect_disconnect_endpoints() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        // A profile under a stand-in home (addressed by absolute path: never the real `$HOME`).
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".claude-x");
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = json!({"env": {"KEEP": "1"}});
+        std::fs::write(dir.join("settings.json"), original.to_string()).unwrap();
+        let path = dir.to_str().unwrap().to_string();
+
+        for p in [
+            "/api/v1/profiles/connect",
+            "/api/v1/profiles/disconnect",
+            "/api/v1/models/refresh",
+        ] {
+            let r = raw(srv.addr, "POST", p, Some(json!({"profiles": [path]})), &[]).await;
+            assert_eq!(r.status, 401, "{p} needs the management key");
+            let r = call(&srv, "GET", p, None).await;
+            assert_eq!(r.status, 405, "{p}");
+        }
+        assert_eq!(settings(&dir), original);
+
+        // Nothing named, a relative path, a missing dir, a non-string: refused, nothing written.
+        for body in [
+            json!({}),
+            json!({"profiles": []}),
+            json!({"profiles": ["relative/dir"]}),
+            json!({"profiles": [home.path().join("missing").to_str().unwrap()]}),
+            json!({"profiles": [7]}),
+            json!({"profiles": "x"}),
+        ] {
+            let r = call(&srv, "POST", "/api/v1/profiles/connect", Some(body.clone())).await;
+            assert_eq!(r.status, 400, "{body}: {}", r.text());
+        }
+        assert_eq!(settings(&dir), original);
+
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/profiles/connect",
+            Some(json!({"profiles": [path]})),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        assert_eq!(v["profiles"][0]["id"], "claude-x");
+        assert_eq!(v["profiles"][0]["settings_dir"], path);
+        assert_eq!(v["profiles"][0]["outcome"], "written");
+        let s = settings(&dir);
+        assert_eq!(
+            s["env"]["ANTHROPIC_BASE_URL"],
+            format!("http://{}", srv.addr)
+        );
+        assert_eq!(s["env"]["KEEP"], "1");
+        let cfg = Config::load_file(&Paths::under(pool.dir.path())).unwrap();
+        assert_eq!(cfg.profiles.len(), 1);
+        assert_eq!(cfg.profiles[0].id, "claude-x");
+
+        // Disconnect by id (resolved from the config).
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/profiles/disconnect",
+            Some(json!({"profiles": ["claude-x"]})),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert_eq!(r.json()["profiles"][0]["outcome"], "written");
+        assert_eq!(settings(&dir), original);
+        let cfg = Config::load_file(&Paths::under(pool.dir.path())).unwrap();
+        assert!(cfg.profiles.is_empty());
+
+        // No names = every connected profile (none now).
+        let r = call(&srv, "POST", "/api/v1/profiles/disconnect", Some(json!({}))).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert_eq!(r.json()["profiles"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn models_refresh_refetches_live_catalog() {
+        let fake = FakeAnthropic::start().await;
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let f = fail.clone();
+        fake.route("/v1/models", move |_, i| {
+            if f.load(Ordering::SeqCst) {
+                return Reply::error(500, "api_error", "boom");
+            }
+            Reply::json(
+                200,
+                &json!({"data": [{"id": format!("claude-live-{i}"), "display_name": "Live",
+                    "created_at": "2026-06-01T00:00:00Z"}], "has_more": false}),
+            )
+        });
+        let pool = Pool::new();
+        let (policy, _) = super::support::fast_policy();
+        let srv = pool
+            .boot(Boot::default().provider(Arc::new(pool.provider(&fake, policy))))
+            .await;
+        let ids = |v: Value| -> Vec<String> {
+            v["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(ids(http_get(srv.addr, "/v1/models", &[]).await.json())
+            .contains(&"claude-live-0".to_string()));
+        // Cached: a second listing does not re-fetch.
+        assert!(ids(http_get(srv.addr, "/v1/models", &[]).await.json())
+            .contains(&"claude-live-0".to_string()));
+        assert_eq!(fake.requests_to("/v1/models").len(), 1);
+
+        let r = call(&srv, "POST", "/api/v1/models/refresh", None).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["live"], 1);
+        assert!(v["models"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("claude-live-1")));
+        assert!(ids(http_get(srv.addr, "/v1/models", &[]).await.json())
+            .contains(&"claude-live-1".to_string()));
+
+        // A failed refresh is an error, and the last good list keeps being served.
+        fail.store(true, Ordering::SeqCst);
+        let r = call(&srv, "POST", "/api/v1/models/refresh", None).await;
+        assert_eq!(r.status, 502, "{}", r.text());
+        assert!(!r.text().contains("boom"), "no upstream text: {}", r.text());
+        assert!(ids(http_get(srv.addr, "/v1/models", &[]).await.json())
+            .contains(&"claude-live-1".to_string()));
+
+        // No Anthropic provider registered: nothing to refresh.
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        let r = call(&srv, "POST", "/api/v1/models/refresh", None).await;
+        assert_eq!(r.status, 503, "{}", r.text());
+    }
 }

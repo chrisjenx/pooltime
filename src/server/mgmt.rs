@@ -42,6 +42,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::auth::keys_match;
+use super::models_route::build_listing;
 use super::router::{method_not_allowed, read_json_limited};
 use super::AppState;
 use crate::accounts::registry::{MAX_WEIGHT, MIN_WEIGHT};
@@ -49,7 +50,9 @@ use crate::accounts::status::window_duration;
 use crate::accounts::{
     AccountId, AccountMeta, AccountState, AccountStatus, Identity, TimedOverride, Window,
 };
-use crate::config::{Config, Paths};
+use crate::claude_code::{discover, profile_of, Profile};
+use crate::config::{Config, Paths, ProfileRef};
+use crate::fsutil::WriteOutcome;
 use crate::models::Mapping;
 use crate::providers::anthropic::anthropic_error;
 use crate::providers::ProviderId;
@@ -187,6 +190,18 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/api/v1/signin/{id}/bind", write(post(signin_bind), "POST"))
         .route("/api/v1/tuning", write(post(tuning), "POST"))
         .route("/api/v1/mappings", write(post(mappings), "POST"))
+        .route(
+            "/api/v1/profiles/connect",
+            write(post(profiles_connect), "POST"),
+        )
+        .route(
+            "/api/v1/profiles/disconnect",
+            write(post(profiles_disconnect), "POST"),
+        )
+        .route(
+            "/api/v1/models/refresh",
+            write(post(models_refresh), "POST"),
+        )
 }
 
 // ---- response helpers ------------------------------------------------------------------------
@@ -895,6 +910,243 @@ async fn mappings(State(app): State<Arc<AppState>>, headers: HeaderMap, body: Bo
     }
 }
 
+// ---- Claude Code profiles & models -----------------------------------------------------------
+
+fn outcome_label(o: WriteOutcome) -> &'static str {
+    match o {
+        WriteOutcome::Written => "written",
+        WriteOutcome::Unchanged => "unchanged",
+        WriteOutcome::GaveUp => "gave_up",
+    }
+}
+
+/// The daemon's `$HOME`, where `~/.claude*` profiles are discovered (never `$CLAUDE_CONFIG_DIR`).
+fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
+const PROFILES_MSG: &str =
+    "profiles must be an array of profile ids or absolute settings-directory paths";
+
+/// The optional `profiles` array of strings (absent = empty).
+fn profile_names(body: &Map<String, Value>) -> Result<Vec<String>, Response> {
+    match body.get("profiles") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| bad(PROFILES_MSG))
+            })
+            .collect(),
+        Some(_) => Err(bad(PROFILES_MSG)),
+    }
+}
+
+/// Resolve profile names. A name containing `/` is a settings directory (absolute, existing);
+/// anything else is an id, looked up among the configured profiles first and then the
+/// `~/.claude*` directories discovered under the daemon's `$HOME` (only read when needed).
+/// Duplicates (same settings dir) collapse.
+pub fn resolve_profiles(
+    names: &[String],
+    configured: &[ProfileRef],
+) -> Result<Vec<Profile>, String> {
+    let home = user_home();
+    let mut discovered: Option<Vec<Profile>> = None;
+    let mut out: Vec<Profile> = Vec::new();
+    for name in names {
+        let p = if name.contains('/') {
+            let dir = std::path::Path::new(name);
+            if !dir.is_absolute() {
+                return Err(format!("profile path must be absolute: {name}"));
+            }
+            if !dir.is_dir() {
+                return Err(format!("profile directory not found: {name}"));
+            }
+            Profile::from_dir(dir, home.as_deref().unwrap_or(std::path::Path::new("")))
+        } else if let Some(r) = configured.iter().find(|r| r.id == *name) {
+            profile_of(r)
+        } else {
+            let found =
+                discovered.get_or_insert_with(|| home.as_deref().map(discover).unwrap_or_default());
+            match found.iter().find(|p| p.id == *name) {
+                Some(p) => p.clone(),
+                None => {
+                    let mut known: Vec<&str> = configured.iter().map(|r| r.id.as_str()).collect();
+                    for p in found.iter() {
+                        if !known.contains(&p.id.as_str()) {
+                            known.push(&p.id);
+                        }
+                    }
+                    let known = if known.is_empty() {
+                        "none found".to_string()
+                    } else {
+                        known.join(", ")
+                    };
+                    return Err(format!("unknown profile '{name}' (known: {known})"));
+                }
+            }
+        };
+        if !out.iter().any(|q| q.settings_dir == p.settings_dir) {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+fn profiles_json(profiles: &[Profile], outcomes: &[(String, WriteOutcome)]) -> Value {
+    Value::Array(
+        outcomes
+            .iter()
+            .map(|(id, o)| {
+                let dir = profiles
+                    .iter()
+                    .find(|p| p.id == *id)
+                    .map(|p| p.settings_dir.to_string_lossy().into_owned());
+                json!({ "id": id, "settings_dir": dir, "outcome": outcome_label(*o) })
+            })
+            .collect(),
+    )
+}
+
+/// `{profiles: [id | absolute dir, ...]}` or `{all: true}` (every `~/.claude*` profile found under
+/// the daemon's `$HOME`): point them at this pool ([`crate::claude_code::connect`]). Naming
+/// nothing is refused rather than read as "all", so no profile is ever connected by accident.
+async fn profiles_connect(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let body = match read_object(&headers, body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let names = match profile_names(&body) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let all = match body.get("all") {
+        None | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => return bad("all must be a boolean"),
+    };
+    if names.is_empty() && !all {
+        return bad(
+            "name the profiles to connect (ids or absolute settings-directory paths), or pass all: true",
+        );
+    }
+    let paths = app.paths.clone();
+    let resolved = blocking(move || -> Result<Vec<Profile>, Response> {
+        let cfg = Config::load_file(&paths).map_err(|e| {
+            tracing::error!(error = %format!("{e:#}"), "could not read config.toml");
+            internal("could not read config.toml")
+        })?;
+        let mut profiles = resolve_profiles(&names, &cfg.profiles).map_err(bad)?;
+        if all {
+            for p in user_home().map(|h| discover(&h)).unwrap_or_default() {
+                if !profiles.iter().any(|q| q.settings_dir == p.settings_dir) {
+                    profiles.push(p);
+                }
+            }
+            if profiles.is_empty() {
+                return Err(bad(
+                    "no Claude Code profiles found (~/.claude*/settings.json)",
+                ));
+            }
+        }
+        Ok(profiles)
+    })
+    .await;
+    let profiles = match resolved {
+        Ok(Ok(p)) => p,
+        Ok(Err(r)) | Err(r) => return r,
+    };
+    match crate::claude_code::connect(&app, &profiles).await {
+        Ok(outcomes) => {
+            tracing::info!(profiles = outcomes.len(), "profiles connected");
+            ok(json!({ "ok": true, "profiles": profiles_json(&profiles, &outcomes) }))
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "connect failed");
+            internal(&format!("connect failed: {e:#}"))
+        }
+    }
+}
+
+/// `{profiles?: [id | absolute dir, ...]}`: restore the named profiles
+/// ([`crate::claude_code::disconnect`]); none named = every connected (configured) profile.
+async fn profiles_disconnect(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let body = match read_object(&headers, body).await {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
+    let names = match profile_names(&body) {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let paths = app.paths.clone();
+    let result = blocking(move || -> Result<Value, Response> {
+        let cfg = Config::load_file(&paths).map_err(|e| {
+            tracing::error!(error = %format!("{e:#}"), "could not read config.toml");
+            internal("could not read config.toml")
+        })?;
+        let profiles = if names.is_empty() {
+            cfg.profiles.iter().map(profile_of).collect()
+        } else {
+            resolve_profiles(&names, &cfg.profiles).map_err(bad)?
+        };
+        let outcomes = crate::claude_code::disconnect(&paths, &profiles).map_err(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "disconnect failed");
+            internal(&format!("disconnect failed: {e:#}"))
+        })?;
+        Ok(profiles_json(&profiles, &outcomes))
+    })
+    .await;
+    match result {
+        Ok(Ok(list)) => {
+            tracing::info!("profiles disconnected");
+            ok(json!({ "ok": true, "profiles": list }))
+        }
+        Ok(Err(r)) | Err(r) => r,
+    }
+}
+
+/// Re-fetch the live Claude catalog now (bypassing the listing cache), then re-derive the pins
+/// of every connected profile from it. A failed fetch is a 502 carrying only a classified reason;
+/// the last good list keeps being served.
+async fn models_refresh(State(app): State<Arc<AppState>>) -> Response {
+    let Some(provider) = app.providers.get(&ProviderId::Anthropic).cloned() else {
+        return anthropic_error(503, "api_error", "pooltime: no Claude provider is running");
+    };
+    let live = match provider.refresh_live_models().await {
+        Ok(live) => live,
+        Err(e) => return anthropic_error(502, "api_error", &format!("pooltime: {e:#}")),
+    };
+    let ids: Vec<Value> = {
+        let table = app.models.read().unwrap_or_else(|e| e.into_inner());
+        build_listing(Some(&live), &table.rows_for_listing())
+            .into_iter()
+            .map(|m| m["id"].clone())
+            .collect()
+    };
+    let synced = match crate::claude_code::sync_once(&app).await {
+        Ok(v) => v.len(),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "profile sync after models refresh failed");
+            0
+        }
+    };
+    tracing::info!(live = live.len(), "model catalog refreshed");
+    ok(json!({ "ok": true, "live": live.len(), "models": ids, "profiles_synced": synced }))
+}
+
 // ---- sign-in ---------------------------------------------------------------------------------
 
 /// The flows the API knows by id: a [`SignInHandle`] to drive each, and its result once known.
@@ -984,7 +1236,7 @@ impl SignIns {
     }
 }
 
-fn mismatch_message(account: &AccountId, expected: &Identity, got: &Identity) -> String {
+pub fn mismatch_message(account: &AccountId, expected: &Identity, got: &Identity) -> String {
     let who = |i: &Identity| {
         i.email
             .clone()
