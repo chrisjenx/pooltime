@@ -20,7 +20,8 @@ pub async fn require_proxy_key(
     req: Request,
     next: Next,
 ) -> Response {
-    if let Some(key) = app.cfg.proxy_key.as_deref() {
+    // An empty key (`proxy_key = ""`, `POOLTIME_PROXY_KEY=`) means "not set", never "match empty".
+    if let Some(key) = app.cfg.proxy_key.as_deref().filter(|k| !k.is_empty()) {
         if !presented_keys(req.headers()).any(|k| keys_match(k, key)) {
             return anthropic_error(
                 401,

@@ -6,7 +6,9 @@ mod support;
 use std::time::Duration;
 
 use bytes::Bytes;
-use pooltime::server::health::{check_bro_shadow, preflight, StartupError};
+use pooltime::server::health::{
+    check_bro_shadow, check_bro_shadow_within, preflight, probe_within, Probe, StartupError,
+};
 use pooltime::server::Outcome;
 use serde_json::{json, Value};
 use support::sockets::{http_get, http_req, raw_client, serve};
@@ -505,4 +507,71 @@ async fn bro_answering_blocks_imported_accounts_unless_flag() {
     check_bro_shadow(&pool.reg, spa.port(), false)
         .await
         .unwrap();
+}
+
+/// A listener that accepts connections and never answers (a saturated or wedged server).
+async fn silent_listener() -> std::net::SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = l.accept().await {
+            held.push(s);
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn slow_bro_counts_as_running() {
+    let pool = Pool::new();
+    let silent = silent_listener().await;
+    assert_eq!(
+        probe_within(silent, Duration::from_millis(300)).await,
+        Probe::Unresponsive
+    );
+
+    // Nothing listening is Free, not Unresponsive.
+    let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let free_addr = free.local_addr().unwrap();
+    drop(free);
+    assert_eq!(
+        probe_within(free_addr, Duration::from_millis(300)).await,
+        Probe::Free
+    );
+
+    let mut imported = pooltime::accounts::AccountMeta::new(
+        "from-bro".parse().unwrap(),
+        pooltime::providers::ProviderId::Anthropic,
+    );
+    imported.imported = true;
+    pool.reg.upsert(imported).unwrap();
+    let t = Duration::from_millis(300);
+    let err = check_bro_shadow_within(&pool.reg, silent.port(), false, t)
+        .await
+        .expect_err("a wedged listener on bro's port may be bro");
+    assert!(matches!(err, StartupError::BroRunning { .. }), "{err:?}");
+    check_bro_shadow_within(&pool.reg, silent.port(), true, t)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn empty_proxy_key_means_open() {
+    let pool = Pool::new();
+    let srv = pool
+        .boot(Boot {
+            proxy_key: Some(String::new()),
+            ..Boot::default()
+        })
+        .await;
+    let r = http_req(
+        srv.addr,
+        "POST",
+        "/v1/messages",
+        &json_headers(),
+        br#"{"model":"m"}"#,
+    )
+    .await;
+    assert_ne!(r.status, 401);
 }

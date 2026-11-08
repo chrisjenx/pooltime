@@ -15,6 +15,7 @@ use axum::middleware::{from_fn_with_state, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
+use futures_util::StreamExt;
 use http::header::{ALLOW, CONTENT_LENGTH};
 use http::{HeaderMap, HeaderValue};
 use http_body::Frame;
@@ -111,35 +112,48 @@ async fn models(State(_app): State<Arc<AppState>>) -> Response {
 // The error is the response to send as-is; boxing it would only add noise for callers.
 #[allow(clippy::result_large_err)]
 pub async fn read_json(headers: &HeaderMap, body: Body) -> Result<(Bytes, Value), Response> {
+    read_json_limited(headers, body, BODY_LIMIT).await
+}
+
+/// [`read_json`] with an explicit byte limit (tests lower it). The limit is enforced here, while
+/// accumulating frames, so overflow is a plain comparison rather than an error to be recognised.
+#[allow(clippy::result_large_err)]
+pub async fn read_json_limited(
+    headers: &HeaderMap,
+    body: Body,
+    limit: usize,
+) -> Result<(Bytes, Value), Response> {
     let too_large = || {
         anthropic_error(
             413,
             "request_too_large",
-            "pooltime: request body exceeds the 64 MiB limit",
+            "pooltime: request body exceeds the size limit",
         )
     };
     let declared = headers
         .get(CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    if declared.is_some_and(|n| n > BODY_LIMIT as u64) {
+    if declared.is_some_and(|n| n > limit as u64) {
         return Err(too_large());
     }
-    let bytes = match axum::body::to_bytes(body, BODY_LIMIT).await {
-        Ok(b) => b,
-        Err(e) => {
-            // Over-limit (chunked) vs. the client going away mid-body.
-            return Err(if e.to_string().contains("length limit") {
-                too_large()
-            } else {
-                anthropic_error(
-                    400,
-                    "invalid_request_error",
-                    "pooltime: could not read request body",
-                )
-            });
+    let mut buf = Vec::new();
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        // An error here is the client going away (or a malformed chunked body) mid-request.
+        let chunk = chunk.map_err(|_| {
+            anthropic_error(
+                400,
+                "invalid_request_error",
+                "pooltime: could not read request body",
+            )
+        })?;
+        if buf.len() + chunk.len() > limit {
+            return Err(too_large());
         }
-    };
+        buf.extend_from_slice(&chunk);
+    }
+    let bytes = Bytes::from(buf);
     match serde_json::from_slice::<Value>(&bytes) {
         Ok(v) => Ok((bytes, v)),
         Err(_) => Err(anthropic_error(
@@ -194,5 +208,70 @@ impl HttpBody for Guarded {
 
     fn size_hint(&self) -> http_body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::Infallible;
+
+    /// A body with no known length (as a chunked request arrives), one frame per chunk.
+    fn chunked(chunks: &[&'static str]) -> Body {
+        let items: Vec<Result<Bytes, Infallible>> = chunks
+            .iter()
+            .map(|c| Ok(Bytes::from_static(c.as_bytes())))
+            .collect();
+        Body::from_stream(futures_util::stream::iter(items))
+    }
+
+    async fn status_of(r: Result<(Bytes, Value), Response>) -> u16 {
+        match r {
+            Ok(_) => 200,
+            Err(resp) => resp.status().as_u16(),
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_body_over_limit_is_413_without_content_length() {
+        let h = HeaderMap::new();
+        // 14 bytes of valid JSON in three chunks against a limit of 10.
+        let over = chunked(&[r#"{"a":"#, r#""bbbb""#, "}"]);
+        assert_eq!(status_of(read_json_limited(&h, over, 10).await).await, 413);
+        // Exactly at the limit is accepted (and the raw bytes come back unchanged).
+        let (bytes, v) = read_json_limited(&h, chunked(&[r#"{"a":"#, "1}"]), 7)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], br#"{"a":1}"#);
+        assert_eq!(v["a"], 1);
+        // One byte over, split so no single chunk exceeds the limit.
+        let r = read_json_limited(&h, chunked(&[r#"{"a":"#, "12}"]), 7).await;
+        assert_eq!(status_of(r).await, 413);
+    }
+
+    #[tokio::test]
+    async fn declared_length_over_limit_is_413_before_reading() {
+        let mut h = HeaderMap::new();
+        h.insert(CONTENT_LENGTH, HeaderValue::from_static("11"));
+        // The body would block forever if it were read.
+        let never = Body::from_stream(futures_util::stream::pending::<Result<Bytes, Infallible>>());
+        assert_eq!(status_of(read_json_limited(&h, never, 10).await).await, 413);
+    }
+
+    #[tokio::test]
+    async fn malformed_json_and_broken_body_are_400() {
+        let h = HeaderMap::new();
+        assert_eq!(
+            status_of(read_json_limited(&h, chunked(&["{nope"]), 100).await).await,
+            400
+        );
+        let broken = Body::from_stream(futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"{")),
+            Err(std::io::Error::other("client went away")),
+        ]));
+        assert_eq!(
+            status_of(read_json_limited(&h, broken, 100).await).await,
+            400
+        );
     }
 }
