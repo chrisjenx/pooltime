@@ -2250,7 +2250,7 @@ mod mgmt {
     }
 
     #[tokio::test]
-    async fn profiles_response_reports_each_dir_even_with_equal_ids() {
+    async fn equal_ids_refused_on_connect_reported_on_disconnect() {
         let pool = Pool::new();
         let srv = pool.boot(Boot::default()).await;
         let home = tempfile::tempdir().unwrap();
@@ -2270,10 +2270,14 @@ mod mgmt {
             Some(json!({ "profiles": names })),
         )
         .await;
-        assert_eq!(r.status, 200, "{}", r.text());
-        let v = r.json();
-        assert_eq!(v["profiles"][0]["settings_dir"], names[0]);
-        assert_eq!(v["profiles"][1]["settings_dir"], names[1]);
+        // One id for two dirs would share a snapshot and a config entry.
+        assert_eq!(r.status, 400, "{}", r.text());
+        assert!(message(&r).contains("same profile id"), "{}", r.text());
+        for d in &dirs {
+            let settings = std::fs::read_to_string(d.join("settings.json")).unwrap();
+            assert_eq!(settings, "{}", "nothing connected");
+        }
+        // Disconnect still reports each dir (a pair connected before the rule can be released).
         let r = call(
             &srv,
             "POST",

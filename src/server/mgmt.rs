@@ -1240,6 +1240,29 @@ pub fn resolve_profiles(
     resolve_profiles_in(names, configured, user_home().as_deref())
 }
 
+/// Refuse to connect two settings directories under one profile id (`/a/.claude-x` and
+/// `/b/.claude-x`): the id keys the snapshot and the config entry, so they would share both.
+/// Checked among `profiles` and against the already configured ones. Disconnect does not
+/// check, so a pair connected before this rule can still be released.
+pub fn check_unique_ids(profiles: &[Profile], configured: &[ProfileRef]) -> Result<(), String> {
+    let configured: Vec<Profile> = configured.iter().map(profile_of).collect();
+    for (i, p) in profiles.iter().enumerate() {
+        let dir = canonical(&p.settings_dir);
+        let others = profiles[..i].iter().chain(configured.iter());
+        for q in others {
+            if q.id == p.id && canonical(&q.settings_dir) != dir {
+                return Err(format!(
+                    "{} has the same profile id '{}' as {}; rename one of the directories",
+                    p.settings_dir.display(),
+                    p.id,
+                    q.settings_dir.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve profile names. A name containing `/` is a settings directory ([`profile_at`]).
 /// Anything else is an id ([`profile_id_arg`]), looked up among the configured profiles first
 /// and then the `~/.claude*` directories discovered under `home` (only read when needed). A
@@ -1425,6 +1448,7 @@ async fn profiles_connect(
                 ));
             }
         }
+        check_unique_ids(&profiles, &cfg.profiles).map_err(bad)?;
         Ok(profiles)
     })
     .await;
@@ -1951,5 +1975,31 @@ mod tests {
         }];
         let e = resolve_profiles_in(&[".claude".into()], &configured, Some(h)).unwrap_err();
         assert!(e.contains("would share"), "{e}");
+    }
+
+    #[test]
+    fn same_id_in_two_dirs_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let a = profile_dir(&h.join("a"), ".claude-x");
+        let b = profile_dir(&h.join("b"), ".claude-x");
+        let s = |p: &PathBuf| p.to_string_lossy().into_owned();
+
+        // Both in one request.
+        let both = resolve(&[&s(&a), &s(&b)], h).unwrap();
+        let e = check_unique_ids(&both, &[]).unwrap_err();
+        assert!(e.contains("'claude-x'"), "{e}");
+
+        // The second dir while the first is already connected.
+        let configured = [ProfileRef {
+            id: "claude-x".into(),
+            settings_dir: a.clone(),
+        }];
+        let second = resolve_profiles_in(&[s(&b)], &configured, Some(h)).unwrap();
+        let e = check_unique_ids(&second, &configured).unwrap_err();
+        assert!(e.contains("'claude-x'") && e.contains(&s(&a)), "{e}");
+        // The connected dir itself is still fine.
+        let first = resolve_profiles_in(&[s(&a)], &configured, Some(h)).unwrap();
+        check_unique_ids(&first, &configured).unwrap();
     }
 }
