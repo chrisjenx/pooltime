@@ -147,16 +147,32 @@ async fn handle(app: &Arc<AppState>, req: &InboundRequest) -> Response {
     resp
 }
 
-/// Point-in-time view of one account, read off the async runtime.
+/// View of one account at a point in time. `creds_ok` comes from the per-pass registry read;
+/// the state fields are re-read live by [`live_view`] on every pick.
 struct Acct {
     meta: AccountMeta,
+    creds_ok: bool,
     status: AccountStatus,
     spent: Vec<String>,
     snapshot: Option<RateLimitSnapshot>,
     active: u32,
 }
 
-/// Every registered account (all providers) with its live state, plus the total count.
+/// Current state of `meta` from the StateBook and Sessions (cheap, in-memory; safe to call from
+/// a `Reservations::reserve` pick closure).
+fn live_view(app: &AppState, meta: &AccountMeta, creds_ok: bool, now: OffsetDateTime) -> Acct {
+    Acct {
+        meta: meta.clone(),
+        creds_ok,
+        status: app.state.status(&meta.id, creds_ok, now),
+        spent: app.state.spent_families(&meta.id, now),
+        snapshot: app.state.state(&meta.id, now).snapshot,
+        active: app.sessions.active_count(&meta.id, now),
+    }
+}
+
+/// Every registered account (all providers) with its state at `now`. The registry and
+/// credential files are read off the async runtime.
 async fn load_accounts(app: &Arc<AppState>, now: OffsetDateTime) -> Vec<Acct> {
     let app = app.clone();
     let job = tokio::task::spawn_blocking(move || {
@@ -165,13 +181,7 @@ async fn load_accounts(app: &Arc<AppState>, now: OffsetDateTime) -> Vec<Acct> {
             .into_iter()
             .map(|meta| {
                 let creds_ok = matches!(app.registry.read_creds(&meta.id), Ok(Some(_)));
-                Acct {
-                    status: app.state.status(&meta.id, creds_ok, now),
-                    spent: app.state.spent_families(&meta.id, now),
-                    snapshot: app.state.state(&meta.id, now).snapshot,
-                    active: app.sessions.active_count(&meta.id, now),
-                    meta,
-                }
+                live_view(&app, &meta, creds_ok, now)
             })
             .collect()
     });
@@ -326,14 +336,23 @@ async fn serve_provider(
         let now = OffsetDateTime::now_utc();
         let accts = load_accounts(app, now).await;
         total_accounts = accts.len();
-        let pin = user.and_then(|u| app.sessions.pinned(pid, u, now));
+        // Registry metadata and credential presence come from this pass; account state, load
+        // and the session pin are re-read live on every pick, because `reserve` may re-pick
+        // many times while it waits for a slot (a bench or an expired cooldown must count).
         let pick = |has_room: &dyn Fn(&AccountId) -> bool| {
-            let cands: Vec<Candidate<'_>> = accts
+            let now = OffsetDateTime::now_utc();
+            let live: Vec<Acct> = accts
+                .iter()
+                .filter(|a| a.meta.provider == pid && !tried.contains(&a.meta.id))
+                .filter(|a| has_room(&a.meta.id))
+                .map(|a| live_view(app, &a.meta, a.creds_ok, now))
+                .collect();
+            let cands: Vec<Candidate<'_>> = live
                 .iter()
                 .filter(|a| usable(&a.meta, &a.status, pid, family, &a.spent, &tried))
-                .filter(|a| has_room(&a.meta.id))
                 .map(candidate)
                 .collect();
+            let pin = user.and_then(|u| app.sessions.pinned(pid, u, now));
             pick_account(&cands, pin.as_ref(), &tuning, &app.cursor, now, family).cloned()
         };
         let Some(reservation) = app.reservations.reserve(pick, pid, budget).await else {

@@ -8,7 +8,7 @@ use axum::response::Response;
 use time::OffsetDateTime;
 
 use crate::accounts::AccountId;
-use crate::errors::{FailReason, RefreshErrorKind};
+use crate::errors::FailReason;
 use crate::providers::anthropic::{RETRYABLE_TRANSPORT_HEADER, UPSTREAM_REJECTED_HEADER};
 use crate::providers::ProviderId;
 use crate::routing::{choose, score, Candidate, Tuning};
@@ -46,26 +46,18 @@ pub struct Served {
 }
 
 impl Served {
-    /// Whether retrying the whole request on the other provider is sensible: whole-pool
-    /// exhaustion or overload (quota, surfaced overload, 429/500/503/529, no account) or an
-    /// exhausted transport failure. Never for an upstream per-request refusal.
+    /// Whether retrying the whole request on the other provider is sensible (bro rule): the
+    /// response status is 429/500/503/529 (whole-pool exhaustion, overload, or no account) or it
+    /// is flagged `x-pool-retryable-transport: 1`. Never for an upstream per-request refusal
+    /// (`x-pool-upstream-rejected`). The verdict is for logging only.
     pub fn cross_provider_retryable(&self) -> bool {
         let h = self.response.headers();
         if h.contains_key(UPSTREAM_REJECTED_HEADER) {
             return false;
         }
-        match self.verdict {
-            Verdict::Served => false,
-            Verdict::NoAccount => true,
-            Verdict::Failed(FailReason::UpstreamRejected) => false,
-            Verdict::Failed(r) => {
-                r.cross_provider_retryable()
-                    || matches!(r, FailReason::Refresh(RefreshErrorKind::Network(_)))
-                    || h.get(RETRYABLE_TRANSPORT_HEADER)
-                        .is_some_and(|v| v.as_bytes() == b"1")
-                    || CROSS_PROVIDER_RETRY_STATUSES.contains(&self.response.status().as_u16())
-            }
-        }
+        CROSS_PROVIDER_RETRY_STATUSES.contains(&self.response.status().as_u16())
+            || h.get(RETRYABLE_TRANSPORT_HEADER)
+                .is_some_and(|v| v.as_bytes() == b"1")
     }
 }
 

@@ -111,6 +111,10 @@ impl Pool {
         if let Some(edit) = opts.configure {
             edit(&mut cfg);
         }
+        let reservations = pooltime::routing::reserve::Reservations::new(HashMap::from([
+            (ProviderId::Anthropic, cfg.routing.anthropic_max_inflight),
+            (ProviderId::OpenAi, cfg.routing.codex_max_inflight),
+        ]));
         let paths = Paths::under(self.dir.path());
         let sessions = Arc::new(pooltime::routing::sessions::Sessions::load(
             self.store.clone(),
@@ -123,7 +127,7 @@ impl Pool {
                 self.reg.clone(),
                 self.state.clone(),
                 sessions,
-                pooltime::routing::reserve::Reservations::new(Default::default()),
+                reservations,
                 opts.models
                     .unwrap_or_else(pooltime::models::ModelTable::defaults),
                 opts.providers,

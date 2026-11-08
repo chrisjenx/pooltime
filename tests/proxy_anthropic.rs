@@ -2113,4 +2113,118 @@ mod inference {
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "ids not unique: {ids:?}");
     }
+
+    fn capped(c: &mut pooltime::config::Config) {
+        c.routing.anthropic_max_inflight = 1;
+        c.timeouts.inflight_wait = Duration::from_secs(30);
+    }
+
+    /// Hold `id`'s only slot (cap 1) until the returned reservation drops.
+    async fn hold_slot(booted: &support::Booted, id: &str) -> Reservation {
+        let id: pooltime::accounts::AccountId = id.parse().unwrap();
+        booted
+            .app
+            .reservations
+            .reserve(
+                move |_| Some(id.clone()),
+                ProviderId::Anthropic,
+                &WaitBudget::new(Duration::from_secs(1)),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn slot_wait_sees_live_account_state() {
+        // 1. The only account is at cap; it gets benched while the request waits for its slot.
+        //    The wait must end at once (nothing usable) instead of running out the 30 s budget
+        //    and then over-cap-reserving a benched account.
+        let fake = FakeAnthropic::start().await;
+        fake.script(MESSAGES, vec![Reply::json(200, &ok_message(1, 1))]);
+        let pool = Pool::new();
+        let booted = pool
+            .boot(Boot {
+                configure: Some(Box::new(capped)),
+                ..Boot::default().provider(anthropic(&pool, &fake))
+            })
+            .await;
+        let held = hold_slot(&booted, "work").await;
+        let addr = booted.addr;
+        let started = std::time::Instant::now();
+        let waiting = tokio::spawn(async move { post(addr, &simple_body()).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "request should wait for the slot");
+        limited(&pool, "work");
+        let resp = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("waiting request did not notice the bench")
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(resp.status, 503, "{}", resp.text());
+        assert_eq!(resp.json()["error"]["message"], ALL_UNAVAILABLE_MESSAGE);
+        assert!(fake.requests_to(MESSAGES).is_empty());
+        drop(held);
+
+        // 2. The other account's cooldown expires during the wait: it becomes pickable.
+        let fake = FakeAnthropic::start().await;
+        fake.script(MESSAGES, vec![Reply::json(200, &ok_message(1, 1))]);
+        let pool = Pool::new();
+        pool.add_account("b", ProviderId::Anthropic, 100, "tok-b");
+        let now = OffsetDateTime::now_utc();
+        pool.state.mark_rate_limited(
+            &"b".parse().unwrap(),
+            now + time::Duration::seconds(1),
+            None,
+            now,
+        );
+        let booted = pool
+            .boot(Boot {
+                configure: Some(Box::new(capped)),
+                ..Boot::default().provider(anthropic(&pool, &fake))
+            })
+            .await;
+        let held = hold_slot(&booted, "work").await;
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(Duration::from_secs(6), post(booted.addr, &simple_body()))
+            .await
+            .expect("expired cooldown was not noticed during the wait");
+        assert!(started.elapsed() < Duration::from_secs(6));
+        assert_eq!(resp.status, 200, "{}", resp.text());
+        assert_eq!(resp.header("x-pool-account"), Some("b"));
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn quota_wording_on_400_does_not_hop() {
+        // Classified as quota (bench + failover within Anthropic), but the surfaced status is
+        // 400, which is not in bro's cross-provider set: no hop.
+        let fake = FakeAnthropic::start().await;
+        fake.script(
+            MESSAGES,
+            vec![Reply::error(
+                400,
+                "invalid_request_error",
+                "usage limit reached",
+            )],
+        );
+        let pool = Pool::new();
+        pool.add_account("codex1", ProviderId::OpenAi, 100, "tok-codex");
+        let codex = FakeProvider::new(ProviderId::OpenAi, |_, _| done(json!({"from": "codex"})));
+        let booted = pool
+            .boot(Boot {
+                models: Some(mapped_models()),
+                ..Boot::default()
+                    .provider(anthropic(&pool, &fake))
+                    .provider(codex.clone())
+            })
+            .await;
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 400, "{}", resp.text());
+        assert!(codex.calls().is_empty());
+        assert!(matches!(
+            pool.state
+                .status(&pool.meta.id, true, OffsetDateTime::now_utc()),
+            AccountStatus::RateLimited { .. }
+        ));
+    }
 }
