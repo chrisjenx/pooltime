@@ -1,0 +1,8 @@
+{"run_id":"1794106936-159606000","line":792,"new":{"module_name":"pooltime__signin__claude__tests","snapshot_name":"authorize_url_has_expected_params_and_login_hint","metadata":{"source":"src/signin/claude.rs","assertion_line":792,"expression":"p.authorize_url"},"snapshot":"https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload+user%3Aplugins&code_challenge=nw4Cig7sk_DT0QSX9Qn-3UKs33fmbbp8bRuv1b5-wXw&code_challenge_method=S256&state=test-state-fixed&login_hint=me%2Btag%40example.com"},"old":{"module_name":"pooltime__signin__claude__tests","metadata":{},"snapshot":"https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload+user%3Aplugins&code_challenge=PLACEHOLDER&code_challenge_method=S256&state=test-state-fixed&login_hint=me%2Btag%40example.com"}}
+{"run_id":"1794106951-490626000","line":800,"new":null,"old":null}
+{"run_id":"1794106955-525351000","line":800,"new":null,"old":null}
+{"run_id":"1794106956-186687000","line":800,"new":null,"old":null}
+{"run_id":"1794106956-685159000","line":800,"new":null,"old":null}
+{"run_id":"1794106957-152169000","line":800,"new":null,"old":null}
+{"run_id":"1794106957-626037000","line":800,"new":null,"old":null}
+{"run_id":"1794106979-2040000","line":800,"new":null,"old":null}
