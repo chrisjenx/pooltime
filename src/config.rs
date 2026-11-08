@@ -351,12 +351,16 @@ impl Default for OpenAiCfg {
 pub struct AlertsCfg {
     /// Warn this many days before a credential/subscription expires.
     pub warn_days: Vec<u32>,
+    /// Desktop notifications for alert events (the daemon only). Off: events are still recorded
+    /// and logged, nothing is shown.
+    pub notify: bool,
 }
 
 impl Default for AlertsCfg {
     fn default() -> Self {
         AlertsCfg {
             warn_days: vec![3, 1],
+            notify: true,
         }
     }
 }
@@ -445,6 +449,13 @@ impl Config {
         if let Some(v) = var("POOLTIME_PROXY_KEY") {
             self.proxy_key = Some(v);
         }
+        if let Some(v) = var("POOLTIME_ALERTS_NOTIFY") {
+            self.alerts.notify = match v.to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" => true,
+                "0" | "false" | "off" => false,
+                _ => return Err(anyhow!("POOLTIME_ALERTS_NOTIFY must be true or false")),
+            };
+        }
         Ok(())
     }
 
@@ -507,6 +518,7 @@ mod tests {
         assert_eq!(c.routing.anthropic_max_inflight, 0);
         assert_eq!(c.retention.journal_days, 30);
         assert_eq!(c.alerts.warn_days, vec![3, 1]);
+        assert!(c.alerts.notify);
         assert_eq!(c.anthropic.user_agent, "claude-code/2.1.319");
         assert_eq!(c.openai.client_id, "app_EMoamEEZ73f0CkXaXp7hrann");
     }
@@ -650,6 +662,17 @@ mod tests {
         let again = Config::load_file(&p).unwrap();
         assert_eq!(again.timeouts.anthropic_idle, Duration::from_secs(10));
         assert_eq!(again.alerts.warn_days, vec![7]);
+    }
+
+    #[test]
+    fn alerts_notify_env_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths::under(dir.path());
+        let off = Config::load_with_env(&p, env_of(&[("POOLTIME_ALERTS_NOTIFY", "0")])).unwrap();
+        assert!(!off.alerts.notify);
+        let on = Config::load_with_env(&p, env_of(&[("POOLTIME_ALERTS_NOTIFY", "true")])).unwrap();
+        assert!(on.alerts.notify);
+        assert!(Config::load_with_env(&p, env_of(&[("POOLTIME_ALERTS_NOTIFY", "maybe")])).is_err());
     }
 
     #[test]

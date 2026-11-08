@@ -164,6 +164,11 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
                 }
             }
         }),
+        // Expiry / dead-account notifications (spec §4 "Alerts").
+        crate::health::alerts::spawn_alerts(
+            app.clone(),
+            Arc::new(crate::health::notify::SystemNotifier::from_env()),
+        ),
         spawn_every(SESSION_PRUNE_EVERY, move || {
             sessions.prune(OffsetDateTime::now_utc());
             std::future::ready(())

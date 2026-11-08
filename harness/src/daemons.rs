@@ -455,6 +455,8 @@ pub async fn start_pooltime(
         .env("HOME", &home)
         .env("TMPDIR", &tmp)
         .env("POOLTIME_HOME", &pt_home)
+        // Never a real desktop notification from a sandboxed daemon.
+        .env("POOLTIME_ALERTS_NOTIFY", "false")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))

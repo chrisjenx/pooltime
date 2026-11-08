@@ -41,6 +41,9 @@ class Pooltime < Formula
 
       Run the daemon either with `pooltime service install` (what `pooltime setup` offers)
       or with `brew services start pooltime`, not both: they would compete for the same port.
+
+      Recommended on macOS, for notifications that open the dashboard when clicked:
+        brew install terminal-notifier
     EOS
   end
 
