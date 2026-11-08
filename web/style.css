@@ -316,3 +316,15 @@ dialog form input { flex: 1; min-width: 200px; }
   main { padding: 12px; }
   .cards { grid-template-columns: 1fr; }
 }
+
+/* Weekly burn chart (SVG; presentation via classes only, CSP style-src 'self'). */
+svg.burn { display: block; width: 100%; height: auto; max-height: 240px; margin: 6px 0 4px; }
+svg.burn .grid { stroke: var(--line); stroke-width: 1; }
+svg.burn .cap { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 3; }
+svg.burn .axis { fill: var(--muted); font-size: 10px; }
+svg.burn .val { fill: var(--text); font-size: 10px; }
+svg.burn .used { fill: var(--accent); opacity: 0.55; }
+svg.burn .used.cur { opacity: 1; }
+svg.burn .proj { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 3 2; }
+svg.burn .hit { fill: transparent; }
+svg.burn g:hover .used { opacity: 1; }

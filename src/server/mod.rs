@@ -6,6 +6,7 @@
 //! the startup preflight, [`shutdown`] owns signal handling and the drain sequence, [`daemon`]
 //! boots it all for `pooltime serve`.
 
+pub mod analytics_api;
 pub mod auth;
 pub mod classifier;
 pub mod daemon;

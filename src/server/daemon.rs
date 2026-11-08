@@ -173,10 +173,19 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
             sessions.prune(OffsetDateTime::now_utc());
             std::future::ready(())
         }),
+        // Weekly-burn history (spec §5): 7-day utilization samples on every state change.
+        crate::analytics::sampler::spawn_sampler(
+            app.registry.clone(),
+            app.state.clone(),
+            store.clone(),
+        ),
         spawn_every(RETENTION_EVERY, move || {
             let (store, cfg) = (store.clone(), retention_cfg.clone());
             async move {
-                match prune(&store, &cfg, OffsetDateTime::now_utc()).await {
+                // Local time: usage-history buckets follow the local ISO weeks of the burn report.
+                let now = OffsetDateTime::now_utc();
+                let now = now.to_offset(crate::analytics::local_offset(now));
+                match prune(&store, &cfg, now).await {
                     Ok(r) => tracing::debug!(report = ?r, "retention prune finished"),
                     Err(e) => tracing::warn!(error = %e, "retention prune failed"),
                 }

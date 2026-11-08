@@ -5,6 +5,7 @@
 //! ```text
 //! pooltime 0.1.0 on 127.0.0.1:3460
 //! pool 2/3 ready · 7d 23% left
+//! this week: 1.4 subs used · on pace for ~2.6 of 3
 //!
 //! ACCOUNT  PROVIDER   STATUS       7D LEFT  PRIO  WEIGHT  EMAIL
 //! gamma    anthropic  needs_login  -        0     1       -
@@ -21,6 +22,9 @@
 //! account without a known 7-day window (including one that needs login) counts as empty.
 //! Per account it is that account's own `seven_day_left`, `-` when unknown. Percentages are
 //! rounded to whole numbers.
+//!
+//! The "this week" line comes from `GET /api/v1/analytics/burn` (needs the management key); it is
+//! left out when that call fails.
 
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -173,8 +177,25 @@ pub fn pool_seven_day_left(status: &Value) -> Option<f64> {
         .map(|t| t / n as f64)
 }
 
+/// `this week: 4.9 subs used · on pace for ~6.2 of 7` from `GET /api/v1/analytics/burn`
+/// (without the pace in the week's first hour); `None` when the document lacks the numbers.
+pub fn burn_line(burn: &Value) -> Option<String> {
+    let f = &burn["forecast"];
+    let used = f["subs_used_so_far"].as_f64()?;
+    let n = f["accounts"].as_u64()?;
+    Some(match f["projected"].as_f64() {
+        Some(p) => format!("this week: {used:.1} subs used · on pace for ~{p:.1} of {n}"),
+        None => format!("this week: {used:.1} subs used of {n}"),
+    })
+}
+
 /// The whole summary.
 pub fn render(status: &Value, addr: &str) -> String {
+    render_with_burn(status, None, addr)
+}
+
+/// [`render`] plus the weekly-burn line when `burn` (the burn API answer) is available.
+pub fn render_with_burn(status: &Value, burn: Option<&Value>, addr: &str) -> String {
     let pool = &status["pool"];
     let n = pool["accounts"].as_u64().unwrap_or(0);
     let left = pool_seven_day_left(status);
@@ -184,6 +205,10 @@ pub fn render(status: &Value, addr: &str) -> String {
         pool["available"].as_u64().unwrap_or(0),
         pct(left)
     );
+    if let Some(line) = burn.and_then(burn_line) {
+        // Right under the pool line (before its blank separator).
+        out.insert_str(out.len() - 1, &format!("{line}\n"));
+    }
     out.push_str(&accounts_table(status));
     let alerts = alerts(status);
     if !alerts.is_empty() {
@@ -197,7 +222,16 @@ pub async fn run(client: &Client, json: bool) -> anyhow::Result<i32> {
     if json {
         println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
-        print!("{}", render(&status, &client.addr.to_string()));
+        // Optional: an older daemon or a missing key just leaves the line out.
+        let burn = client
+            .get_authed_opt("/api/v1/analytics/burn?weeks=1")
+            .await
+            .ok()
+            .flatten();
+        print!(
+            "{}",
+            render_with_burn(&status, burn.as_ref(), &client.addr.to_string())
+        );
     }
     Ok(0)
 }
@@ -273,6 +307,26 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    #[test]
+    fn status_shows_weekly_burn_line() {
+        let s = json!({"version": "0.1.0", "pool": {"accounts": 3, "available": 3,
+            "seven_day_left_total": 1.2}, "accounts": []});
+        let burn = json!({"weeks": [], "idle_accounts": [], "forecast": {"week": "2026-W45",
+            "subs_used_so_far": 1.44, "elapsed_fraction": 0.55, "projected": 2.618, "accounts": 3}});
+        let out = render_with_burn(&s, Some(&burn), "x");
+        assert!(
+            out.contains("pool 3/3 ready · 7d 40% left\nthis week: 1.4 subs used · on pace for ~2.6 of 3\n\n"),
+            "{out}"
+        );
+        let mut early = burn.clone();
+        early["forecast"]["projected"] = Value::Null;
+        let out = render_with_burn(&s, Some(&early), "x");
+        assert!(out.contains("this week: 1.4 subs used of 3\n"), "{out}");
+        // No burn document (endpoint failed): the line is simply absent.
+        assert!(!render_with_burn(&s, None, "x").contains("this week"));
+        assert!(!render_with_burn(&s, Some(&json!({"error": {}})), "x").contains("this week"));
     }
 
     #[test]

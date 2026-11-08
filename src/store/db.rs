@@ -293,6 +293,7 @@ mod tests {
                 "CREATE TABLE journal_requests (id TEXT PRIMARY KEY, ts INTEGER, model TEXT, provider TEXT, status INTEGER, outcome TEXT, ttfb_ms INTEGER, total_ms INTEGER, input_tokens INTEGER, output_tokens INTEGER, cache_read INTEGER, cache_write INTEGER, session_hash TEXT);
                  CREATE TABLE journal_attempts (request_id TEXT, n INTEGER, account TEXT, provider TEXT, outcome TEXT, reason TEXT, upstream_status INTEGER, upstream_request_id TEXT, ms INTEGER);
                  CREATE TABLE account_state_quarantine (account TEXT, ts INTEGER, json TEXT);
+                 CREATE TABLE usage_samples (ts INTEGER, account TEXT, window TEXT, utilization REAL, reset INTEGER, granularity TEXT);
                  INSERT INTO journal_requests(id, ts, outcome) VALUES ('old', 1, 'completed');",
             )
             .unwrap();
@@ -309,7 +310,10 @@ mod tests {
         };
         {
             let store = Store::open(&path).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 3);
+            assert_eq!(
+                store.schema_version().unwrap(),
+                super::super::SCHEMA_VERSION
+            );
             let (r, a) = (row.clone(), Vec::<AttemptRow>::new());
             let rt = tokio::runtime::Builder::new_current_thread()
                 .build()
@@ -323,7 +327,10 @@ mod tests {
         }
         // A second open is a no-op: same version, rows intact.
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            super::super::SCHEMA_VERSION
+        );
         assert_eq!(store.read(journal::count).unwrap(), 2);
         assert_eq!(
             store.read(|c| journal::get(c, "new")).unwrap().unwrap().0,

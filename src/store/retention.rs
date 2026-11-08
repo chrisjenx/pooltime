@@ -2,10 +2,13 @@
 //! downsampling of `usage_samples` (hourly -> daily -> weekly -> deleted), and
 //! a `VACUUM` when enough pages were freed.
 
+use std::collections::BTreeMap;
+
 use anyhow::Context;
 use rusqlite::{params, Connection};
 use time::OffsetDateTime;
 
+use super::usage_history::{self, day_start, week_start, Granularity, HistRow};
 use super::Store;
 use crate::config::RetentionCfg;
 
@@ -39,20 +42,30 @@ pub struct PruneReport {
     pub vacuumed: bool,
 }
 
+/// One retention run at `now`. Usage-history buckets are local days / ISO weeks at `now`'s UTC
+/// offset (the daemon passes the local time, so they line up with the burn report's weeks).
 pub async fn prune(
     store: &Store,
     cfg: &RetentionCfg,
     now: OffsetDateTime,
 ) -> anyhow::Result<PruneReport> {
     let cfg = cfg.clone();
+    let off = i64::from(now.offset().whole_seconds());
     let now = now.unix_timestamp();
-    store.exec(move |conn| prune_conn(conn, &cfg, now)).await
+    store
+        .exec(move |conn| prune_conn(conn, &cfg, now, off))
+        .await
 }
 
-fn prune_conn(conn: &mut Connection, cfg: &RetentionCfg, now: i64) -> anyhow::Result<PruneReport> {
+fn prune_conn(
+    conn: &mut Connection,
+    cfg: &RetentionCfg,
+    now: i64,
+    off: i64,
+) -> anyhow::Result<PruneReport> {
     let mut rep = PruneReport::default();
     prune_journal(conn, cfg, now, &mut rep).context("prune journal")?;
-    downsample_usage(conn, cfg, now, &mut rep).context("downsample usage history")?;
+    downsample_usage(conn, cfg, now, off, &mut rep).context("downsample usage history")?;
 
     let (pages, free) = page_counts(conn)?;
     if pages > 0 && (free as f64) / (pages as f64) > VACUUM_FREE_FRACTION {
@@ -144,41 +157,30 @@ fn downsample_usage(
     conn: &mut Connection,
     cfg: &RetentionCfg,
     now: i64,
+    off: i64,
     rep: &mut PruneReport,
 ) -> anyhow::Result<()> {
-    // Cutoffs are aligned to a day / ISO-week boundary so a bucket is always
-    // rolled up whole and a re-run never produces a second row for it.
-    let hourly_cut = (now - i64::from(cfg.history_hourly_days) * DAY).div_euclid(DAY) * DAY;
-    let daily_days = (now - i64::from(cfg.history_daily_days) * DAY).div_euclid(DAY);
-    // Epoch day 0 was a Thursday, so (day + 3) % 7 == 0 on Mondays.
-    let weekly_cut = (daily_days - (daily_days + 3).rem_euclid(7)) * DAY;
+    // Cutoffs are aligned to a local day / ISO-week boundary so a bucket is
+    // always rolled up whole (a bucket that already exists absorbs late rows).
+    let hourly_cut = day_start(now - i64::from(cfg.history_hourly_days) * DAY, off);
+    let weekly_cut = week_start(now - i64::from(cfg.history_daily_days) * DAY, off);
     let expire_cut = now - i64::from(cfg.history_weekly_days) * DAY;
 
     let tx = conn.transaction()?;
-    rep.usage_daily_created = tx.execute(
-        "INSERT INTO usage_samples(ts, account, window, utilization, reset, granularity)
-         SELECT (ts / 86400) * 86400, account, window, AVG(utilization), MAX(reset), 'daily'
-         FROM usage_samples WHERE granularity = 'hourly' AND ts < ?1
-         GROUP BY account, window, ts / 86400",
-        [hourly_cut],
-    )? as u64;
-    rep.usage_hourly_rolled_up = tx.execute(
-        "DELETE FROM usage_samples WHERE granularity = 'hourly' AND ts < ?1",
-        [hourly_cut],
-    )? as u64;
-
-    rep.usage_weekly_created = tx.execute(
-        "INSERT INTO usage_samples(ts, account, window, utilization, reset, granularity)
-         SELECT (ts / 86400 - (ts / 86400 + 3) % 7) * 86400, account, window,
-                AVG(utilization), MAX(reset), 'weekly'
-         FROM usage_samples WHERE granularity = 'daily' AND ts < ?1
-         GROUP BY account, window, ts / 86400 - (ts / 86400 + 3) % 7",
-        [weekly_cut],
-    )? as u64;
-    rep.usage_daily_rolled_up = tx.execute(
-        "DELETE FROM usage_samples WHERE granularity = 'daily' AND ts < ?1",
-        [weekly_cut],
-    )? as u64;
+    let (rolled, created) = rollup(&tx, Granularity::Raw, Granularity::Daily, hourly_cut, |t| {
+        day_start(t, off)
+    })?;
+    rep.usage_hourly_rolled_up = rolled;
+    rep.usage_daily_created = created;
+    let (rolled, created) = rollup(
+        &tx,
+        Granularity::Daily,
+        Granularity::Weekly,
+        weekly_cut,
+        |t| week_start(t, off),
+    )?;
+    rep.usage_daily_rolled_up = rolled;
+    rep.usage_weekly_created = created;
 
     rep.usage_expired = tx.execute(
         "DELETE FROM usage_samples WHERE ts < ?1",
@@ -186,6 +188,79 @@ fn downsample_usage(
     )? as u64;
     tx.commit()?;
     Ok(())
+}
+
+/// Fold every `src` row older than `cut` into one `dst` row per (account, window, bucket):
+/// consumption between the folded readings is kept in `consumed`, the first and last readings
+/// as the bucket's ends (see [`usage_history`]), so weekly burn totals come out the same. An
+/// existing `dst` row for the bucket is folded in too. Returns `(rows rolled up, rows created)`.
+fn rollup(
+    tx: &Connection,
+    src: Granularity,
+    dst: Granularity,
+    cut: i64,
+    bucket_of: impl Fn(i64) -> i64,
+) -> anyhow::Result<(u64, u64)> {
+    let mut st = tx.prepare(&format!(
+        "SELECT {} FROM usage_samples WHERE granularity = ?1 AND ts < ?2",
+        usage_history::COLUMNS
+    ))?;
+    let src_rows: Vec<(i64, Option<HistRow>)> = st
+        .query_map(params![src.as_str(), cut], usage_history::from_row)?
+        .collect::<Result<_, _>>()?;
+    if src_rows.is_empty() {
+        return Ok((0, 0));
+    }
+    let mut groups: BTreeMap<(String, String, i64), Vec<HistRow>> = BTreeMap::new();
+    let mut rolled = 0u64;
+    for (rowid, row) in src_rows {
+        let Some(row) = row else { continue };
+        tx.execute("DELETE FROM usage_samples WHERE rowid = ?1", [rowid])?;
+        rolled += 1;
+        let key = (
+            row.account.clone(),
+            row.window.clone(),
+            bucket_of(row.anchor()),
+        );
+        groups.entry(key).or_default().push(row);
+    }
+    let mut existing = tx.prepare(&format!(
+        "SELECT {} FROM usage_samples WHERE granularity = ?1 AND account = ?2 AND window = ?3 AND ts = ?4",
+        usage_history::COLUMNS
+    ))?;
+    let mut created = 0u64;
+    for ((account, window, start), mut rows) in groups {
+        let old: Vec<(i64, Option<HistRow>)> = existing
+            .query_map(
+                params![dst.as_str(), account, window, start],
+                usage_history::from_row,
+            )?
+            .collect::<Result<_, _>>()?;
+        if old.is_empty() {
+            created += 1;
+        }
+        for (rowid, row) in old {
+            tx.execute("DELETE FROM usage_samples WHERE rowid = ?1", [rowid])?;
+            rows.extend(row);
+        }
+        rows.sort_by(|a, b| a.first.ts.cmp(&b.first.ts).then(a.last.ts.cmp(&b.last.ts)));
+        let Some((consumed, first, last)) = usage_history::fold(&rows) else {
+            continue;
+        };
+        usage_history::insert_bucket(
+            tx,
+            &HistRow {
+                account,
+                window,
+                gran: dst,
+                ts: start,
+                consumed,
+                first,
+                last,
+            },
+        )?;
+    }
+    Ok((rolled, created))
 }
 
 #[cfg(test)]
@@ -384,10 +459,24 @@ mod tests {
             .iter()
             .find(|r| r.0 == day0 && r.2 == "five_hour")
             .unwrap();
-        assert!((d0.3 - 0.2).abs() < 1e-9, "mean {}", d0.3);
-        assert_eq!(d0.4, 1002, "max reset");
+        // A bucket keeps its last reading and the consumption between its readings.
+        assert!((d0.3 - 0.3).abs() < 1e-9, "last {}", d0.3);
+        assert_eq!(d0.4, 1002, "last reset");
         let d1 = daily.iter().find(|r| r.0 == day0 + DAY).unwrap();
-        assert!((d1.3 - 0.7).abs() < 1e-9);
+        assert!((d1.3 - 0.9).abs() < 1e-9);
+        let consumed = |ts: i64| -> f64 {
+            store
+                .read(move |c| {
+                    Ok(c.query_row(
+                        "SELECT consumed FROM usage_samples WHERE granularity = 'daily' AND window = 'five_hour' AND ts = ?1",
+                        [ts],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap()
+        };
+        assert!((consumed(day0) - 0.2).abs() < 1e-9);
+        assert!((consumed(day0 + DAY) - 0.4).abs() < 1e-9);
         assert_eq!(d1.4, 2002);
         assert!(daily.iter().any(|r| r.2 == "seven_day" && r.0 == day0));
         let hourly: Vec<_> = rows.iter().filter(|r| r.5 == "hourly").collect();
@@ -446,7 +535,7 @@ mod tests {
             .unwrap();
         assert_eq!(weekly.len(), 2);
         assert_eq!(weekly[0].0, monday);
-        assert!((weekly[0].1 - 0.4).abs() < 1e-9);
+        assert!((weekly[0].1 - 0.7).abs() < 1e-9, "last reading");
         assert_eq!(weekly[0].2, 6);
         assert_eq!(weekly[1].0, monday + 7 * DAY);
         assert!((weekly[1].1 - 0.5).abs() < 1e-9);
