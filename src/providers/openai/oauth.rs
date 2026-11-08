@@ -791,6 +791,57 @@ mod tests {
         hex::encode(Sha256::digest(t.as_bytes()))[..16].to_string()
     }
 
+    #[tokio::test]
+    async fn successful_refresh_heals_an_unverified_account_and_a_transient_failure_does_not() {
+        let mut fx = fx(creds_expiring_in(3600));
+        let store = Arc::new(Store::open(&fx._dir.path().join("unverified.db")).unwrap());
+        store
+            .exec(|c| {
+                c.execute(
+                    "INSERT INTO account_state(account, json) VALUES ('codex', '{corrupt')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        fx.state = Arc::new(StateBook::load(store).unwrap());
+        assert!(fx.state.is_unverified(&fx.meta.id));
+        assert_eq!(fx.status(), AccountStatus::NeedsLogin);
+
+        let down = fake_token_endpoint(|_| reply(503, "unavailable")).await;
+        assert_eq!(
+            fx.provider(&down.url)
+                .access_token(&fx.meta, true)
+                .await
+                .unwrap_err(),
+            RefreshErrorKind::Server(503)
+        );
+        assert!(fx.state.is_unverified(&fx.meta.id));
+
+        let fake = fake_token_endpoint(|_| {
+            reply(
+                200,
+                serde_json::json!({
+                    "access_token": "healed",
+                    "refresh_token": "rt2",
+                    "expires_in": 3600,
+                })
+                .to_string(),
+            )
+        })
+        .await;
+        assert_eq!(
+            fx.provider(&fake.url)
+                .access_token(&fx.meta, true)
+                .await
+                .unwrap(),
+            "healed"
+        );
+        assert!(!fx.state.is_unverified(&fx.meta.id));
+        assert_eq!(fx.status(), AccountStatus::Ready);
+    }
+
     #[test]
     fn account_id_from_id_token() {
         let tok = id_token("acct-123", "me@example.com", "pro");

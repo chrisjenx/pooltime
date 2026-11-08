@@ -372,6 +372,8 @@ struct AccountFacts {
     /// `anthropic` / `openai`.
     provider: String,
     status: String,
+    /// The pool's classified reason for a non-ready status (live status only).
+    reason: Option<String>,
     refresh_expires_at: Option<OffsetDateTime>,
 }
 
@@ -398,6 +400,7 @@ async fn account_facts(paths: &Paths, daemon: Option<&Client>) -> Facts {
                         id: a["id"].as_str().unwrap_or("?").to_string(),
                         provider: a["provider"].as_str().unwrap_or("?").to_string(),
                         status: a["status"].as_str().unwrap_or("?").to_string(),
+                        reason: a["reason"].as_str().map(str::to_string),
                         refresh_expires_at: parse_ts(&a["refresh_expires_at"]),
                     })
                     .collect()
@@ -425,6 +428,7 @@ async fn account_facts(paths: &Paths, daemon: Option<&Client>) -> Facts {
                 id: m.id.as_str().to_string(),
                 provider: m.provider.as_str().to_string(),
                 status,
+                reason: None,
                 refresh_expires_at,
             }
         })
@@ -463,6 +467,13 @@ fn account_check(a: AccountFacts, live: bool, warn_days: u32, now: OffsetDateTim
         " (pool not running: from the files)"
     };
     match a.status.as_str() {
+        "needs_login" if a.reason.as_deref() == Some("state_unreadable") => {
+            return Check::new(Level::Fail, label, format!("needs login{source}")).hint(format!(
+                "account state was unreadable and is being re-verified — wait for the next usage \
+                 sweep or run `pooltime accounts recheck {}`",
+                a.id
+            ))
+        }
         "needs_login" => {
             return Check::new(Level::Fail, label, format!("needs login{source}")).hint(login)
         }
@@ -780,6 +791,7 @@ mod tests {
             id: "a".into(),
             provider: "anthropic".into(),
             status: status.into(),
+            reason: None,
             refresh_expires_at: days.map(|d| now + time::Duration::days(d)),
         };
         let lvl = |f| account_check(f, true, 3, now).level;
@@ -791,6 +803,33 @@ mod tests {
         assert_eq!(lvl(facts("needs_login", None)), Level::Fail);
         assert_eq!(lvl(facts("billing", None)), Level::Warn);
         assert_eq!(lvl(facts("rate_limited", None)), Level::Ok);
+    }
+
+    #[test]
+    fn unreadable_state_hints_at_recheck_not_login() {
+        let now = OffsetDateTime::now_utc();
+        let facts = |reason: Option<&str>| AccountFacts {
+            id: "a".into(),
+            provider: "anthropic".into(),
+            status: "needs_login".into(),
+            reason: reason.map(Into::into),
+            refresh_expires_at: None,
+        };
+        let c = account_check(facts(Some("state_unreadable")), true, 3, now);
+        assert_eq!(c.level, Level::Fail);
+        let line = c.to_string();
+        assert!(line.starts_with("✗ account a: "), "{line}");
+        assert!(
+            line.contains(
+                "account state was unreadable and is being re-verified — wait for the next usage \
+                 sweep or run `pooltime accounts recheck a`"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("accounts login"), "{line}");
+        // Any other reason keeps the login hint.
+        let line = account_check(facts(Some("refresh_token_dead")), true, 3, now).to_string();
+        assert!(line.contains("`pooltime accounts login a`"), "{line}");
     }
 
     #[test]

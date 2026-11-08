@@ -89,6 +89,9 @@ pub enum AccountsCmd {
         #[arg(long, short)]
         yes: bool,
     },
+    /// Re-verify an account now: clears a billing block, forces a token refresh when its saved
+    /// state was unreadable, and re-polls usage.
+    Recheck { name: String },
     /// Change an account's routing priority / weight.
     Set {
         name: String,
@@ -253,6 +256,21 @@ pub async fn run(paths: &Paths, cmd: AccountsCmd) -> anyhow::Result<i32> {
             c.delete(&format!("/api/v1/accounts/{}", seg(&name)))
                 .await?;
             println!("removed account '{name}'");
+            Ok(0)
+        }
+        AccountsCmd::Recheck { name } => {
+            let c = client::require(paths).await?;
+            let v = c
+                .post(
+                    &format!("/api/v1/accounts/{}/recheck", seg(&name)),
+                    json!({}),
+                )
+                .await?;
+            println!(
+                "'{name}': {} (usage poll: {})",
+                v["status"].as_str().unwrap_or("?"),
+                v["poll"].as_str().unwrap_or("?")
+            );
             Ok(0)
         }
         AccountsCmd::Set {
