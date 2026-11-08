@@ -1,8 +1,9 @@
 //! Anthropic (Claude Max) provider.
 //!
-//! Task 15 provides OAuth access-token handling ([`oauth`]). `access_token` is an *inherent*
-//! method for now; Task 18 adds `impl Provider for AnthropicProvider` (attempt / usage / catalog)
-//! and its trait `access_token` simply delegates here.
+//! Task 15 provides OAuth access-token handling ([`oauth`]); Task 16 adds rate-limit header
+//! parsing ([`ratelimit`]) and the usage poll + sweeper ([`usage`]). `access_token` and
+//! `poll_usage` are *inherent* methods for now; Task 18 adds `impl Provider for AnthropicProvider`
+//! (attempt / usage / catalog) and its trait `access_token` / `poll_usage` simply delegate here.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -13,8 +14,12 @@ use crate::config::AnthropicCfg;
 use crate::upstream::Upstream;
 
 mod oauth;
+mod ratelimit;
+mod usage;
 
 pub use oauth::expiry_after_refresh;
+pub use ratelimit::{has_quota_signal, parse_unified_headers};
+pub use usage::{spawn_usage_sweeper, SWEEP_INTERVAL};
 
 pub struct AnthropicProvider {
     cfg: AnthropicCfg,
@@ -27,6 +32,8 @@ pub struct AnthropicProvider {
     refresh_timeout: Duration,
     /// One in-flight refresh per account within this process.
     gates: Mutex<HashMap<AccountId, Arc<tokio::sync::Mutex<()>>>>,
+    /// One in-flight usage poll per account within this process (see [`usage`]).
+    usage_gates: Mutex<HashMap<AccountId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl AnthropicProvider {
@@ -46,6 +53,7 @@ impl AnthropicProvider {
             skew: time::Duration::seconds(300),
             refresh_timeout: Duration::from_secs(30),
             gates: Mutex::new(HashMap::new()),
+            usage_gates: Mutex::new(HashMap::new()),
         }
     }
 
