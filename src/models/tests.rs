@@ -46,9 +46,8 @@
 //! corrupt_file_falls_back_to_defaults (now: quarantined to models.toml.corrupt-<ts>),
 //! loaded_direct_routes_preserve_valid_effort_overrides (bro, fix round 1),
 //! effort_maps_round_trip_through_save_and_bro_json_import,
-//! effective_effort_prefers_mapping_row_then_route_map_then_pass_through.
+//! effective_effort_mapping_row_replaces_route_map_else_route_map_else_pass_through.
 
-use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 
 use super::*;
@@ -1061,7 +1060,7 @@ fn effort_maps_round_trip_through_save_and_bro_json_import() {
 }
 
 #[test]
-fn effective_effort_prefers_mapping_row_then_route_map_then_pass_through() {
+fn effective_effort_mapping_row_replaces_route_map_else_route_map_else_pass_through() {
     let t = from_toml(
         r#"[[models]]
 id = "r"
@@ -1073,15 +1072,21 @@ high = "medium"
 "#,
     );
     let def = &t.resolve("r").def;
-    let mapping: HashMap<String, String> = [("high".to_string(), "low".to_string())].into();
-    let eff = |m: Option<&HashMap<String, String>>, tier: &str| effective_effort(def, m, tier);
-    // mapping row wins over the route map
-    assert_eq!(eff(Some(&mapping), "high").as_deref(), Some("low"));
-    // route map used when the mapping row has no entry for the tier (or no mapping)
-    assert_eq!(eff(Some(&mapping), "max").as_deref(), Some("xhigh"));
+    let row = with_effort("sonnet", "r", &[("high", "low")]);
+    let bare_row = mapping("sonnet", "r");
+    let eff = |m: Option<&Mapping>, tier: &str| effective_effort(def, m, tier);
+    // mapping row applies: its entry wins
+    assert_eq!(eff(Some(&row), "high").as_deref(), Some("low"));
+    // mapping row applies but lacks the tier: pass-through, NOT the route's effort_map (bro)
+    assert_eq!(eff(Some(&row), "max").as_deref(), Some("max"));
+    // mapping row applies with no effort at all: route map is not consulted either
+    assert_eq!(eff(Some(&bare_row), "high").as_deref(), Some("high"));
+    assert_eq!(eff(Some(&bare_row), "default"), None);
+    // no mapping row: the route's effort_map, else 1:1
     assert_eq!(eff(None, "high").as_deref(), Some("medium"));
-    // otherwise 1:1, and "default" stays unset
+    assert_eq!(eff(None, "max").as_deref(), Some("xhigh"));
     assert_eq!(eff(None, "low").as_deref(), Some("low"));
+    // "default" stays unset
     assert_eq!(eff(None, "default"), None);
     let plain = defaults().resolve("gpt-6-sol").def;
     assert_eq!(
@@ -1090,7 +1095,7 @@ high = "medium"
     );
     assert_eq!(effective_effort(&plain, None, "default"), None);
     // an explicit override for "default" is honoured
-    let d: HashMap<String, String> = [("default".to_string(), "medium".to_string())].into();
+    let d = with_effort("sonnet", "gpt-6-sol", &[("default", "medium")]);
     assert_eq!(
         effective_effort(&plain, Some(&d), "default").as_deref(),
         Some("medium")
