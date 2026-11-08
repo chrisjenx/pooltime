@@ -25,7 +25,7 @@ use super::{
     FLOW_TTL,
 };
 use crate::accounts::{
-    fetch_identity, verify, AccountId, Credentials, Identity, Registry, StateBook, Verify,
+    fetch_profile, verify, AccountId, Credentials, Identity, Registry, StateBook, Verify,
 };
 use crate::config::AnthropicCfg;
 use crate::providers::anthropic::expiry_after_refresh;
@@ -244,6 +244,35 @@ struct TokenResponse {
     expires_in: Option<i64>,
     refresh_token_expires_in: Option<i64>,
     scope: Option<String>,
+    account: Option<TokenAccount>,
+    organization: Option<TokenOrg>,
+}
+
+/// The identity the token endpoint itself reports (docs/spikes.md S1: `account.{uuid,
+/// email_address}`, `organization.uuid`); the fallback when the profile call fails.
+#[derive(Deserialize)]
+struct TokenAccount {
+    uuid: Option<String>,
+    email_address: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TokenOrg {
+    uuid: Option<String>,
+}
+
+impl TokenResponse {
+    fn identity(&self) -> Identity {
+        let nonempty = |s: &Option<String>| s.clone().filter(|s| !s.trim().is_empty());
+        Identity {
+            account_uuid: self.account.as_ref().and_then(|a| nonempty(&a.uuid)),
+            email: self
+                .account
+                .as_ref()
+                .and_then(|a| nonempty(&a.email_address)),
+            org_uuid: self.organization.as_ref().and_then(|o| nonempty(&o.uuid)),
+        }
+    }
 }
 
 impl Flow {
@@ -401,6 +430,7 @@ impl Flow {
         let Ok(tok) = serde_json::from_str::<TokenResponse>(&body) else {
             return failed(format!("token response was not valid JSON{rid}"));
         };
+        let from_token = tok.identity();
         let (Some(access), Some(refresh)) = (
             tok.access_token.filter(|t| !t.is_empty()),
             tok.refresh_token.filter(|t| !t.is_empty()),
@@ -422,7 +452,9 @@ impl Flow {
             .split_whitespace()
             .map(str::to_owned)
             .collect();
-        let got = match fetch_identity(
+        // Prefer the profile; the token response's own identity covers a failed profile call
+        // (the code is already spent, so failing here would waste the user's sign-in).
+        let (got, plan, tier) = match fetch_profile(
             &self.upstream,
             &self.cfg.api_base,
             &access,
@@ -430,8 +462,25 @@ impl Flow {
         )
         .await
         {
-            Ok(i) => i,
-            Err(e) => return failed(format!("could not verify the signed-in account: {e:#}")),
+            Ok(p) => (merge(&from_token, p.identity), p.plan, p.tier),
+            Err(e) => {
+                tracing::warn!(account = %self.account, "profile fetch failed during sign-in; using the token response identity");
+                if from_token.account_uuid.is_none() && from_token.email.is_none() {
+                    return failed(format!("could not verify the signed-in account: {e:#}"));
+                }
+                (from_token, None, None)
+            }
+        };
+        if got.account_uuid.is_none() && got.email.is_none() {
+            return failed("could not verify the signed-in account: no identity reported".into());
+        }
+        // A re-login keeps what we already knew about the plan when the profile did not say.
+        let prev = {
+            let (reg, id) = (self.registry.clone(), self.account.clone());
+            tokio::task::spawn_blocking(move || reg.read_creds(&id).ok().flatten())
+                .await
+                .ok()
+                .flatten()
         };
         let creds = Credentials {
             provider: ProviderId::Anthropic,
@@ -441,8 +490,8 @@ impl Flow {
             // A new login starts a new token chain: no older expiry to take the min against.
             refresh_expires_at: expiry_after_refresh(None, tok.refresh_token_expires_in, now),
             scopes,
-            plan: None,
-            tier: None,
+            plan: plan.or_else(|| prev.as_ref().and_then(|c| c.plan.clone())),
+            tier: tier.or_else(|| prev.as_ref().and_then(|c| c.tier.clone())),
             openai_account_id: None,
         };
 
@@ -1018,6 +1067,13 @@ mod tests {
                 let mut s = fx.fake.script.lock().unwrap();
                 s.token_status = token_status;
                 s.profile_status = profile_status;
+                if profile_status != 200 {
+                    // No identity in the token response either: nothing to fall back to.
+                    s.token_body = serde_json::json!({
+                        "access_token": "at-new", "refresh_token": "rt-new", "expires_in": 3600
+                    })
+                    .to_string();
+                }
                 if token_status != 200 {
                     s.token_body =
                         r#"{"error":"invalid_grant","error_description":"secret-ish"}"#.into();
@@ -1117,5 +1173,91 @@ mod tests {
             SubmitError::AlreadyUsed
         );
         assert!(matches!(p.wait().await, SignInResult::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn profile_failure_falls_back_to_token_response_identity() {
+        // Saved: the token response's account matches the baseline.
+        let fx1 = fx(baseline_a(), UUID_A).await;
+        fx1.fake.script.lock().unwrap().profile_status = 500;
+        let p = fx1
+            .flow
+            .start(&fx1.id, None, SignInMode::PasteCode)
+            .unwrap();
+        p.submit_code(&format!("c#{STATE}")).unwrap();
+        assert!(matches!(p.wait().await, SignInResult::Saved { .. }));
+        assert_eq!(fx1.creds().access_token, "at-new");
+        assert_eq!(fx1.meta().identity, baseline_a());
+        assert!(!fx1.state.is_refresh_dead(&fx1.id, OLD_RT));
+
+        // Mismatch: the token response says another account signed in.
+        let fx2 = fx(baseline_a(), UUID_A).await;
+        {
+            let mut s = fx2.fake.script.lock().unwrap();
+            s.profile_status = 500;
+            s.token_body = serde_json::json!({
+                "access_token": "at-new", "refresh_token": "rt-new", "expires_in": 3600,
+                "account": {"uuid": UUID_B, "email_address": "other@example.com"},
+                "organization": {"uuid": ORG},
+            })
+            .to_string();
+        }
+        let p = fx2
+            .flow
+            .start(&fx2.id, None, SignInMode::PasteCode)
+            .unwrap();
+        p.submit_code(&format!("c#{STATE}")).unwrap();
+        match p.wait().await {
+            SignInResult::Mismatch { got, .. } => {
+                assert_eq!(got.account_uuid.as_deref(), Some(UUID_B));
+                assert_eq!(got.email.as_deref(), Some("other@example.com"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fx2.creds(), old_creds());
+    }
+
+    #[tokio::test]
+    async fn plan_and_tier_come_from_the_profile() {
+        let fx = fx(baseline_a(), UUID_A).await;
+        fx.fake.script.lock().unwrap().profile_body = serde_json::json!({
+            "account": {"uuid": UUID_A, "email": "me@example.com"},
+            "organization": {
+                "uuid": ORG,
+                "organization_type": "claude_max",
+                "rate_limit_tier": "default_claude_max_20x",
+            },
+        })
+        .to_string();
+        let mut prev = old_creds();
+        prev.plan = Some("pro".into());
+        prev.tier = Some("old-tier".into());
+        fx.reg.write_creds(&fx.id, &prev).unwrap();
+        let p = fx.flow.start(&fx.id, None, SignInMode::PasteCode).unwrap();
+        p.submit_code(&format!("c#{STATE}")).unwrap();
+        assert!(matches!(p.wait().await, SignInResult::Saved { .. }));
+        let c = fx.creds();
+        assert_eq!(c.plan.as_deref(), Some("max"));
+        assert_eq!(c.tier.as_deref(), Some("default_claude_max_20x"));
+    }
+
+    #[tokio::test]
+    async fn plan_and_tier_are_kept_when_the_profile_omits_them() {
+        // Profile without organization_type/rate_limit_tier, and a failed profile call.
+        for profile_status in [200, 500] {
+            let fx = fx(baseline_a(), UUID_A).await;
+            fx.fake.script.lock().unwrap().profile_status = profile_status;
+            let mut prev = old_creds();
+            prev.plan = Some("max".into());
+            prev.tier = Some("default_claude_max_5x".into());
+            fx.reg.write_creds(&fx.id, &prev).unwrap();
+            let p = fx.flow.start(&fx.id, None, SignInMode::PasteCode).unwrap();
+            p.submit_code(&format!("c#{STATE}")).unwrap();
+            assert!(matches!(p.wait().await, SignInResult::Saved { .. }));
+            let c = fx.creds();
+            assert_eq!(c.access_token, "at-new");
+            assert_eq!(c.plan.as_deref(), Some("max"), "profile {profile_status}");
+            assert_eq!(c.tier.as_deref(), Some("default_claude_max_5x"));
+        }
     }
 }
