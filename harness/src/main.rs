@@ -18,6 +18,8 @@ mod compare;
 mod daemons;
 mod fake;
 mod observe;
+#[cfg(test)]
+mod parity;
 mod scenarios;
 
 use std::fmt::Write as _;
