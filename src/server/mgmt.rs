@@ -583,7 +583,16 @@ async fn create_account(
         Ok(p) => p,
         Err(r) => return r,
     };
-    let (a, new_id) = (app.clone(), id.clone());
+    // `email` (optional) is the expected identity: the first sign-in must match it (email is
+    // the fallback match when no account uuid is on file) and it pre-fills the login page.
+    let email = match body.get("email") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_str().map(str::trim) {
+            Some(e) if e.len() > 2 && e.contains('@') => Some(e.to_string()),
+            _ => return bad("email must be an email address, e.g. you@example.com"),
+        },
+    };
+    let (a, new_id, mail) = (app.clone(), id.clone(), email.clone());
     let created = blocking(move || {
         if a.registry.get(&new_id).is_some() {
             return Err(anthropic_error(
@@ -592,18 +601,18 @@ async fn create_account(
                 &format!("account '{new_id}' already exists"),
             ));
         }
-        a.registry
-            .upsert(AccountMeta::new(new_id, provider))
-            .map_err(|e| {
-                tracing::error!(error = %format!("{e:#}"), "could not create account");
-                internal("could not create the account")
-            })
+        let mut meta = AccountMeta::new(new_id, provider);
+        meta.identity.email = mail;
+        a.registry.upsert(meta).map_err(|e| {
+            tracing::error!(error = %format!("{e:#}"), "could not create account");
+            internal("could not create the account")
+        })
     })
     .await;
     match created {
         Ok(Ok(())) => json_response(
             StatusCode::CREATED,
-            json!({ "ok": true, "id": id.as_str(), "provider": provider.as_str() }),
+            json!({ "ok": true, "id": id.as_str(), "provider": provider.as_str(), "email": email }),
         ),
         Ok(Err(r)) | Err(r) => r,
     }
@@ -946,64 +955,150 @@ fn profile_names(body: &Map<String, Value>) -> Result<Vec<String>, Response> {
     }
 }
 
-/// Resolve profile names. A name containing `/` is a settings directory (absolute, existing);
-/// anything else is an id, looked up among the configured profiles first and then the
-/// `~/.claude*` directories discovered under the daemon's `$HOME` (only read when needed).
-/// Duplicates (same settings dir) collapse.
+/// The profile id an argument without `/` stands for: leading dots are dropped (`.claude-work`
+/// -> `claude-work`) and `claude` / `.claude` mean `default` (`~/.claude`). Such an argument is
+/// never a path, so `.claude` typed inside a repository cannot pick that repository's
+/// `.claude/` directory.
+pub fn profile_id_arg(name: &str) -> String {
+    match name.trim_start_matches('.') {
+        "" => name.to_string(),
+        "claude" => "default".to_string(),
+        id => id.to_string(),
+    }
+}
+
+/// `p` with symlinks resolved when it exists (macOS temp dirs live behind `/var` ->
+/// `/private/var`); a missing file is resolved through its parent.
+fn canonical(p: &std::path::Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+            .map(|d| d.join(name))
+            .unwrap_or_else(|_| p.to_path_buf()),
+        _ => p.to_path_buf(),
+    }
+}
+
+/// Resolve profile names against the daemon's `$HOME` ([`resolve_profiles_in`]).
 pub fn resolve_profiles(
     names: &[String],
     configured: &[ProfileRef],
 ) -> Result<Vec<Profile>, String> {
-    let home = user_home();
+    resolve_profiles_in(names, configured, user_home().as_deref())
+}
+
+/// Resolve profile names. A name containing `/` is a settings directory ([`profile_at`]).
+/// Anything else is an id ([`profile_id_arg`]), looked up among the configured profiles first
+/// and then the `~/.claude*` directories discovered under `home` (only read when needed). A
+/// profile whose `.claude.json` would be another profile's is refused. Duplicates (same
+/// settings dir) collapse.
+pub fn resolve_profiles_in(
+    names: &[String],
+    configured: &[ProfileRef],
+    home: Option<&std::path::Path>,
+) -> Result<Vec<Profile>, String> {
     let mut discovered: Option<Vec<Profile>> = None;
     let mut out: Vec<Profile> = Vec::new();
     for name in names {
         let p = if name.contains('/') {
-            let dir = std::path::Path::new(name);
-            if !dir.is_absolute() {
-                return Err(format!("profile path must be absolute: {name}"));
-            }
-            if !dir.is_dir() {
-                return Err(format!("profile directory not found: {name}"));
-            }
-            Profile::from_dir(dir, home.as_deref().unwrap_or(std::path::Path::new("")))
-        } else if let Some(r) = configured.iter().find(|r| r.id == *name) {
-            profile_of(r)
+            profile_at(name, home)?
         } else {
-            let found =
-                discovered.get_or_insert_with(|| home.as_deref().map(discover).unwrap_or_default());
-            match found.iter().find(|p| p.id == *name) {
-                Some(p) => p.clone(),
-                None => {
-                    let mut known: Vec<&str> = configured.iter().map(|r| r.id.as_str()).collect();
-                    for p in found.iter() {
-                        if !known.contains(&p.id.as_str()) {
-                            known.push(&p.id);
+            let id = profile_id_arg(name);
+            if let Some(r) = configured.iter().find(|r| r.id == id) {
+                profile_of(r)
+            } else {
+                let found =
+                    discovered.get_or_insert_with(|| home.map(discover).unwrap_or_default());
+                match found.iter().find(|p| p.id == id) {
+                    Some(p) => p.clone(),
+                    None => {
+                        let mut known: Vec<&str> =
+                            configured.iter().map(|r| r.id.as_str()).collect();
+                        for p in found.iter() {
+                            if !known.contains(&p.id.as_str()) {
+                                known.push(&p.id);
+                            }
                         }
+                        let known = if known.is_empty() {
+                            "none found".to_string()
+                        } else {
+                            known.join(", ")
+                        };
+                        return Err(format!("unknown profile '{name}' (known: {known})"));
                     }
-                    let known = if known.is_empty() {
-                        "none found".to_string()
-                    } else {
-                        known.join(", ")
-                    };
-                    return Err(format!("unknown profile '{name}' (known: {known})"));
                 }
             }
         };
-        if !out.iter().any(|q| q.settings_dir == p.settings_dir) {
+        let (dir, state) = (canonical(&p.settings_dir), canonical(&p.claude_json));
+        let others = configured.iter().map(profile_of).chain(out.iter().cloned());
+        for q in others {
+            if canonical(&q.settings_dir) != dir && canonical(&q.claude_json) == state {
+                return Err(format!(
+                    "{} would share {} with profile '{}'",
+                    p.settings_dir.display(),
+                    p.claude_json.display(),
+                    q.id
+                ));
+            }
+        }
+        if !out.iter().any(|q| canonical(&q.settings_dir) == dir) {
             out.push(p);
         }
     }
     Ok(out)
 }
 
-fn profiles_json(profiles: &[Profile], outcomes: &[(String, WriteOutcome)]) -> Value {
+/// The profile at directory `name`: absolute, holding a `settings.json` (the discovery rule),
+/// never `home` itself, and never a directory whose `.claude.json` is `~/.claude.json` other than
+/// `~/.claude` (however spelled, that one is the default profile).
+fn profile_at(name: &str, home: Option<&std::path::Path>) -> Result<Profile, String> {
+    let dir = std::path::Path::new(name);
+    if !dir.is_absolute() {
+        return Err(format!("profile path must be absolute: {name}"));
+    }
+    if !dir.is_dir() {
+        return Err(format!("profile directory not found: {name}"));
+    }
+    if !dir.join("settings.json").is_file() {
+        return Err(format!(
+            "{name} has no settings.json, so it is not a Claude Code profile directory"
+        ));
+    }
+    let Some(home) = home else {
+        return Ok(Profile::from_dir(dir, std::path::Path::new("")));
+    };
+    let dir_c = canonical(dir);
+    if dir_c == canonical(home) {
+        return Err(format!(
+            "{name} is your home directory, not a Claude Code profile (did you mean {}?)",
+            home.join(".claude").display()
+        ));
+    }
+    if dir_c == canonical(&home.join(".claude")) {
+        return Ok(Profile::from_dir(&home.join(".claude"), home));
+    }
+    let p = Profile::from_dir(dir, home);
+    if canonical(&p.claude_json) == canonical(&home.join(".claude.json")) {
+        return Err(format!(
+            "{name} would share ~/.claude.json with the default profile"
+        ));
+    }
+    Ok(p)
+}
+
+/// Response rows for `profiles` and the `(id, outcome)` pairs `connect` / `disconnect` returned.
+/// Those come back in `profiles` order (failed ones skipped), so each pair is matched to the next
+/// profile with its id: two directories sharing an id keep their own directories.
+pub fn profiles_json(profiles: &[Profile], outcomes: &[(String, WriteOutcome)]) -> Value {
+    let mut rest = profiles.iter();
     Value::Array(
         outcomes
             .iter()
             .map(|(id, o)| {
-                let dir = profiles
-                    .iter()
+                let dir = rest
+                    .by_ref()
                     .find(|p| p.id == *id)
                     .map(|p| p.settings_dir.to_string_lossy().into_owned());
                 json!({ "id": id, "settings_dir": dir, "outcome": outcome_label(*o) })
@@ -1136,15 +1231,18 @@ async fn models_refresh(State(app): State<Arc<AppState>>) -> Response {
             .map(|m| m["id"].clone())
             .collect()
     };
-    let synced = match crate::claude_code::sync_once(&app).await {
-        Ok(v) => v.len(),
+    let mut out = json!({ "ok": true, "live": live.len(), "models": ids });
+    match crate::claude_code::sync_once(&app).await {
+        Ok(v) => out["profiles_synced"] = json!(v.len()),
         Err(e) => {
+            // The chain may quote config.toml; the response carries only a fixed reason.
             tracing::warn!(error = %format!("{e:#}"), "profile sync after models refresh failed");
-            0
+            out["profiles_synced"] = json!(0);
+            out["sync_error"] = json!("profile_sync_failed");
         }
-    };
+    }
     tracing::info!(live = live.len(), "model catalog refreshed");
-    ok(json!({ "ok": true, "live": live.len(), "models": ids, "profiles_synced": synced }))
+    ok(out)
 }
 
 // ---- sign-in ---------------------------------------------------------------------------------
@@ -1390,5 +1488,97 @@ async fn signin_bind(State(app): State<Arc<AppState>>, Path(id): Path<String>) -
             ok(out)
         }
         Err(e) => anthropic_error(409, "invalid_request_error", &format!("{e:#}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile_dir(home: &std::path::Path, name: &str) -> PathBuf {
+        let d = home.join(name);
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("settings.json"), "{}").unwrap();
+        d
+    }
+
+    fn resolve(names: &[&str], home: &std::path::Path) -> Result<Vec<Profile>, String> {
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        resolve_profiles_in(&names, &[], Some(home))
+    }
+
+    #[test]
+    fn bare_names_are_ids_never_paths() {
+        assert_eq!(profile_id_arg(".claude"), "default");
+        assert_eq!(profile_id_arg("claude"), "default");
+        assert_eq!(profile_id_arg(".claude-work"), "claude-work");
+        assert_eq!(profile_id_arg("default"), "default");
+        assert_eq!(profile_id_arg("."), ".");
+
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        profile_dir(h, ".claude");
+        profile_dir(h, ".claude-work");
+        let p = resolve(&[".claude", ".claude-work"], h).unwrap();
+        assert_eq!(p[0].id, "default");
+        assert_eq!(p[0].claude_json, h.join(".claude.json"));
+        assert_eq!(p[1].id, "claude-work");
+        assert_eq!(p[1].claude_json, h.join(".claude-work/.claude.json"));
+    }
+
+    #[test]
+    fn path_rules() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let s = |p: PathBuf| p.to_string_lossy().into_owned();
+
+        // $HOME itself, even with a settings.json, is refused (it maps to ~/.claude.json).
+        fs::write(h.join("settings.json"), "{}").unwrap();
+        let e = resolve(&[&s(h.to_path_buf())], h).unwrap_err();
+        assert!(e.contains("home directory"), "{e}");
+        let e = resolve(&[&format!("{}/", s(h.to_path_buf()))], h).unwrap_err();
+        assert!(e.contains("home directory"), "{e}");
+
+        // A directory without settings.json is not a profile.
+        fs::create_dir_all(h.join("plain")).unwrap();
+        let e = resolve(&[&s(h.join("plain"))], h).unwrap_err();
+        assert!(e.contains("settings.json"), "{e}");
+
+        // ~/.claude however spelled is the default profile.
+        profile_dir(h, ".claude");
+        let p = resolve(&[&format!("{}/", s(h.join(".claude")))], h).unwrap();
+        assert_eq!(p[0].id, "default");
+        assert_eq!(p[0].claude_json, h.join(".claude.json"));
+
+        // Another dir is fine; the same dir twice collapses.
+        let other = s(profile_dir(h, "elsewhere"));
+        let p = resolve(&[&other, &other], h).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].claude_json, h.join("elsewhere/.claude.json"));
+    }
+
+    #[test]
+    fn shared_claude_json_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let a = profile_dir(h, "a");
+        // A configured profile pointing at `a` under another id (e.g. via a symlinked dir).
+        let link = h.join("link");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let configured = [ProfileRef {
+            id: "a".into(),
+            settings_dir: a.clone(),
+        }];
+        // The same directory through a symlink collapses rather than conflicting.
+        let names = vec![link.to_string_lossy().into_owned()];
+        assert!(resolve_profiles_in(&names, &configured, Some(h)).is_ok());
+        // A profile recorded at $HOME (hand-edited config) shares ~/.claude.json with ~/.claude.
+        profile_dir(h, ".claude");
+        let configured = [ProfileRef {
+            id: "weird".into(),
+            settings_dir: h.to_path_buf(),
+        }];
+        let e = resolve_profiles_in(&[".claude".into()], &configured, Some(h)).unwrap_err();
+        assert!(e.contains("would share"), "{e}");
     }
 }

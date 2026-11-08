@@ -134,6 +134,6 @@ mod tests {
         assert!(parse(&["accounts", "login"]).is_err());
         assert!(parse(&["accounts", "relogin"]).is_err());
         assert!(parse(&["accounts", "relogin", "--expiring"]).is_ok());
-        assert!(parse(&["accounts", "add", "x", "--email", "a@b"]).is_err());
+        assert!(parse(&["accounts", "add", "x", "--email", "a@b"]).is_ok());
     }
 }

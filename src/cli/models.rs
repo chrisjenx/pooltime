@@ -39,13 +39,51 @@ pub async fn run(paths: &Paths, cmd: ModelsCmd) -> anyhow::Result<i32> {
         }
         ModelsCmd::Refresh => {
             let v = c.post("/api/v1/models/refresh", json!({})).await?;
-            println!(
-                "refreshed: {} live Claude models, {} listed; {} connected profiles re-synced",
-                v["live"],
-                v["models"].as_array().map_or(0, Vec::len),
-                v["profiles_synced"]
-            );
-            Ok(0)
+            let (line, warning) = refresh_report(&v);
+            println!("{line}");
+            match warning {
+                Some(w) => {
+                    eprintln!("{w}");
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
         }
+    }
+}
+
+/// The summary line, plus a warning when the connected profiles could not be re-synced.
+fn refresh_report(v: &serde_json::Value) -> (String, Option<String>) {
+    let line = format!(
+        "refreshed: {} live Claude models, {} listed; {} connected profiles re-synced",
+        v["live"],
+        v["models"].as_array().map_or(0, Vec::len),
+        v["profiles_synced"]
+    );
+    let warning = v["sync_error"].as_str().map(|e| {
+        format!("warning: connected profiles were not re-synced ({e}); see `pooltime logs`")
+    });
+    (line, warning)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_report_warns_on_sync_error() {
+        let ok = json!({"live": 2, "models": ["a", "b", "c"], "profiles_synced": 1});
+        let (line, w) = refresh_report(&ok);
+        assert_eq!(
+            line,
+            "refreshed: 2 live Claude models, 3 listed; 1 connected profiles re-synced"
+        );
+        assert!(w.is_none());
+        let bad = json!({"live": 2, "models": [], "profiles_synced": 0,
+            "sync_error": "profile_sync_failed"});
+        assert!(refresh_report(&bad)
+            .1
+            .unwrap()
+            .contains("profile_sync_failed"));
     }
 }

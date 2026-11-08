@@ -46,8 +46,9 @@ pub enum AccountsCmd {
         /// Sign in right away.
         #[arg(long)]
         login: bool,
-        /// Email to pre-fill on the sign-in page (with --login).
-        #[arg(long, requires = "login")]
+        /// The account's email: recorded as its expected identity (the first sign-in must be
+        /// this account) and pre-filled on the sign-in page.
+        #[arg(long)]
         email: Option<String>,
         #[command(flatten)]
         signin: SignInFlags,
@@ -153,11 +154,15 @@ pub async fn run(paths: &Paths, cmd: AccountsCmd) -> anyhow::Result<i32> {
             let v = c
                 .post(
                     "/api/v1/accounts",
-                    json!({ "id": name, "provider": provider }),
+                    json!({ "id": name, "provider": provider, "email": email }),
                 )
                 .await?;
+            let mail = v["email"]
+                .as_str()
+                .map(|e| format!(", {e}"))
+                .unwrap_or_default();
             println!(
-                "added account '{}' ({})",
+                "added account '{}' ({}{mail})",
                 v["id"].as_str().unwrap_or(&name),
                 v["provider"].as_str().unwrap_or(&provider)
             );
@@ -630,6 +635,16 @@ fn select_relogin(status: &Value, expiring: Option<u32>, dead: bool, all: bool) 
         .collect()
 }
 
+/// A pasted code belongs to exactly one sign-in (its `state`), so it cannot drive a batch.
+fn check_relogin_flags(flags: &SignInFlags) -> anyhow::Result<()> {
+    if flags.code.is_some() {
+        bail!(
+            "--code belongs to a single sign-in; use it with `accounts login <name>`, not relogin"
+        );
+    }
+    Ok(())
+}
+
 async fn relogin(
     paths: &Paths,
     expiring: Option<u32>,
@@ -637,6 +652,7 @@ async fn relogin(
     all: bool,
     flags: &SignInFlags,
 ) -> anyhow::Result<i32> {
+    check_relogin_flags(flags)?;
     let c = client::require(paths).await?;
     let status = c.get("/api/v1/status").await?;
     let ids = select_relogin(&status, expiring, dead, all);
@@ -672,6 +688,17 @@ mod tests {
         assert_eq!(parse_until("2h", now).unwrap(), "2026-11-07T14:00:00Z");
         assert_eq!(parse_until("3d", now).unwrap(), "2026-11-10T12:00:00Z");
         assert!(parse_until("soon", now).is_err());
+    }
+
+    #[test]
+    fn relogin_refuses_a_code() {
+        assert!(check_relogin_flags(&SignInFlags::default()).is_ok());
+        let flags = SignInFlags {
+            code: Some("c#s".into()),
+            ..SignInFlags::default()
+        };
+        let e = check_relogin_flags(&flags).unwrap_err().to_string();
+        assert!(e.contains("--code"), "{e}");
     }
 
     #[test]
