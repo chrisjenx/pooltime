@@ -15,10 +15,14 @@ use crate::upstream::Upstream;
 
 mod oauth;
 mod ratelimit;
+pub mod strip;
 mod usage;
 
 pub use oauth::expiry_after_refresh;
 pub use ratelimit::{has_quota_signal, parse_unified_headers};
+pub use strip::{
+    codex_stash_signature, is_codex_stash_signature, prepare_body, CODEX_STASH_PREFIX,
+};
 pub use usage::{spawn_usage_sweeper, SWEEP_INTERVAL};
 
 pub struct AnthropicProvider {
