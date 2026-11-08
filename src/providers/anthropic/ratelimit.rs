@@ -65,6 +65,7 @@ pub fn parse_unified_headers(h: &HeaderMap, now: OffsetDateTime) -> Option<RateL
             continue;
         }
         let w = windows.entry(key.to_string()).or_insert_with(|| Window {
+            reset_synthetic: false,
             key: key.to_string(),
             model: window_model_of(key),
             status: WindowStatus::Unknown,

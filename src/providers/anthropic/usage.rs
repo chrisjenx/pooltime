@@ -69,6 +69,7 @@ fn map_usage_response(json: &Value, now: OffsetDateTime) -> Option<RateLimitSnap
             reset = window_duration(&key).map(|d| now + d);
         }
         windows.push(Window {
+            reset_synthetic: false,
             key,
             model,
             status: if utilization >= 1.0 {

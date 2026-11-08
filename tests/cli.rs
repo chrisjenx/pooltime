@@ -361,6 +361,7 @@ async fn seed_account(pt: &Path, name: &str, util: f64) {
     let state = StateBook::load(store).unwrap();
     let now = time::OffsetDateTime::now_utc();
     let window = |key: &str, u: f64| Window {
+        reset_synthetic: false,
         key: key.into(),
         model: None,
         status: WindowStatus::Allowed,

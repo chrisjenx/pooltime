@@ -62,6 +62,11 @@ pub struct Window {
     pub utilization: f64,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub reset: Option<OffsetDateTime>,
+    /// `reset` was made up by pooltime (a spent window upstream reported no reset for, see
+    /// `replace_snapshot`), not reported upstream. It blocks routing like a real one, but usage
+    /// analytics ignores it (it moves forward on every poll).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset_synthetic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -157,6 +162,7 @@ fn replace_snapshot(
         if w.reset.is_none() && is_spent(w) {
             if let Some(d) = window_duration(&w.key) {
                 w.reset = Some(next.updated_at + d);
+                w.reset_synthetic = true;
             }
         }
     }
