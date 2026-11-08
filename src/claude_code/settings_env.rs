@@ -116,13 +116,17 @@ fn env_of(settings: &Map<String, Value>) -> anyhow::Result<Option<Map<String, Va
 
 /// The value to remember as the user's own for `k`: `null` when absent or when
 /// it is recognisably ours (a pin we or bro wrote, a marker-proven context
-/// value, a marker), so our own values are never restored as "the user's".
-fn snapshot_value(k: &str, env: &Map<String, Value>) -> Value {
+/// value, a marker, or exactly the base URL / token we are about to write), so
+/// our own values are never restored as "the user's". A URL on a different port
+/// (the daemon moved) or bro's URL cannot be proven ours and is kept as found.
+fn snapshot_value(k: &str, env: &Map<String, Value>, block: &EnvBlock) -> Value {
     let Some(v) = env.get(k) else {
         return Value::Null;
     };
     let ours = match k {
         MARKER_KEY | BRO_MARKER_KEY => true,
+        BASE_URL_KEY => v.as_str() == Some(block.base_url.as_str()),
+        AUTH_TOKEN_KEY => v.as_str() == Some(block.auth_token.as_str()),
         CONTEXT_KEY => context_is_managed(env),
         _ => is_pin_value(k, v, env),
     };
@@ -146,11 +150,9 @@ fn snapshot_value(k: &str, env: &Map<String, Value>) -> Value {
 /// may exist already, which is harmless.
 pub fn apply(p: &Profile, block: &EnvBlock, snaps: &Paths) -> anyhow::Result<WriteOutcome> {
     let snap_path = snapshot::snapshot_path(snaps, p);
-    let base = snapshot::read(&snap_path);
-    let mut persisted: Option<Snapshot> = None;
     let mut failure: Option<anyhow::Error> = None;
     let outcome = patch_json(&p.settings_json, |settings| {
-        match apply_once(settings, block, &base, &snap_path, &mut persisted) {
+        match apply_once(settings, block, &snap_path) {
             Ok(changed) => changed,
             Err(e) => {
                 failure.get_or_insert(e);
@@ -168,35 +170,39 @@ pub fn apply(p: &Profile, block: &EnvBlock, snaps: &Paths) -> anyhow::Result<Wri
 fn apply_once(
     settings: &mut Map<String, Value>,
     block: &EnvBlock,
-    base: &SnapshotState,
     snap_path: &Path,
-    persisted: &mut Option<Snapshot>,
 ) -> anyhow::Result<bool> {
     let original = env_of(settings)?;
     let env = original.clone().unwrap_or_default();
 
-    // Snapshot first (see the module docs), derived from this pass's fresh env.
-    let prior = match base {
-        SnapshotState::Unreadable => Map::new(),
-        SnapshotState::Absent | SnapshotState::Present(_) => {
-            let mut snap = match base {
-                SnapshotState::Present(s) => (**s).clone(),
-                _ => Snapshot::new(Map::new()),
+    // Snapshot first (see the module docs). It is re-read on every pass so a
+    // concurrent apply that wrote it first is respected (snapshot once, only
+    // backfill missing keys), and derived from this pass's fresh env.
+    let prior = match snapshot::read(snap_path) {
+        SnapshotState::Unreadable => {
+            tracing::warn!(
+                path = %snap_path.display(),
+                "snapshot is unreadable and was left untouched; this override cannot be \
+                 released by clear until it is fixed or removed"
+            );
+            Map::new()
+        }
+        state @ (SnapshotState::Absent | SnapshotState::Present(_)) => {
+            let on_disk = match state {
+                SnapshotState::Present(s) => Some(*s),
+                _ => None,
             };
+            let mut snap = on_disk.clone().unwrap_or_else(|| Snapshot::new(Map::new()));
             snap.managed = true;
             for k in cleanup_keys() {
                 if !snap.prior.contains_key(k) {
-                    snap.prior.insert(k.to_string(), snapshot_value(k, &env));
+                    snap.prior
+                        .insert(k.to_string(), snapshot_value(k, &env, block));
                 }
             }
-            let on_disk = persisted.as_ref().or(match base {
-                SnapshotState::Present(s) => Some(&**s),
-                _ => None,
-            });
-            if on_disk != Some(&snap) {
+            if on_disk.as_ref() != Some(&snap) {
                 snapshot::write(snap_path, &snap)
                     .with_context(|| format!("writing snapshot {}", snap_path.display()))?;
-                *persisted = Some(snap.clone());
             }
             snap.prior
         }

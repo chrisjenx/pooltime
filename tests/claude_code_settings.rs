@@ -955,6 +955,68 @@ fn scrub_legacy_pins_recognises_historical_literals_and_shapes() {
     assert_eq!(Value::Object(m), weird);
 }
 
+/// Snapshot lost while settings.json already holds exactly what we would write:
+/// those are ours, never "the user's", so clear must not restore a dead URL.
+/// A different port or bro's URL cannot be proven ours and is left as-is.
+#[test]
+fn own_base_url_and_token_never_snapshotted() {
+    let f = Fix::new();
+    let p = f.with_settings(
+        ".claude",
+        json!({"env": {"ANTHROPIC_BASE_URL": URL, "ANTHROPIC_AUTH_TOKEN": TOKEN}}),
+    );
+    apply(&p, &block(), &f.snaps).unwrap();
+    let snap = f.read_snap(&p);
+    assert_eq!(snap["prior"]["ANTHROPIC_BASE_URL"], Value::Null);
+    assert_eq!(snap["prior"]["ANTHROPIC_AUTH_TOKEN"], Value::Null);
+    clear(&p, &f.snaps).unwrap();
+    assert_eq!(settings(&p), json!({}));
+
+    // Each key is judged on its own: same URL, user's own token.
+    let q = f.with_settings(
+        ".claude-q",
+        json!({"env": {"ANTHROPIC_BASE_URL": URL, "ANTHROPIC_AUTH_TOKEN": "user-token"}}),
+    );
+    apply(&q, &block(), &f.snaps).unwrap();
+    let snap = f.read_snap(&q);
+    assert_eq!(snap["prior"]["ANTHROPIC_BASE_URL"], Value::Null);
+    assert_eq!(snap["prior"]["ANTHROPIC_AUTH_TOKEN"], "user-token");
+
+    // A different port is not provably ours: kept as the prior.
+    let r = f.with_settings(
+        ".claude-r",
+        json!({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:3456"}}),
+    );
+    apply(&r, &block(), &f.snaps).unwrap();
+    assert_eq!(
+        f.read_snap(&r)["prior"]["ANTHROPIC_BASE_URL"],
+        "http://127.0.0.1:3456"
+    );
+}
+
+/// A snapshot that appears after our first read (a concurrent apply) is
+/// respected: the closure re-reads it on every pass.
+#[test]
+fn snapshot_written_by_a_concurrent_apply_is_respected() {
+    let f = Fix::new();
+    let p = f.with_settings(
+        ".claude",
+        json!({"env": {"ANTHROPIC_BASE_URL": "https://gw.example"}}),
+    );
+    // First apply snapshots the user's URL.
+    apply(&p, &block(), &f.snaps).unwrap();
+    let snap = f.read_snap(&p);
+    // Simulate the file being reset to the user's content by a racing writer
+    // while the snapshot already exists: a second apply must not re-snapshot.
+    fs::write(
+        &p.settings_json,
+        json!({"env": {"ANTHROPIC_BASE_URL": URL}}).to_string(),
+    )
+    .unwrap();
+    apply(&p, &block(), &f.snaps).unwrap();
+    assert_eq!(f.read_snap(&p), snap);
+}
+
 /// Crash safety: the snapshot is on disk before the settings.json write lands. A
 /// read-only profile dir makes the settings write fail after the snapshot step.
 #[test]
