@@ -890,8 +890,11 @@ async fn recheck(State(app): State<Arc<AppState>>, Path(raw): Path<String>) -> R
         }),
         _ => None,
     };
+    // A failed forced refresh skips the poll: a poll that succeeded on the still-valid access
+    // token would clear `unverified` without the refresh token having been proven.
     let poll = match provider {
         None => "unavailable".to_string(),
+        Some(_) if refresh.as_deref().is_some_and(|r| r != "ok") => "skipped".to_string(),
         Some(p) => match p.poll_usage(&meta).await {
             Ok(_) => "ok".to_string(),
             Err(e) => e.label(),
