@@ -10,3 +10,4 @@ pub mod sse;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod upstream;
