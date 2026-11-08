@@ -6,8 +6,10 @@
 #    POOLTIME_HOME and HOME, with the freshly built `pooltime` first on PATH, browsers and the
 #    release check disabled, and a port nothing listens on. Any non-zero exit fails.
 #    Only offline-safe blocks may be tagged `run` (no network, browser, service or real home).
-# 2. Every `pooltime <subcommand>` named in a code span or a sh/bash/plain code block is a real subcommand
-#    (from `pooltime --help`), and for the command groups also a real second-level subcommand.
+#    Fences may be indented (inside list items).
+# 2. Every `pooltime <subcommand>` named in a code span or a sh/bash/plain code block is a real
+#    subcommand (from `pooltime --help`, run with a clean environment), and for the command
+#    groups also a real second-level subcommand. Flags are not checked.
 #
 # Usage: scripts/check-docs.sh        (builds target/debug/pooltime first)
 #        POOLTIME_BIN=/path/to/pooltime scripts/check-docs.sh
@@ -50,14 +52,18 @@ i=0
 for f in $files; do
     i=$((i + 1))
     awk -v dir="$work/blocks" -v src="$f" -v fi="$i" '
-        !inb && /^```sh[ \t]/ && substr($0, 6) ~ /(^|[ \t])run([ \t]|$)/ {
+        # Fences may be indented (inside list items).
+        !inb && /^[ \t]*```sh[ \t]/ {
+            info = $0
+            sub(/^[ \t]*```sh/, "", info)
+            if (info !~ /(^|[ \t])run([ \t]|$)/) next
             inb = 1
             n++
             out = sprintf("%s/%04d-%04d.sh", dir, fi, n)
             printf "# %s:%d\n", src, NR > out
             next
         }
-        inb && /^```[ \t]*$/ { inb = 0; close(out); next }
+        inb && /^[ \t]*```[ \t]*$/ { inb = 0; close(out); next }
         inb { print > out }
     ' "$f"
 done
@@ -90,16 +96,21 @@ done
 echo "check-docs: ran $ran \`sh run\` blocks"
 
 # ---- 2. every named subcommand exists -------------------------------------------------------
+# `pooltime [group] --help` in a clean environment (nothing from the caller's shell or home).
+help() {
+    # shellcheck disable=SC2086 # $1 is a single optional word
+    env -i HOME="$work/help-home" PATH=/usr/bin:/bin "$bin" ${1:-} --help
+}
 subcommands() {
     # The names listed under "Commands:" in `pooltime [group] --help`.
     # shellcheck disable=SC2086 # $1 is a single optional word
-    "$bin" $1 --help | awk '/^Commands:/ { f = 1; next } f && /^[^ ]/ { f = 0 } f && NF { print $1 }'
+    help "$1" | awk '/^Commands:/ { f = 1; next } f && /^[^ ]/ { f = 0 } f && NF { print $1 }'
 }
 top=$(subcommands "")
 groups=""
 for g in $top; do
     [ "$g" = help ] && continue
-    if "$bin" "$g" --help | grep '^Commands:' >/dev/null; then
+    if help "$g" | grep '^Commands:' >/dev/null; then
         groups="$groups $g"
         subcommands "$g" >"$work/sub.$g"
     fi
@@ -116,8 +127,12 @@ mentions() {
                 s = substr(s, RSTART + RLENGTH)
             }
         }
-        /^```/ {
-            if (fence) { fence = 0; shell = 0 } else { fence = 1; shell = (substr($0, 4) ~ /^(sh|bash|shell)?([ \t]|$)/) }
+        /^[ \t]*```/ {
+            if (fence) { fence = 0; shell = 0; next }
+            lang = $0
+            sub(/^[ \t]*```/, "", lang)
+            fence = 1
+            shell = (lang ~ /^(sh|bash|shell)?([ \t]|$)/)
             next
         }
         fence && shell { scan($0, "(^|[^A-Za-z0-9_./-])pooltime [a-z][a-z-]*( [a-z][a-z-]*)?"); next }

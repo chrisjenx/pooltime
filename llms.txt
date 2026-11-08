@@ -7,11 +7,16 @@
 
 Rules for agents:
 - Never print, log or paste tokens, ~/.pooltime/run/*.key, or credentials files.
-- Signing in needs the human: they open a URL in a browser and sign in. Do not try to automate it.
+- The dashboard URL that `pooltime setup` and `pooltime open` print contains the local management
+  key (`?k=...`). Never repeat or quote it, and never put it in logs, commits, issues or PRs. Tell
+  the user to run `pooltime open` themselves to see the dashboard.
+- Signing in needs the human: they open a URL in a browser and sign in. Do not try to automate it,
+  and do not run sign-in commands under a short tool timeout (see step 4).
 - Only connect the Claude Code profiles the user names. Do not use `pooltime connect --all` unless
   they ask for every ~/.claude* profile.
 - If bro-cli is in use, the user must stop it (`bro pool down`) before pooltime serves imported accounts.
-- These steps need pooltime v1.0.0 or later (main branch). `pooltime --version` shows the version.
+- These steps need pooltime v1.0.0 or later. `pooltime --version` shows the version; upgrade first
+  if it is older.
 
 ## 1. Install
 
@@ -31,42 +36,41 @@ Check:
 pooltime --version
 ```
 
-## 2. Non-interactive setup
+## 2. Linux only: keep the service running after logout
 
-`pooltime setup` with `--yes` never asks; it does only what the flags say. Flags:
-
-- `--import-bro`: import accounts/settings from bro-cli (when ~/.claude-max-pool or ~/.bro exists and
-  pooltime has no accounts yet).
-- `--account NAME`: sign in a first Claude account (when pooltime has none and nothing is imported).
-  Needs the human (see step 3). Optional `--email EMAIL`, `--mode callback|paste`.
-- `--service`: install the background service (launchd on macOS, systemd --user on Linux).
-- `--connect PROFILES`: comma-separated Claude Code profile ids to connect: `default` = ~/.claude,
-  `claude-personal` = ~/.claude-personal, etc.
-- `--yes` / `-y`: never ask; also binds a first sign-in to the account without asking.
-
-Migrating from bro (ask the user to run `bro pool down` first):
+A systemd user service stops when the user logs out. On servers / SSH-only machines, run this
+before installing the service (step 5):
 
 ```sh
-pooltime setup --import-bro --service --connect default --yes
+loginctl enable-linger "$USER"
 ```
 
-Fresh install, first Claude account signed in by the human, then service and one profile:
+## 3. Find the Claude Code profile ids
+
+A profile is a settings directory that contains `settings.json`. Its id is `default` for
+`~/.claude` and `claude-<name>` for `~/.claude-<name>` (the directory name without the leading
+dot). List the candidates and ask the user which to connect:
 
 ```sh
-pooltime setup --account personal --email you@example.com --service --connect default --yes
+ls -d ~/.claude*
 ```
 
-setup prints one line per step, runs `pooltime doctor`, then prints the dashboard URL. Exit 1 if a
-step or a doctor check failed. It is safe to re-run.
+(`~/.claude.json` is a file, not a profile; `~/.claude-max-pool` is bro's pool, not a profile.)
 
-Then add the status line segment and the MCP server to the connected profiles (setup does not do
-this yet):
+## 4. Sign in accounts (the human must act)
+
+A sign-in waits up to 5 minutes for the human, which outlives most tool-call timeouts. Preferred:
+ask the user to run the command in their own terminal (in Claude Code, typing it with the `!`
+prefix runs it in the session, e.g. `! pooltime accounts login personal`), wait for them to say it
+finished, then verify:
 
 ```sh
-pooltime connect default --statusline --mcp
+pooltime accounts list
 ```
 
-## 3. Sign-in (the human must act)
+If you must run a sign-in command yourself (including `pooltime setup --account ...`), use a tool
+timeout of at least 330 seconds or run it in the background, and relay the printed sign-in URL to
+the user.
 
 Claude account:
 
@@ -74,12 +78,10 @@ Claude account:
 pooltime accounts login personal
 ```
 
-With a local browser this opens it and waits up to 5 minutes for the redirect.
-
-Headless / SSH (pooltime picks paste mode automatically when `SSH_TTY` is set, or on Linux without
-DISPLAY/WAYLAND_DISPLAY; force it with `--mode paste`): pooltime prints a URL. The human opens it in
-any browser, signs in, and pastes the `code#state` line the page shows at the `Code:` prompt on
-stdin. Run the command where the human can type into it.
+With a local browser this opens it and waits for the redirect. Headless / SSH (pooltime picks
+paste mode automatically when `SSH_TTY` is set, or on Linux without DISPLAY/WAYLAND_DISPLAY; force
+it with `--mode paste`): pooltime prints a URL; the human opens it in any browser, signs in, and
+pastes the `code#state` line the page shows at the `Code:` prompt on stdin.
 
 ```sh
 pooltime accounts login personal --mode paste
@@ -97,41 +99,68 @@ The browser is redirected to http://localhost:1455/auth/callback (or 1457). Head
 2. Or, after signing in, the browser lands on a page that fails to load: paste that full address
    at the `Code:` prompt.
 
-Reuse an existing Codex CLI sign-in instead (no browser; pooltime then owns it, so the Codex CLI
-needs `codex login` again):
+Reuse an existing Codex CLI sign-in instead (no browser, no human step; pooltime then owns it, so
+the Codex CLI needs `codex login` again):
 
 ```sh
 pooltime accounts add codex-1 --provider openai --from-codex-auth
 ```
 
-Re-login later: `pooltime accounts relogin --dead` or `--expiring` (one at a time, same modes).
+Re-login later: `pooltime accounts relogin --dead` or `--expiring` (one at a time, same modes and
+the same timeout advice).
 
-## 4. Linux service persistence
+## 5. Non-interactive setup
 
-A systemd user service stops when the user logs out. On servers / SSH-only machines:
+`pooltime setup` with `--yes` never asks; it does only what the flags say. Flags:
+
+- `--import-bro`: import accounts/settings from bro-cli (when ~/.claude-max-pool or ~/.bro exists and
+  pooltime has no accounts yet).
+- `--account NAME`: sign in a first Claude account (when pooltime has none and nothing is imported).
+  This is a sign-in: see step 4. Optional `--email EMAIL`, `--mode callback|paste`.
+- `--service`: install the background service (launchd on macOS, systemd --user on Linux).
+- `--connect PROFILES`: comma-separated profile ids from step 3 (`default,claude-personal`).
+- `--yes` / `-y`: never ask; also binds a first sign-in to the account without asking.
+
+Migrating from bro (ask the user to run `bro pool down` first):
 
 ```sh
-loginctl enable-linger "$USER"
-pooltime service install
-pooltime service status
+pooltime setup --import-bro --service --connect default --yes
 ```
 
-## 5. Verify
+Fresh install, after the user signed in an account in step 4:
+
+```sh
+pooltime setup --service --connect default --yes
+```
+
+setup prints one line per step, runs `pooltime doctor`, then prints the dashboard URL, which
+contains the management key: do not repeat it (see the rules above). Exit 1 if a step or a doctor
+check failed. It is safe to re-run.
+
+Then add the status line segment and the MCP server to the connected profiles (setup does not do
+this yet):
+
+```sh
+pooltime connect default --statusline --mcp
+```
+
+## 6. Verify
 
 ```sh
 pooltime doctor
 pooltime status
 pooltime accounts list
+pooltime service status
 ```
 
 `doctor` exits 1 on any failure and prints the command that fixes each problem. Each account shows
 one state: ready, expiring, rate_limited, erroring, access_denied, billing, needs_login.
 
-## 6. Use
+## 7. Use
 
-Start `claude` in a connected profile; nothing else to configure. `pooltime open` prints and opens
-the dashboard URL (it contains a local key: do not share it). `pooltime disconnect` restores the
-profiles' own settings; `pooltime service uninstall` disconnects every profile and removes the service.
+Start `claude` in a connected profile; nothing else to configure. For the dashboard, tell the user
+to run `pooltime open` (its URL holds the local key). `pooltime disconnect` restores the profiles'
+own settings; `pooltime service uninstall` disconnects every profile and removes the service.
 
 ## Commands
 

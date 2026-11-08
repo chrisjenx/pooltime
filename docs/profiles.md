@@ -4,11 +4,15 @@ A Claude Code *profile* is a settings directory: `~/.claude` (id `default`) or a
 (id `claude-<name>`) that contains a `settings.json`. Its state file is `~/.claude.json` for
 `~/.claude`, and `<dir>/.claude.json` for every other directory.
 
+To see which you have: `ls -d ~/.claude*` (ignore `~/.claude.json`, a file, and bro's
+`~/.claude-max-pool`), or `pooltime connect` with the pool running.
+
 Connecting a profile points Claude Code at the pool; disconnecting puts back exactly what was there.
 
 ## Connect
 
-`connect` needs a running pool (it checks the pool's `/health` first).
+Every `connect`, including the bare listing form, needs a running pool (it asks the pool and
+checks its `/health` first); start it with `pooltime service install` or `pooltime serve`.
 
 ```sh
 pooltime connect                    # list the profiles found and their state; changes nothing
@@ -35,6 +39,7 @@ What `connect` writes, in the `env` block of `<profile>/settings.json`:
 | `ANTHROPIC_AUTH_TOKEN` | the pool's proxy key (random, generated once) |
 | `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` (+ `_NAME`, `_DESCRIPTION`) | the newest Sonnet (1M context) and Haiku in the live Claude catalog |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | the smallest Codex context window, when Codex routes are served |
+| `POOLTIME_MANAGED_MAX_CONTEXT_TOKENS` | marker written next to it, so pooltime can tell its own context value from one you set (bro's `BRO_POOL_MANAGED_MAX_CONTEXT_TOKENS` is recognised and cleaned up too) |
 
 Pins an earlier bro wrote (including Opus/Fable ones) are recognised and removed; pins you set yourself are left alone.
 
@@ -77,7 +82,9 @@ has no fallback for an unreachable base URL, so a profile must never point at a 
 pooltime connect default --statusline
 ```
 
-The profile's `statusLine` becomes `pooltime statusline --wrap default`, which runs your original
+The profile's `statusLine` becomes `<absolute path to pooltime> statusline --wrap default` (prefixed
+with `POOLTIME_HOME=<dir>` when your data dir is not the default `~/.pooltime`), e.g.
+`/opt/homebrew/bin/pooltime statusline --wrap default`. It runs your original
 status line command (with Claude Code's stdin), then appends the pool segment:
 
 ```text

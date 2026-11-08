@@ -4,7 +4,7 @@ One Rust binary. `pooltime serve` is a tokio/axum daemon on `127.0.0.1:3460` tha
 
 | Path | What |
 |---|---|
-| `POST /v1/messages` | Anthropic Messages API (what Claude Code calls); proxy key required |
+| `POST /v1/messages` | Anthropic Messages API (what Claude Code calls); the proxy key is optional in config, but `connect` generates one and the running daemon enforces it at once |
 | `GET /v1/models` | the model list Claude Code sees |
 | `GET /health` | identity check (so nobody trusts or kills a foreign listener) |
 | `/api/v1/*` | management API: the one layer the dashboard, CLI and MCP all call |
