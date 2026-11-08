@@ -37,9 +37,6 @@ class Pooltime < Formula
       Finish with the setup wizard (accounts, background service, Claude Code profiles):
         pooltime setup
 
-      Recommended on macOS, for clickable desktop notifications:
-        brew install terminal-notifier
-
       Run the daemon either with `pooltime service install` (what `pooltime setup` offers)
       or with `brew services start pooltime`, not both: they would compete for the same port.
     EOS
