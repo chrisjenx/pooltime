@@ -771,3 +771,42 @@ fn statusline_reads_the_daemons_cache() {
         assert_eq!(out, "pool 0/0\n");
     }
 }
+
+#[test]
+fn installed_wrapper_finds_its_pool_without_pooltime_home() {
+    let h = Home::new();
+    let dir = h.dir.path().join(".claude-work");
+    std::fs::create_dir_all(&dir).unwrap();
+    let original = json!({"type": "command", "command": "printf orig", "padding": 1});
+    let settings = dir.join("settings.json");
+    std::fs::write(&settings, json!({"statusLine": original}).to_string()).unwrap();
+    let _d = h.serve();
+    let cache = h.pt().join("run/status-cache.json");
+    let start = Instant::now();
+    while !cache.exists() {
+        assert!(start.elapsed() < BOOT_BUDGET, "no status cache written");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    h.cli(&["connect", "--statusline", "claude-work"]).success();
+    let s: Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(s["statusLine"]["padding"], 1);
+    let command = s["statusLine"]["command"].as_str().unwrap().to_string();
+
+    // Claude Code's environment: no POOLTIME_HOME (the data dir is not ~/.pooltime here).
+    let mut sh = Command::new("sh");
+    sh.args(["-c", &command])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", h.dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = procs::spawn(&mut sh);
+    child.stdin.take().unwrap().write_all(b"{}").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "orig · pool 0/0");
+
+    h.cli(&["disconnect", "claude-work"]).success();
+    let s: Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(s["statusLine"], original);
+}

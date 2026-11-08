@@ -20,7 +20,7 @@ use anyhow::anyhow;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
-use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use super::snapshot::{self, SnapshotState};
@@ -37,9 +37,6 @@ pub const STALE_AFTER: Duration = Duration::from_secs(150);
 pub const HEARTBEAT: Duration = Duration::from_secs(60);
 /// Minimum spacing between two cache writes.
 pub const MIN_WRITE_GAP: Duration = Duration::from_secs(1);
-/// How often the daemon re-reads the pool when no status transition woke it (usage changes, e.g.
-/// the 7-day figure, emit none).
-const POLL_EVERY: Duration = Duration::from_secs(5);
 
 /// The segment shown when the pool cannot be read.
 pub const POOL_DOWN: &str = "pool down";
@@ -120,50 +117,85 @@ pub fn read_segment(paths: &Paths) -> String {
     segment(bytes.as_deref(), OffsetDateTime::now_utc().unix_timestamp())
 }
 
-/// Keep `run/status-cache.json` current until aborted: re-read the pool on every status
-/// transition and every [`POLL_EVERY`], write when the document changed (never twice within
-/// [`MIN_WRITE_GAP`]) or [`HEARTBEAT`] has passed. Failures are logged and retried.
-pub fn spawn_status_cache(app: Arc<AppState>) -> JoinHandle<()> {
-    tokio::spawn(async move {
+/// The running cache writer ([`spawn_status_cache`]). The writer itself deletes the cache when it
+/// stops, after any write in progress, so a late write never brings the file back.
+pub struct StatusCache {
+    stop: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
+impl StatusCache {
+    /// Stop the writer and wait until it has deleted the cache (status lines then say
+    /// `pool down` at once). Dropping a `StatusCache` stops it too, without waiting.
+    pub async fn shutdown(self) {
+        let StatusCache { stop, task } = self;
+        let _ = stop.send(true);
+        let _ = task.await;
+    }
+}
+
+/// Keep `run/status-cache.json` current: re-read the pool when [`StateBook::changes`]
+/// (crate::accounts::StateBook::changes) reports a change (at most once per [`MIN_WRITE_GAP`]) and
+/// on every [`HEARTBEAT`]. A change writes only when the document differs; a heartbeat always
+/// writes (it refreshes `written_at`). Nothing is read while nothing changes between heartbeats. A
+/// failed read is warned about once per failure streak (with its cause), the recovery logged.
+pub fn spawn_status_cache(app: Arc<AppState>) -> StatusCache {
+    let (stop, mut stopped) = watch::channel(false);
+    let task = tokio::spawn(async move {
         let path = cache_path(&app.paths);
-        let mut rx = Some(app.state.transitions());
-        let mut poll = tokio::time::interval(POLL_EVERY);
-        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut last: Option<(Value, Instant)> = None;
+        let mut changes = Some(app.state.changes());
+        let mut beat = tokio::time::interval(HEARTBEAT);
+        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_read: Option<Instant> = None;
+        let mut last_body: Option<Value> = None;
+        let mut failing = false;
         loop {
-            match rx.as_mut() {
-                Some(r) => tokio::select! {
-                    _ = poll.tick() => {}
-                    got = r.recv() => if let Err(RecvError::Closed) = got { rx = None },
-                },
-                None => {
-                    poll.tick().await;
+            let heartbeat = tokio::select! {
+                biased;
+                _ = stopped.changed() => break,
+                _ = beat.tick() => true,
+                r = async { changes.as_mut().expect("guarded").changed().await }, if changes.is_some() => {
+                    if r.is_err() {
+                        changes = None; // the book is gone: heartbeats only
+                    }
+                    false
                 }
-            }
-            if let Some((_, at)) = &last {
+            };
+            if let Some(at) = last_read {
                 let gap = at.elapsed();
                 if gap < MIN_WRITE_GAP {
-                    tokio::time::sleep(MIN_WRITE_GAP - gap).await;
+                    tokio::select! {
+                        biased;
+                        _ = stopped.changed() => break,
+                        _ = tokio::time::sleep(MIN_WRITE_GAP - gap) => {}
+                    }
                 }
             }
-            // Transitions that came in meanwhile are covered by this read.
-            if let Some(r) = rx.as_mut() {
-                while let Ok(_) | Err(TryRecvError::Lagged(_)) = r.try_recv() {}
+            // Changes up to here are covered by this read.
+            if let Some(c) = changes.as_mut() {
+                c.borrow_and_update();
             }
+            last_read = Some(Instant::now());
             let now = OffsetDateTime::now_utc();
-            let Ok(inputs) = crate::server::mgmt::gather(&app, now).await else {
-                tracing::warn!("status cache: could not read the pool");
-                continue;
+            let inputs = match crate::server::mgmt::try_gather(&app, now).await {
+                Ok(i) => i,
+                Err(e) => {
+                    if !failing {
+                        tracing::warn!(error = %e, "status cache: could not read the pool");
+                    }
+                    failing = true;
+                    continue;
+                }
             };
+            if failing {
+                tracing::info!("status cache: reading the pool works again");
+                failing = false;
+            }
             let body = cache_body(
                 &crate::server::mgmt::build_status(&inputs, now),
                 app.cfg.port,
             );
-            let due = match &last {
-                None => true,
-                Some((prev, at)) => *prev != body || at.elapsed() >= HEARTBEAT,
-            };
-            if !due {
+            if !heartbeat && last_body.as_ref() == Some(&body) {
                 continue;
             }
             let mut doc = body.clone();
@@ -172,12 +204,19 @@ pub fn spawn_status_cache(app: Arc<AppState>) -> JoinHandle<()> {
             let p = path.clone();
             match tokio::task::spawn_blocking(move || atomic_write_relaxed(&p, &bytes, 0o600)).await
             {
-                Ok(Ok(())) => last = Some((body, Instant::now())),
+                Ok(Ok(())) => last_body = Some(body),
                 Ok(Err(e)) => tracing::warn!(error = %e, "status cache write failed"),
                 Err(e) => tracing::warn!(error = %e, "status cache write task failed"),
             }
         }
-    })
+        // Stopped: nothing of ours is in flight any more.
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(error = %e, "could not delete the status cache");
+            }
+        }
+    });
+    StatusCache { stop, task }
 }
 
 /// `s` as one `sh` word.
@@ -192,33 +231,87 @@ fn sh_word(s: &str) -> String {
     }
 }
 
-/// The `statusLine` command for `id`: `<bin> statusline --wrap <id>`.
-pub fn wrapper_command(bin: &Path, id: &str) -> String {
+/// One `sh` word as [`sh_word`] writes it (plain, or single-quoted with `'\''` escapes) at the
+/// start of `s`; returns the rest. `None` if `s` does not start with one.
+fn take_word(s: &str) -> Option<&str> {
+    if let Some(mut rest) = s.strip_prefix('\'') {
+        loop {
+            let end = rest.find('\'')?;
+            rest = &rest[end + 1..];
+            match rest.strip_prefix(r"\''") {
+                Some(more) => rest = more,
+                None => return Some(rest),
+            }
+        }
+    }
+    let end = s
+        .find(|c: char| !(c.is_ascii_alphanumeric() || "/._-+:@%=,".contains(c)))
+        .unwrap_or(s.len());
+    (end > 0).then(|| &s[end..])
+}
+
+/// The `statusLine` command for `id`: `[POOLTIME_HOME=<home> ]<bin> statusline --wrap <id>`.
+/// `home` is the daemon's data dir when it is not the default one, so the wrapper reads the cache
+/// and snapshot of the pool that installed it whatever Claude Code's environment says.
+pub fn wrapper_command(bin: &Path, id: &str, home: Option<&Path>) -> String {
+    let env = home.map_or(String::new(), |h| {
+        format!("POOLTIME_HOME={} ", sh_word(&h.to_string_lossy()))
+    });
     format!(
-        "{} statusline --wrap {}",
+        "{env}{} statusline --wrap {}",
         sh_word(&bin.to_string_lossy()),
         sh_word(id)
     )
 }
 
-/// Whether the `statusLine` value `v` is our wrapper for profile `id` (whatever binary path it
-/// names), so it is never snapshotted as the user's own.
+/// Whether the `statusLine` value `v` is our wrapper for profile `id`: exactly the shape
+/// [`wrapper_command`] writes (optional `POOLTIME_HOME=<word> `, one word naming the binary, then
+/// ` statusline --wrap <id>`), whatever binary or home it names. Never snapshotted as the user's.
 pub fn is_wrapper(v: &Value, id: &str) -> bool {
-    v.get("command")
-        .and_then(Value::as_str)
-        .is_some_and(|c| c.ends_with(&format!(" statusline --wrap {}", sh_word(id))))
+    let Some(c) = v.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let c = match c.strip_prefix("POOLTIME_HOME=") {
+        Some(rest) => match take_word(rest).and_then(|r| r.strip_prefix(' ')) {
+            Some(r) => r,
+            None => return false,
+        },
+        None => c,
+    };
+    take_word(c).is_some_and(|rest| rest == format!(" statusline --wrap {}", sh_word(id)))
 }
 
-/// Install the wrapper (`bin statusline --wrap <id>`) as `p`'s `statusLine`. The user's own value
-/// (`null` when absent) goes to the profile snapshot first; a `statusLine` that already is our
-/// wrapper is never snapshotted (re-connecting keeps the original prior). Needs the snapshot
-/// `connect` has just written; an absent or unreadable one is an error and nothing is changed.
+/// The data dir to name in the wrapper: `paths.home` unless it is the default
+/// (`$HOME/.pooltime`).
+fn non_default_home(paths: &Paths) -> Option<&Path> {
+    let default = std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|h| Path::new(&h).join(".pooltime"));
+    (default.as_deref() != Some(paths.home.as_path())).then_some(paths.home.as_path())
+}
+
+/// The wrapper `statusLine`: the user's own object (`base`) with `type` and `command` replaced,
+/// so its other fields (`padding`, ...) are kept; just `{type, command}` otherwise.
+fn wrapper_value(base: &Value, command: &str) -> Value {
+    let mut obj = match base {
+        Value::Object(m) => m.clone(),
+        _ => Map::new(),
+    };
+    obj.insert("type".into(), json!("command"));
+    obj.insert("command".into(), json!(command));
+    Value::Object(obj)
+}
+
+/// Install the wrapper ([`wrapper_command`]) as `p`'s `statusLine`. The user's own value (`null`
+/// when absent) goes to the profile snapshot first; a `statusLine` that already is our wrapper is
+/// never snapshotted (re-connecting keeps the original prior). Needs the snapshot `connect` has
+/// just written; an absent or unreadable one is an error and nothing is changed.
 pub fn install(p: &Profile, paths: &Paths, bin: &Path) -> anyhow::Result<WriteOutcome> {
     let snap_path = snapshot::snapshot_path(paths, p);
-    let desired = json!({ "type": "command", "command": wrapper_command(bin, &p.id) });
+    let command = wrapper_command(bin, &p.id, non_default_home(paths));
     let mut failure: Option<anyhow::Error> = None;
     let outcome = patch_json(&p.settings_json, |settings| {
-        match install_once(settings, &desired, &p.id, &snap_path) {
+        match install_once(settings, &command, &p.id, &snap_path) {
             Ok(changed) => changed,
             Err(e) => {
                 failure.get_or_insert(e);
@@ -234,30 +327,34 @@ pub fn install(p: &Profile, paths: &Paths, bin: &Path) -> anyhow::Result<WriteOu
 
 fn install_once(
     settings: &mut Map<String, Value>,
-    desired: &Value,
+    command: &str,
     id: &str,
     snap_path: &Path,
 ) -> anyhow::Result<bool> {
+    let SnapshotState::Present(mut snap) = snapshot::read(snap_path) else {
+        return Err(anyhow!(
+            "no readable snapshot at {}; status line not installed",
+            snap_path.display()
+        ));
+    };
     let current = settings.get("statusLine").cloned();
-    match &current {
-        Some(c) if c == desired => return Ok(false),
-        // Ours with an older binary path: the snapshot already holds the original.
-        Some(c) if is_wrapper(c, id) => {}
-        _ => {
-            let SnapshotState::Present(mut snap) = snapshot::read(snap_path) else {
-                return Err(anyhow!(
-                    "no readable snapshot at {}; status line not installed",
-                    snap_path.display()
-                ));
-            };
-            let prior = current.unwrap_or(Value::Null);
+    let prior = match current {
+        // Ours already (maybe another binary or home): the snapshot holds the original.
+        Some(c) if is_wrapper(&c, id) => snap.statusline_prior,
+        other => {
+            let prior = other.unwrap_or(Value::Null);
             if snap.statusline_prior != prior {
-                snap.statusline_prior = prior;
+                snap.statusline_prior = prior.clone();
                 snapshot::write(snap_path, &snap)?;
             }
+            prior
         }
+    };
+    let desired = wrapper_value(&prior, command);
+    if settings.get("statusLine") == Some(&desired) {
+        return Ok(false);
     }
-    settings.insert("statusLine".into(), desired.clone());
+    settings.insert("statusLine".into(), desired);
     Ok(true)
 }
 
@@ -347,26 +444,55 @@ mod tests {
         assert!(cache_body(&empty, 1)["seven_day_left"].is_null());
     }
 
+    fn line(c: &str) -> Value {
+        json!({"type": "command", "command": c})
+    }
+
     #[test]
     fn wrapper_command_quotes_and_is_recognised() {
-        let cmd = wrapper_command(Path::new("/opt/homebrew/bin/pooltime"), "claude-work");
+        let bin = Path::new("/opt/homebrew/bin/pooltime");
+        let cmd = wrapper_command(bin, "claude-work", None);
         assert_eq!(
             cmd,
             "/opt/homebrew/bin/pooltime statusline --wrap claude-work"
         );
-        let spaced = wrapper_command(Path::new("/My Apps/pooltime"), "it's");
+        let homed = wrapper_command(bin, "claude-work", Some(Path::new("/tmp/pt home")));
+        assert_eq!(
+            homed,
+            "POOLTIME_HOME='/tmp/pt home' /opt/homebrew/bin/pooltime statusline --wrap claude-work"
+        );
+        let spaced = wrapper_command(Path::new("/My Apps/pooltime"), "it's", None);
         assert_eq!(spaced, r"'/My Apps/pooltime' statusline --wrap 'it'\''s'");
-        assert!(is_wrapper(
-            &json!({"type": "command", "command": spaced}),
-            "it's"
-        ));
-        assert!(!is_wrapper(
-            &json!({"type": "command", "command": cmd}),
-            "other"
-        ));
-        assert!(!is_wrapper(
-            &json!({"type": "command", "command": "ccline"}),
-            "claude-work"
-        ));
+        assert!(is_wrapper(&line(&cmd), "claude-work"));
+        assert!(is_wrapper(&line(&homed), "claude-work"));
+        assert!(is_wrapper(&line(&spaced), "it's"));
+        assert!(!is_wrapper(&line(&cmd), "other"));
+        assert!(!is_wrapper(&line("ccline"), "claude-work"));
+        // A user command that merely ends in the same words is not ours.
+        for user in [
+            "ccline && pooltime statusline --wrap claude-work",
+            "env X=1 pooltime statusline --wrap claude-work",
+            "POOLTIME_HOME=/x a b statusline --wrap claude-work",
+            "'unterminated statusline --wrap claude-work",
+            " statusline --wrap claude-work",
+        ] {
+            assert!(!is_wrapper(&line(user), "claude-work"), "{user}");
+        }
+    }
+
+    #[test]
+    fn wrapper_keeps_the_originals_other_fields() {
+        let w = wrapper_value(
+            &json!({"type": "command", "command": "ccline", "padding": 2}),
+            "pt statusline --wrap x",
+        );
+        assert_eq!(
+            w,
+            json!({"type": "command", "command": "pt statusline --wrap x", "padding": 2})
+        );
+        assert_eq!(
+            wrapper_value(&Value::Null, "c"),
+            json!({"type": "command", "command": "c"})
+        );
     }
 }

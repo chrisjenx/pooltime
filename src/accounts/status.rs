@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use super::id::AccountId;
 use crate::errors::FailReason;
@@ -416,6 +416,8 @@ pub struct StateBook {
     store: Arc<Store>,
     inner: Mutex<HashMap<AccountId, Entry>>,
     tx: broadcast::Sender<Transition>,
+    /// Bumped whenever something the pool shows may have changed ([`StateBook::changes`]).
+    changed: watch::Sender<u64>,
     access_denied_cooldown: Duration,
     usage_window: Duration,
 }
@@ -464,6 +466,7 @@ impl StateBook {
             store,
             inner: Mutex::new(map),
             tx,
+            changed: watch::channel(0).0,
             access_denied_cooldown: DEFAULT_ACCESS_DENIED_COOLDOWN,
             usage_window: DEFAULT_USAGE_WINDOW,
         };
@@ -517,6 +520,20 @@ impl StateBook {
     /// Subscribe to status transitions (capacity 256; slow receivers see `Lagged`).
     pub fn transitions(&self) -> broadcast::Receiver<Transition> {
         self.tx.subscribe()
+    }
+
+    /// A counter bumped whenever something an account shows may have changed: a status
+    /// transition, a changed persisted state (usage, errors, markers), an `erroring` verdict
+    /// flipping, a forgotten account, or [`notify_changed`](Self::notify_changed). Time alone
+    /// (an expiry or cooldown passing) bumps nothing until the status is next read.
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    /// Bump [`changes`](Self::changes) for a change made outside the book (an account added,
+    /// credentials saved).
+    pub fn notify_changed(&self) {
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     /// Wait until every queued write (state rows and timeline rows) is on disk.
@@ -610,6 +627,7 @@ impl StateBook {
     /// re-adding the same id starts clean. Timeline rows are history and stay.
     pub fn forget(&self, id: &AccountId) {
         self.lock().remove(id);
+        self.notify_changed();
         let account = id.to_string();
         let queued = self.store.submit(move |c| {
             c.execute("DELETE FROM account_state WHERE account = ?1", [account])?;
@@ -854,7 +872,11 @@ impl StateBook {
         let e = map
             .entry(id.clone())
             .or_insert_with(|| Entry::new(AccountState::default(), now));
+        let was = e.streak.current(now).is_some();
         f(&mut e.streak);
+        if e.streak.current(now).is_some() != was {
+            self.notify_changed();
+        }
     }
 
     /// Apply `f` to the account's state under the lock: surface any time-based transition
@@ -877,6 +899,7 @@ impl StateBook {
         self.settle(id, e, now, reason);
         if e.state != before {
             self.persist(id, &e.state);
+            self.notify_changed();
         }
     }
 
@@ -921,6 +944,7 @@ impl StateBook {
             tracing::error!(error = %err, "could not queue timeline row");
         }
         let _ = self.tx.send(t); // no subscribers is fine
+        self.notify_changed();
     }
 
     fn persist(&self, id: &AccountId, state: &AccountState) {

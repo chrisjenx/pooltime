@@ -540,8 +540,20 @@ fn status_since(app: &AppState, account: &AccountId, label: &str) -> Option<Offs
 /// a cooldown that just ended (or credentials that just vanished) is reflected, and recorded in
 /// the timeline, before `status_since` is read.
 pub async fn gather(app: &Arc<AppState>, now: OffsetDateTime) -> Result<StatusInputs, Response> {
+    try_gather(app, now).await.map_err(|e| {
+        tracing::error!(error = %e, "management task failed");
+        internal("internal error")
+    })
+}
+
+/// [`gather`] with the failure itself (a blocking task that panicked or was cancelled), logged
+/// by nobody: for callers that log it their own way.
+pub async fn try_gather(
+    app: &Arc<AppState>,
+    now: OffsetDateTime,
+) -> Result<StatusInputs, tokio::task::JoinError> {
     let a = app.clone();
-    let metas = blocking(move || {
+    let metas = tokio::task::spawn_blocking(move || {
         a.registry
             .list()
             .into_iter()
@@ -566,7 +578,7 @@ pub async fn gather(app: &Arc<AppState>, now: OffsetDateTime) -> Result<StatusIn
     }
     let a = app.clone();
     let warn = warn_window(&app.cfg.alerts.warn_days);
-    let accounts = blocking(move || {
+    let accounts = tokio::task::spawn_blocking(move || {
         metas
             .into_iter()
             .map(|(meta, creds)| {
@@ -780,10 +792,13 @@ async fn create_account(
     })
     .await;
     match created {
-        Ok(Ok(())) => json_response(
-            StatusCode::CREATED,
-            json!({ "ok": true, "id": id.as_str(), "provider": provider.as_str(), "email": email }),
-        ),
+        Ok(Ok(())) => {
+            app.state.notify_changed();
+            json_response(
+                StatusCode::CREATED,
+                json!({ "ok": true, "id": id.as_str(), "provider": provider.as_str(), "email": email }),
+            )
+        }
         Ok(Err(r)) | Err(r) => r,
     }
 }
@@ -1681,7 +1696,7 @@ async fn login(
         let (a, rid) = (app.clone(), id.clone());
         let saved = blocking(move || a.registry.upsert(AccountMeta::new(rid, provider))).await;
         match saved {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => app.state.notify_changed(),
             Ok(Err(e)) => {
                 tracing::error!(account = %id, error = %format!("{e:#}"), "could not create account");
                 return internal("could not create the account");
