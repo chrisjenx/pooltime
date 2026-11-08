@@ -43,18 +43,21 @@ pub struct RouteDef {
     pub effort_map: Option<HashMap<String, String>>,
 }
 
-/// Codex effort to send for a source effort `tier` (`default`, `low`, ... `max`): the
-/// mapping row's override wins, then the route's `effort_map`, else the tier passes
-/// through 1:1 and `default` stays unset (Codex applies its own server default).
-/// Clamping to `supported_efforts` is the caller's job.
-pub fn effective_effort(
-    def: &RouteDef,
-    mapping_effort: Option<&HashMap<String, String>>,
-    tier: &str,
-) -> Option<String> {
-    mapping_effort
+/// Codex effort to send for a source effort `tier` (`default`, `low`, ... `max`).
+///
+/// Bro parity: when a mapping row applies (`mapping` is the active row from
+/// [`ModelTable::mapping_for`]), its `effort` map **replaces** the route's `effort_map`
+/// entirely, so a tier the row lacks passes through 1:1 and the route's own map is never
+/// consulted. With no mapping row the route's `effort_map` applies. In both cases a tier
+/// with no override passes through 1:1 and `default` stays unset (Codex applies its own
+/// server default). Clamping to `supported_efforts` is the caller's job.
+pub fn effective_effort(def: &RouteDef, mapping: Option<&Mapping>, tier: &str) -> Option<String> {
+    let overrides = match mapping {
+        Some(row) => row.effort.as_ref(),
+        None => def.effort_map.as_ref(),
+    };
+    overrides
         .and_then(|m| m.get(tier))
-        .or_else(|| def.effort_map.as_ref().and_then(|m| m.get(tier)))
         .cloned()
         .or_else(|| (tier != "default").then(|| tier.to_string()))
 }
