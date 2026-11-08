@@ -13,8 +13,11 @@ repository = "https://github.com/chrisjenx/pooltime"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 humantime-serde = "1.1.1"
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3.27.0"
+time = "0.3.55"
+tokio = { version = "1.54.1", features = ["sync", "rt", "rt-multi-thread", "macros"] }
 toml = "1.2.1"
 
 [dev-dependencies]
