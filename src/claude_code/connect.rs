@@ -114,6 +114,51 @@ fn merge(a: WriteOutcome, b: WriteOutcome) -> WriteOutcome {
     }
 }
 
+/// What a `.claude.json` patch pass writes in: the newest Fable row and the MCP target.
+#[derive(Clone, PartialEq, Eq)]
+struct PatchInputs {
+    fable: Option<(String, String)>,
+    mcp: Option<(String, String)>,
+}
+
+/// A file as last left right by a patch pass: its `(mtime, size)` and the inputs used.
+#[derive(Clone, PartialEq, Eq)]
+struct PatchMemo {
+    stamp: (std::time::SystemTime, u64),
+    inputs: PatchInputs,
+}
+
+static PATCH_MEMO: Mutex<Option<std::collections::HashMap<PathBuf, PatchMemo>>> = Mutex::new(None);
+
+fn file_stamp(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// The file and the inputs are what the last successful pass saw: nothing to do.
+fn patch_memo_hit(path: &Path, inputs: &PatchInputs) -> bool {
+    let Some(stamp) = file_stamp(path) else {
+        return false;
+    };
+    let memo = PATCH_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    memo.as_ref()
+        .and_then(|m| m.get(path))
+        .is_some_and(|m| m.stamp == stamp && &m.inputs == inputs)
+}
+
+fn patch_memo_store(path: &Path, inputs: PatchInputs) {
+    let mut memo = PATCH_MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    let map = memo.get_or_insert_with(Default::default);
+    match file_stamp(path) {
+        Some(stamp) => {
+            map.insert(path.to_path_buf(), PatchMemo { stamp, inputs });
+        }
+        None => {
+            map.remove(path);
+        }
+    }
+}
+
 /// Each profile id is warned about a missing proxy key once per process.
 fn first_no_key_warning(id: &str) -> bool {
     static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
@@ -200,13 +245,27 @@ fn sync_profile(
     if fable.is_none() && mcp.is_none() {
         return Ok(env);
     }
+    // `.claude.json` can be megabytes: parse it only when it or what we would patch in changed
+    // since the last pass that left it right.
+    let inputs = PatchInputs {
+        fable: fable.as_ref().map(|f| (f.id.clone(), f.name.clone())),
+        mcp: mcp.map(|(u, t)| (u.to_string(), t.to_string())),
+    };
+    if patch_memo_hit(&p.claude_json, &inputs) {
+        return Ok(env);
+    }
     let cached = patch_json(&p.claude_json, |obj| {
         let rows = fable.as_ref().is_some_and(|f| refresh_rows(obj, f));
         let entry = mcp.is_some_and(|(url, token)| super::mcp::refresh_entry(obj, url, token));
         rows || entry
     });
     let cached = match cached {
-        Ok(o) => o,
+        Ok(o) => {
+            if o != WriteOutcome::GaveUp {
+                patch_memo_store(&p.claude_json, inputs);
+            }
+            o
+        }
         Err(_) => {
             tracing::warn!(profile = %p.id, "could not refresh .claude.json (Fable rows / MCP entry); left as is");
             WriteOutcome::Unchanged
@@ -220,9 +279,8 @@ fn sync_profile(
 /// 1. The pool's own address must answer `/health` as a pooltime
 ///    (`Probe::Pooltime`); anything else is an error and nothing is written.
 /// 2. The proxy key is the running pool's, else the stored one, else a freshly
-///    generated 256-bit random key that is saved (0600) to the config. A newly
-///    generated key only takes effect in a pool that is restarted afterwards; a
-///    pool running without a key accepts any token until then.
+///    generated 256-bit random key that is saved (0600) to the config. The
+///    running pool enforces it from then on (no restart).
 /// 3. Each profile gets the `env` block (pins from the catalog; with the catalog
 ///    unavailable the pins and context already in the profile are kept, so a
 ///    first connect writes only the base URL and token, and a re-connect never
