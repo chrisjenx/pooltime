@@ -7,10 +7,9 @@ use std::time::{Duration, SystemTime};
 use http::HeaderMap;
 use rand::RngExt;
 use sha2::{Digest, Sha256};
-use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, EnvFilter, Layer};
+use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::config::{Paths, RetentionCfg};
 
@@ -46,7 +45,7 @@ pub struct PruneStats {
 /// Install the global tracing subscriber.
 ///
 /// - JSON lines to `<logs>/pooltime.log.<date>` (daily rotation, non-blocking), always.
-/// - `foreground_tty`: human-readable output to stderr; otherwise only warn+ goes to stderr.
+/// - `foreground_tty`: also human-readable output to stderr; services (non-TTY) log to the file only.
 /// - Filter: `POOLTIME_LOG` (EnvFilter syntax) or `info`.
 ///
 /// Old files are pruned once at startup. Safe to call more than once: a second
@@ -63,18 +62,36 @@ pub fn init(paths: &Paths, cfg: &RetentionCfg, foreground_tty: bool) -> anyhow::
     ) {
         eprintln!("pooltime: log pruning failed: {e}");
     }
+    let directive = std::env::var(LOG_ENV).ok();
+    let (subscriber, guard) = build_subscriber(&paths.logs, directive.as_deref(), foreground_tty)?;
+    // try_init: a subscriber may already be installed (tests, repeated init).
+    let _ = subscriber.try_init();
+    Ok(guard)
+}
 
+/// Parse a `POOLTIME_LOG` directive; empty/absent means `info`, invalid warns and means `info`.
+fn make_filter(directive: Option<&str>) -> EnvFilter {
+    match directive.map(str::trim).filter(|v| !v.is_empty()) {
+        None => EnvFilter::new("info"),
+        Some(d) => EnvFilter::try_new(d).unwrap_or_else(|_| {
+            eprintln!("pooltime: invalid {LOG_ENV} directive {d:?}, using \"info\"");
+            EnvFilter::new("info")
+        }),
+    }
+}
+
+/// Build (without installing) the subscriber: JSON lines to the daily-rolled file in `logs_dir`,
+/// plus human-readable stderr output when `foreground_tty`.
+fn build_subscriber(
+    logs_dir: &Path,
+    directive: Option<&str>,
+    foreground_tty: bool,
+) -> anyhow::Result<(impl tracing::Subscriber + Send + Sync, LogGuard)> {
     let appender = tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix(LOG_PREFIX)
-        .build(&paths.logs)?;
+        .build(logs_dir)?;
     let (writer, worker) = tracing_appender::non_blocking(appender);
-
-    let filter = std::env::var(LOG_ENV)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .map(|v| EnvFilter::try_new(v).unwrap_or_else(|_| EnvFilter::new("info")))
-        .unwrap_or_else(|| EnvFilter::new("info"));
 
     let file_layer = fmt::layer().json().with_ansi(false).with_writer(writer);
     let tty_layer = foreground_tty.then(|| {
@@ -82,22 +99,11 @@ pub fn init(paths: &Paths, cfg: &RetentionCfg, foreground_tty: bool) -> anyhow::
             .with_ansi(io::stderr().is_terminal())
             .with_writer(io::stderr)
     });
-    let warn_layer = (!foreground_tty).then(|| {
-        fmt::layer()
-            .with_ansi(false)
-            .with_writer(io::stderr)
-            .with_filter(LevelFilter::WARN)
-    });
-
-    // try_init: a subscriber may already be installed (tests, repeated init).
-    let _ = tracing_subscriber::registry()
-        .with(filter)
+    let subscriber = tracing_subscriber::registry()
+        .with(make_filter(directive))
         .with(file_layer)
-        .with(tty_layer)
-        .with(warn_layer)
-        .try_init();
-
-    Ok(LogGuard { _worker: worker })
+        .with(tty_layer);
+    Ok((subscriber, LogGuard { _worker: worker }))
 }
 
 /// Delete `pooltime.log*` files in `dir` older than `days`, then oldest-first until the
@@ -339,21 +345,69 @@ mod tests {
         assert_eq!(hash_session("abc"), "ba7816bf8f01cfea");
     }
 
+    /// Run `emit` under a file-only subscriber built with `directive`; return parsed JSON lines.
+    fn capture(directive: Option<&str>, emit: impl FnOnce()) -> Vec<serde_json::Value> {
+        let dir = tempfile::tempdir().unwrap();
+        let (subscriber, guard) = build_subscriber(dir.path(), directive, false).unwrap();
+        tracing::subscriber::with_default(subscriber, emit);
+        drop(guard); // flushes the non-blocking writer
+        let mut lines = Vec::new();
+        for e in std::fs::read_dir(dir.path()).unwrap() {
+            let e = e.unwrap();
+            assert!(e.file_name().to_string_lossy().starts_with(LOG_PREFIX));
+            for l in std::fs::read_to_string(e.path()).unwrap().lines() {
+                lines.push(serde_json::from_str(l).expect("each line is JSON"));
+            }
+        }
+        lines
+    }
+
+    fn emit_sample() {
+        let span = tracing::info_span!(
+            "req",
+            request_id = "req_abc",
+            account = "a1",
+            provider = "anthropic"
+        );
+        let _g = span.enter();
+        tracing::debug!("debug-line");
+        tracing::info!("info-line");
+    }
+
+    fn msg(v: &serde_json::Value) -> &str {
+        v["fields"]["message"].as_str().unwrap()
+    }
+
     #[test]
-    fn init_creates_log_file_and_is_repeatable() {
+    fn json_file_has_message_and_span_fields_and_default_filter_drops_debug() {
+        let lines = capture(None, emit_sample);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let l = &lines[0];
+        assert_eq!(msg(l), "info-line");
+        assert_eq!(l["level"], "INFO");
+        assert_eq!(l["span"]["request_id"], "req_abc");
+        assert_eq!(l["span"]["account"], "a1");
+        assert_eq!(l["span"]["provider"], "anthropic");
+    }
+
+    #[test]
+    fn pooltime_log_directive_enables_debug() {
+        let lines = capture(Some("debug"), emit_sample);
+        let msgs: Vec<_> = lines.iter().map(msg).collect();
+        assert_eq!(msgs, ["debug-line", "info-line"]);
+        // Invalid or blank directives fall back to info.
+        assert_eq!(capture(Some("   "), emit_sample).len(), 1);
+        assert_eq!(capture(Some("not a [valid"), emit_sample).len(), 1);
+    }
+
+    #[test]
+    fn init_is_repeatable_and_creates_log_dir() {
         let home = tempfile::tempdir().unwrap();
         let paths = Paths::under(home.path());
         let cfg = RetentionCfg::default();
         let g1 = init(&paths, &cfg, false).unwrap();
-        let g2 = init(&paths, &cfg, true).unwrap();
-        tracing::info!(request_id = %new_request_id(), "init test");
+        let g2 = init(&paths, &cfg, false).unwrap();
         drop((g1, g2));
-        let any = std::fs::read_dir(&paths.logs).unwrap().any(|e| {
-            e.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(LOG_PREFIX)
-        });
-        assert!(any);
+        assert!(paths.logs.is_dir());
     }
 }
