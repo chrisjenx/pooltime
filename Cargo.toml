@@ -12,16 +12,24 @@ repository = "https://github.com/chrisjenx/pooltime"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+hex = "0.4.3"
+http = "1.5.0"
 humantime-serde = "1.1.1"
+rand = "0.10.3"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
 tempfile = "3.27.0"
 time = "0.3.55"
 tokio = { version = "1.54.1", features = ["sync", "rt", "rt-multi-thread", "macros"] }
 toml = "1.2.1"
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "json", "env-filter"] }
 
 [dev-dependencies]
 assert_cmd = "2"
+filetime = "0.2.29"
 predicates = "3"
 
 [profile.release]
