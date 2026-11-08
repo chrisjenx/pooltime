@@ -5,11 +5,13 @@
 pub mod accounts;
 pub mod client;
 pub mod connect;
+pub mod doctor;
 pub mod import;
 pub mod logs;
 pub mod models;
 pub mod open;
 pub mod service;
+pub mod setup;
 pub mod status;
 
 use std::ffi::OsString;
@@ -67,6 +69,10 @@ pub enum Command {
     /// Migrate from another tool (bro-cli).
     #[command(subcommand)]
     Import(import::ImportCmd),
+    /// First-run wizard: accounts, background service, Claude Code profiles, then doctor.
+    Setup(setup::SetupArgs),
+    /// Check the installation: one line per check, exit 1 on any failure.
+    Doctor,
 }
 
 /// `pooltime serve` flags. `--port`/`--host` override `config.toml` and `POOLTIME_PORT`/`POOLTIME_HOST`.
@@ -117,6 +123,8 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
             Command::Service(cmd) => service::run(&paths, cmd),
             // Blocking file and Keychain reads, then the identity fetches.
             Command::Import(cmd) => import::run(&paths, cmd).await,
+            Command::Setup(args) => setup::run(&paths, args).await,
+            Command::Doctor => doctor::run(&paths).await,
         }
     })
 }
