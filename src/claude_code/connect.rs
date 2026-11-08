@@ -95,9 +95,9 @@ fn non_empty(k: &Option<String>) -> Option<&str> {
 /// The key the profiles must send: what the running pool enforces, else the
 /// stored one. `None` when neither exists.
 fn existing_key(state: &AppState, stored: &Config) -> Option<String> {
-    non_empty(&state.cfg.proxy_key)
-        .or_else(|| non_empty(&stored.proxy_key))
-        .map(str::to_string)
+    state
+        .proxy_key()
+        .or_else(|| non_empty(&stored.proxy_key).map(str::to_string))
 }
 
 fn generate_key() -> String {
@@ -288,6 +288,8 @@ pub async fn connect_with(
             k
         }
     };
+    // The running pool enforces the key the profiles are about to send, from now on.
+    state.set_proxy_key(&key);
     let catalog = catalog(state).await;
     let url = base_url(&state.cfg);
 

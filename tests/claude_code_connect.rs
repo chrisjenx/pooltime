@@ -203,6 +203,30 @@ async fn connect_uses_the_running_pools_key() {
 }
 
 #[tokio::test]
+async fn connect_enforces_the_new_key_without_restart() {
+    // Fresh pool: no key at boot, so the proxy starts open.
+    let fx = Fix::new().await;
+    let p = fx.profile(".claude-work");
+    connect(fx.app(), std::slice::from_ref(&p)).await.unwrap();
+    let key = fx.config().proxy_key.expect("key generated");
+    let body = br#"{"model":"claude-sonnet-5","messages":[]}"#;
+    let ct = ("content-type", "application/json");
+    // The running daemon enforces the generated key at once.
+    let r = sockets::http_req(fx.srv.addr, "POST", "/v1/messages", &[ct], body).await;
+    assert_eq!(r.status, 401, "{}", r.text());
+    let bearer = format!("Bearer {key}");
+    let r = sockets::http_req(
+        fx.srv.addr,
+        "POST",
+        "/v1/messages",
+        &[ct, ("authorization", bearer.as_str())],
+        body,
+    )
+    .await;
+    assert_ne!(r.status, 401, "{}", r.text());
+}
+
+#[tokio::test]
 async fn connect_refuses_when_pool_unhealthy() {
     // Nothing listens on the configured port.
     let free = std::net::TcpListener::bind("127.0.0.1:0")
@@ -390,12 +414,13 @@ async fn no_known_key_warns_once_per_profile() {
     let fx = Fix::new().await;
     let p = fx.profile(".claude-nokey-warn-once");
     connect(fx.app(), std::slice::from_ref(&p)).await.unwrap();
-    // The stored key is lost (hand-edited config) and this pool enforces none.
+    // The stored key is lost (hand-edited config) and the restarted pool enforces none.
     let mut cfg = fx.config();
     cfg.proxy_key = None;
     cfg.save(&fx.paths()).unwrap();
+    let restarted = fx.blind(Some(fx.srv.addr.port())).await;
     for _ in 0..3 {
-        assert!(sync_once(fx.app()).await.unwrap().is_empty());
+        assert!(sync_once(&restarted.app).await.unwrap().is_empty());
     }
     let logs = support::captured_logs();
     let hits = logs

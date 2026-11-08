@@ -32,9 +32,9 @@ The background service sets only `POOLTIME_HOME`; put anything else it needs in 
 
 | Key | Default | Meaning |
 |---|---|---|
-| `host` | `"127.0.0.1"` | IP address to bind |
+| `host` | `"127.0.0.1"` | IP address to bind (a non-loopback address needs a `proxy_key`, else the daemon refuses to start) |
 | `port` | `3460` | port (must not be 0; bro uses 3456, so both can run side by side) |
-| `proxy_key` | generated on first `connect` | key Claude Code sends as `ANTHROPIC_AUTH_TOKEN` |
+| `proxy_key` | generated on first `connect` | key Claude Code sends as `ANTHROPIC_AUTH_TOKEN`; the running daemon enforces a key `connect` generates at once, no restart |
 
 `pooltime serve --host/--port` override these for one run.
 

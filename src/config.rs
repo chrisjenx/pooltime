@@ -400,14 +400,30 @@ impl Config {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Config::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", p.config.display())),
         };
-        cfg.validate()
+        // The bind/key pairing is checked on the runtime config only: the key may come from
+        // `POOLTIME_PROXY_KEY`.
+        cfg.validate_values()
             .with_context(|| format!("invalid {}", p.config.display()))?;
         Ok(cfg)
     }
 
     /// Reject out-of-range values (unlike `normalize`, which clamps durations
-    /// up to their floors).
+    /// up to their floors), and a non-loopback bind without a proxy key: the proxy would
+    /// spend the pool's subscriptions for anyone on the network.
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_values()?;
+        let keyed = self.proxy_key.as_deref().is_some_and(|k| !k.is_empty());
+        if !self.host.is_loopback() && !keyed {
+            return Err(anyhow!(
+                "host {} is not a loopback address: set proxy_key (or POOLTIME_PROXY_KEY) so the \
+                 proxy is not open to the network",
+                self.host
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_values(&self) -> anyhow::Result<()> {
         let r = &self.routing;
         if self.port == 0 {
             return Err(anyhow!("port must not be 0"));
@@ -561,7 +577,11 @@ mod tests {
         let c = Config::load_with_env(&p, env).unwrap();
         assert_eq!(c.port, 4000);
         assert_eq!(c.host.to_string(), "127.0.0.1");
-        let c = Config::load_with_env(&p, env_of(&[("POOLTIME_HOST", "0.0.0.0")])).unwrap();
+        let c = Config::load_with_env(
+            &p,
+            env_of(&[("POOLTIME_HOST", "0.0.0.0"), ("POOLTIME_PROXY_KEY", "k")]),
+        )
+        .unwrap();
         assert_eq!(c.host.to_string(), "0.0.0.0");
         assert!(Config::load_with_env(&p, env_of(&[("POOLTIME_PORT", "nope")])).is_err());
     }
@@ -679,6 +699,41 @@ mod tests {
         let on = Config::load_with_env(&p, env_of(&[("POOLTIME_ALERTS_NOTIFY", "true")])).unwrap();
         assert!(on.alerts.notify);
         assert!(Config::load_with_env(&p, env_of(&[("POOLTIME_ALERTS_NOTIFY", "maybe")])).is_err());
+    }
+
+    #[test]
+    fn non_loopback_host_requires_proxy_key() {
+        let open = Config {
+            host: "0.0.0.0".parse().unwrap(),
+            ..Config::default()
+        };
+        let err = open.validate().unwrap_err().to_string();
+        assert!(err.contains("proxy_key"), "{err}");
+        let empty = Config {
+            proxy_key: Some(String::new()),
+            ..open.clone()
+        };
+        assert!(empty.validate().is_err());
+        let keyed = Config {
+            proxy_key: Some("k".into()),
+            ..open.clone()
+        };
+        keyed.validate().unwrap();
+        for host in ["127.0.0.1", "::1"] {
+            let local = Config {
+                host: host.parse().unwrap(),
+                ..Config::default()
+            };
+            local.validate().unwrap();
+        }
+        // The key may come from the environment: a file-only load does not refuse the bind.
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths::under(dir.path());
+        std::fs::write(&p.config, "host = \"0.0.0.0\"\n").unwrap();
+        Config::load_file(&p).unwrap();
+        assert!(Config::load_with_env(&p, no_env).is_err());
+        let c = Config::load_with_env(&p, env_of(&[("POOLTIME_PROXY_KEY", "k")])).unwrap();
+        assert_eq!(c.host.to_string(), "0.0.0.0");
     }
 
     #[test]

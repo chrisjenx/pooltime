@@ -167,6 +167,40 @@ async fn proxy_key_required_when_set() {
 }
 
 #[tokio::test]
+async fn inference_rejects_foreign_origin_and_host() {
+    let pool = Pool::new();
+    let srv = pool.boot(Boot::default()).await;
+    let port = srv.addr.port();
+    let body = br#"{"model":"claude-sonnet-5","messages":[]}"#;
+    let evil_host = format!("evil.com:{port}");
+    let ok_host = format!("127.0.0.1:{port}");
+    for path in ["/v1/messages", "/v1/messages/count_tokens", "/v1/models"] {
+        let method = if path == "/v1/models" { "GET" } else { "POST" };
+        // A browser page (simple cross-origin POST, no preflight) always sends Origin.
+        let mut h = json_headers().to_vec();
+        h.push(("origin", "http://evil.example"));
+        let r = http_req(srv.addr, method, path, &h, body).await;
+        assert_eq!(r.status, 403, "origin on {path}");
+        assert_eq!(r.json()["error"]["type"], "permission_error");
+        assert!(r.header("access-control-allow-origin").is_none());
+        // DNS rebinding: the page's own name as Host.
+        let mut h = json_headers().to_vec();
+        h.push(("host", evil_host.as_str()));
+        let r = http_req(srv.addr, method, path, &h, body).await;
+        assert_eq!(r.status, 403, "host on {path}");
+    }
+    // What Claude Code sends (loopback Host, no Origin) passes the guard.
+    for host in [ok_host.clone(), format!("localhost:{port}")] {
+        let mut h = json_headers().to_vec();
+        h.push(("host", host.as_str()));
+        let r = http_req(srv.addr, "POST", "/v1/messages", &h, body).await;
+        assert_ne!(r.status, 403, "{host}: {}", r.text());
+        let r = http_get(srv.addr, "/v1/models", &[("host", host.as_str())]).await;
+        assert_eq!(r.status, 200, "{host}");
+    }
+}
+
+#[tokio::test]
 async fn invalid_json_is_400_and_oversize_is_413() {
     let pool = Pool::new();
     let srv = pool.boot(Boot::default()).await;

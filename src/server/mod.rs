@@ -65,6 +65,9 @@ pub struct AppState {
     pub cursor: AtomicUsize,
     /// Live routing knobs (seeded from `cfg.routing`, edited by `POST /api/v1/tuning`).
     tuning: RwLock<Tuning>,
+    /// The proxy key inference requests must present (seeded from `cfg.proxy_key`; `connect`
+    /// sets it when it generates one, so it applies without a restart). `None` = open.
+    proxy_key: RwLock<Option<String>>,
     /// In-flight and finished sign-in flows, addressable by id (management API).
     pub signins: mgmt::SignIns,
     /// Dev/test hook: when set, `GET /api/v1/status` serves this document instead of the live
@@ -87,6 +90,7 @@ impl AppState {
         mgmt_key: String,
     ) -> AppState {
         let tuning = RwLock::new(Tuning::from(&cfg.routing));
+        let proxy_key = RwLock::new(cfg.proxy_key.clone().filter(|k| !k.is_empty()));
         let debug = DebugMode::default();
         AppState {
             cfg,
@@ -106,6 +110,7 @@ impl AppState {
             drift: classifier::DriftWarner::default(),
             cursor: AtomicUsize::new(0),
             tuning,
+            proxy_key,
             signins: mgmt::SignIns::default(),
             fixture_state: None,
         }
@@ -114,6 +119,21 @@ impl AppState {
     /// The routing knobs in effect now.
     pub fn tuning(&self) -> Tuning {
         *self.tuning.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The proxy key in effect now (`None`: inference is open). Never empty.
+    pub fn proxy_key(&self) -> Option<String> {
+        self.proxy_key
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Enforce `key` on inference from the next request on. An empty key is ignored.
+    pub fn set_proxy_key(&self, key: &str) {
+        if !key.is_empty() {
+            *self.proxy_key.write().unwrap_or_else(|e| e.into_inner()) = Some(key.to_string());
+        }
     }
 
     /// Serve `fixture` from `/api/v1/status` instead of the live state (dev/test only).

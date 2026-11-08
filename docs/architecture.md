@@ -47,7 +47,8 @@ Outside `src/`: `web/` (dashboard), `harness/` (differential harness against bro
 ## Request flow (`POST /v1/messages`)
 
 1. **Router middleware** assigns a request id (`x-pooltime-request-id`), opens the journal row,
-   and checks the proxy key.
+   refuses browser traffic (any `Origin` header, or a non-loopback `Host` on a loopback bind:
+   403), and checks the proxy key.
 2. **Resolve the route** from the model id (`models/`): an OpenAI route goes to Codex only; an
    unmapped Claude model to Anthropic only; a family mapped to Codex picks a provider by weighted
    ranking with cross-provider fallback (`server/fallback.rs`). Claude Code's safety classifier
