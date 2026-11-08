@@ -107,7 +107,7 @@ pub async fn run(paths: &Paths, args: SetupArgs) -> anyhow::Result<i32> {
     report(&mut steps, c);
 
     println!();
-    let checks = doctor::checks(paths).await;
+    let checks = doctor::checks(paths, &doctor::Options::from_env(false)).await;
     doctor::print(&checks);
     println!();
     if client::find(paths).await.ok().flatten().is_some() {

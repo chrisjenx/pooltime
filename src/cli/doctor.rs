@@ -1,35 +1,54 @@
-//! `pooltime doctor`: one line per check, `✓` (fine), `!` (worth a look) or `✗` (broken), each
-//! problem with the command that fixes it. Exit 1 when any check is `✗`.
+//! `pooltime doctor`: one line per check, `✓` (fine), `!` (worth a look), `✗` (broken) or `i`
+//! (for information, never a problem), each problem with the command that fixes it. Exit 1 when
+//! any check is `✗`.
 //!
 //! Checks, in order:
 //! - **service**: launchd/systemd definition installed and running (`!` when not installed: the
 //!   pool then runs only while `pooltime serve` does; `✗` when installed but not running).
 //! - **health**: what answers `/health` on the configured address (pooltime `✓`; bro, another
 //!   server, a hung listener or nothing `✗`).
-//! - **profile <id>**, per profile recorded in `config.toml`: still connected, pointing at this
-//!   pool, pins current. Connected while the pool is down is `✗` ("connected, pool down"):
-//!   Claude Code has no fallback for an unreachable base URL. Pins are compared with the pins
-//!   derived from the live Anthropic rows of the pool's `/v1/models` listing (see [`live_rows`]);
-//!   with no live rows they are not compared. Stale pins are `!` (the pool re-syncs connected
-//!   profiles every minute). A foreign base URL is shown as its origin only.
+//! - **profile <id>**, per profile recorded in `config.toml`: still connected (a profile
+//!   snapshot plus the base URL), pointing at this pool, pins current. Connected while the pool
+//!   is down (nothing pooltime answers, or the status cache the status line reads is missing or
+//!   older than [`STALE_AFTER`]) is `✗` ("connected, pool down"): Claude Code has no fallback for
+//!   an unreachable base URL. Pins are compared with the pins derived from the live Anthropic
+//!   rows of the pool's `/v1/models` listing (see [`live_rows`]); with no live rows they are not
+//!   compared. Stale pins are `!` (the pool re-syncs connected profiles every minute). A foreign
+//!   base URL is shown as its origin only.
+//! - **statusline <id>**, per recorded profile whose `statusLine` is our wrapper: the binary it
+//!   runs exists and is executable (`✗`), the snapshot holding the original status line is
+//!   readable (`!`), and the data dir it reads is this one (`!`).
+//! - **mcp <id>**, per recorded profile whose snapshot says the MCP server is registered: the
+//!   `.claude.json` entry is there, on this port, with the token in `run/mcp.key` (compared in
+//!   constant time, never shown). Any mismatch is `!`.
 //! - **account <id>**: the running pool's status (unreadable status: `✗`, no fallback), else,
 //!   with no pool, the files. `needs_login` / corrupt credentials `✗`; a recorded login expiry
 //!   that passed (unconfirmed: only a refused probe refresh means needs_login) or falls within
 //!   the largest `alerts.warn_days` `!`.
+//! - **errors**: the pool's journal stats over the last 24 h; an account with at least
+//!   [`ERROR_MIN_ATTEMPTS`] attempts and an error rate of [`ERROR_RATE_WARN`] or more is `!`
+//!   (with its most frequent error and latency), else one `✓` summary. No pool: `i`.
 //! - **upstream <origin>**: `HEAD` to the Anthropic API and token origins, plus the OpenAI/Codex
 //!   API and token origins when an OpenAI account exists (all from config, so tests point them at
 //!   local fakes). Any HTTP answer is reachable; a timeout is `!` (slow or offline network); a
 //!   DNS, connect or TLS failure is `✗`.
-//!
-//! Every call to the pool is bounded by 5 s, as is each upstream `HEAD`.
-//! - **clock**: skew against the `Date` header of the first upstream answer (`!` over 60 s, `✗`
-//!   over 5 min: sign-in and token expiry depend on it).
+//! - **version**: the latest GitHub release (the only request beyond the pool and the upstream
+//!   origins), `!` when newer than this binary; any failure is `i`. Off with
+//!   `--no-version-check` or `POOLTIME_NO_VERSION_CHECK=1`; `POOLTIME_RELEASES_API` points it
+//!   elsewhere (tests).
+//! - **clock**: skew against the `Date` header of the first upstream answer, else of the release
+//!   check's answer (`!` over 60 s, `✗` over 5 min: sign-in and token expiry depend on it).
+//! - **notifications**: the desktop notifier alerts would use (`i` when `alerts.notify` is off;
+//!   `!` when none is installed).
 //! - **permissions**: data dir and its subdirs without group/other access (0700), config,
-//!   database, management key and account files likewise (0600); each offender is a `✗` line with
-//!   its `chmod`.
-//! - **disk**: database plus logs; `!` above 1 GiB.
+//!   database, management and MCP keys, profile snapshots and account files likewise (0600); each
+//!   offender is a `✗` line with its `chmod`.
+//! - **storage**: database (against `retention.journal_max_mb`, `!` above 80 %), logs, and
+//!   journal rows against `retention.journal_max_requests` (from the pool, when it runs); `!`
+//!   above 1 GiB in all. **retention**: the settings (`i`).
 //!
-//! The doctor only reads: it never creates a file, and it never prints a credential.
+//! Every call to the pool is bounded by 5 s, as is each upstream `HEAD`; the release check by
+//! 3 s. The doctor only reads: it never creates a file, and it never prints a credential.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -38,12 +57,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::Value;
+use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 
 use super::client::{self, Client, Located};
 use crate::accounts::Registry;
-use crate::claude_code::{derive_pins, is_connected, profile_of};
-use crate::config::{Config, Paths, ProfileRef};
+use crate::claude_code::snapshot::{self, SnapshotState};
+use crate::claude_code::statusline::{cache_is_fresh, wrapper_parts, STALE_AFTER};
+use crate::claude_code::{derive_pins, is_connected, mcp, profile_of};
+use crate::config::{Config, Paths, ProfileRef, RetentionCfg};
+use crate::health::notify::{Notification, SystemNotifier};
 use crate::providers::anthropic::ANTHROPIC_OWNER;
 use crate::server::health::{probe_addr, Probe};
 use crate::service::{Backend, Env, SystemRunner};
@@ -56,6 +79,8 @@ pub enum Level {
     Fail,
     /// Not done (a setup step that was skipped).
     Skip,
+    /// For information only: a check that was not run, or a setting.
+    Info,
 }
 
 impl Level {
@@ -65,6 +90,7 @@ impl Level {
             Level::Warn => "!",
             Level::Fail => "✗",
             Level::Skip => "-",
+            Level::Info => "i",
         }
     }
 }
@@ -111,10 +137,46 @@ const SKEW_FAIL: i64 = 5 * 60;
 const DISK_WARN: u64 = 1 << 30;
 /// Per upstream `HEAD`.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// The release check.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
+/// An account needs this many attempts in the window before its error rate counts...
+pub const ERROR_MIN_ATTEMPTS: u64 = 20;
+/// ...and is `!` at this rate or above.
+pub const ERROR_RATE_WARN: f64 = 0.10;
+/// The database is `!` above this share of `retention.journal_max_mb`.
+const DB_CAP_WARN: f64 = 0.80;
+
+/// The latest release of pooltime.
+pub const RELEASES_API: &str = "https://api.github.com/repos/chrisjenx/pooltime/releases/latest";
+/// Points the release check elsewhere (tests).
+pub const RELEASES_API_ENV: &str = "POOLTIME_RELEASES_API";
+/// `1` (or any value but `0` / `false`) turns the release check off.
+pub const NO_VERSION_CHECK_ENV: &str = "POOLTIME_NO_VERSION_CHECK";
+
+/// What the doctor may do beyond the local checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Options {
+    /// Ask GitHub for the latest release.
+    pub version_check: bool,
+    pub releases_api: String,
+}
+
+impl Options {
+    /// From the environment; `no_version_check` is the `--no-version-check` flag.
+    pub fn from_env(no_version_check: bool) -> Options {
+        let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+        let env_off = var(NO_VERSION_CHECK_ENV)
+            .is_some_and(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false"));
+        Options {
+            version_check: !(no_version_check || env_off),
+            releases_api: var(RELEASES_API_ENV).unwrap_or_else(|| RELEASES_API.to_string()),
+        }
+    }
+}
 
 /// `pooltime doctor`.
-pub async fn run(paths: &Paths) -> anyhow::Result<i32> {
-    let checks = checks(paths).await;
+pub async fn run(paths: &Paths, opts: &Options) -> anyhow::Result<i32> {
+    let checks = checks(paths, opts).await;
     print(&checks);
     Ok(exit_code(&checks))
 }
@@ -132,7 +194,7 @@ pub fn print(checks: &[Check]) {
 }
 
 /// Run every check.
-pub async fn checks(paths: &Paths) -> Vec<Check> {
+pub async fn checks(paths: &Paths, opts: &Options) -> Vec<Check> {
     let mut out = Vec::new();
     // A parse error could quote config.toml (it may hold the proxy key): no details.
     let cfg = match Config::load(paths) {
@@ -168,13 +230,26 @@ pub async fn checks(paths: &Paths) -> Vec<Check> {
             .and_then(|v| v["data"].as_array().map(|rows| live_rows(rows))),
         None => None,
     };
+    let pool = if probe != Probe::Pooltime {
+        PoolState::Down
+    } else if !cache_is_fresh(paths, OffsetDateTime::now_utc().unix_timestamp()) {
+        PoolState::CacheStale
+    } else {
+        PoolState::Up
+    };
     out.extend(profile_checks(
         paths,
         &cfg.profiles,
         &format!("http://{addr}"),
-        probe == Probe::Pooltime,
+        pool,
         catalog.as_deref(),
     ));
+    out.extend(statusline_checks(
+        paths,
+        &cfg.profiles,
+        home_default().as_deref(),
+    ));
+    out.extend(mcp_checks(paths, &cfg.profiles, cfg.port));
     let warn_days = cfg.alerts.warn_days.iter().copied().max().unwrap_or(3);
     let facts = account_facts(paths, daemon).await;
     // Codex hosts matter only with an OpenAI account (unknown when the status is unreadable).
@@ -182,13 +257,40 @@ pub async fn checks(paths: &Paths) -> Vec<Check> {
         .as_ref()
         .is_ok_and(|(f, _)| f.iter().any(|a| a.provider == "openai"));
     out.extend(account_checks(facts, warn_days, OffsetDateTime::now_utc()));
+    let stats = match daemon {
+        Some(c) => Some(get_stats(c).await),
+        None => None,
+    };
+    out.extend(error_checks(stats.as_ref()));
 
     let (upstream, date) = upstream_checks(&cfg, openai).await;
     out.extend(upstream);
-    out.push(clock_check(date, OffsetDateTime::now_utc()));
+    let (version, release_date) = version_check(opts).await;
+    out.push(version);
+    out.push(clock_check(
+        date.or(release_date),
+        OffsetDateTime::now_utc(),
+    ));
+    out.push(notify_check(
+        cfg.alerts.notify,
+        &SystemNotifier::from_env(),
+        cfg!(target_os = "macos"),
+    ));
     out.extend(permission_checks(paths));
-    out.push(disk_check(paths));
+    let journal_rows = stats
+        .as_ref()
+        .and_then(|s| s.as_ref().ok())
+        .and_then(|v| v["journal_requests"].as_u64());
+    out.push(storage_check(paths, &cfg.retention, journal_rows));
+    out.push(retention_check(&cfg.retention));
     out
+}
+
+/// `$HOME/.pooltime`, the data dir a status line wrapper without `POOLTIME_HOME=` reads.
+fn home_default() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|h| Path::new(&h).join(".pooltime"))
 }
 
 fn service_check(paths: &Paths) -> Check {
@@ -283,11 +385,21 @@ fn live_rows(rows: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// Whether connected profiles can use the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PoolState {
+    Up,
+    /// Nothing pooltime answers on the configured address (the health line says what does).
+    Down,
+    /// The pool answers, but the status cache is missing or stale: status lines say `pool down`.
+    CacheStale,
+}
+
 fn profile_checks(
     paths: &Paths,
     profiles: &[ProfileRef],
     pool_url: &str,
-    pool_up: bool,
+    pool: PoolState,
     catalog: Option<&[Value]>,
 ) -> Vec<Check> {
     if profiles.is_empty() {
@@ -315,9 +427,26 @@ fn profile_checks(
                 )
                 .hint(format!("`pooltime connect {}`", r.id));
             }
-            if !pool_up {
-                return Check::new(Level::Fail, label, "connected, pool down")
-                    .hint("Claude Code can't reach the pool; start it or `pooltime disconnect`");
+            match pool {
+                PoolState::Up => {}
+                PoolState::Down => {
+                    return Check::new(Level::Fail, label, "connected, pool down").hint(
+                        "Claude Code can't reach the pool: check `pooltime service status` \
+                         or run `pooltime serve`, else `pooltime disconnect`",
+                    )
+                }
+                PoolState::CacheStale => {
+                    return Check::new(
+                        Level::Fail,
+                        label,
+                        format!(
+                            "connected, pool down (its status cache is missing or older than \
+                             {} s)",
+                            STALE_AFTER.as_secs()
+                        ),
+                    )
+                    .hint("check `pooltime service status` and `pooltime logs`")
+                }
             }
             let env = settings_env(&p.settings_json);
             let url = env
@@ -365,6 +494,442 @@ fn profile_checks(
             Check::new(Level::Ok, label, format!("connected to {pool_url}, {pins}"))
         })
         .collect()
+}
+
+/// The `settings.json` of a profile, parsed (`None` when unreadable).
+fn read_json(p: &Path) -> Option<Value> {
+    std::fs::read(p)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+}
+
+fn is_executable(p: &Path) -> bool {
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// One line per recorded profile whose `statusLine` is our wrapper. `default_home` is the data
+/// dir a wrapper without `POOLTIME_HOME=` reads.
+fn statusline_checks(
+    paths: &Paths,
+    profiles: &[ProfileRef],
+    default_home: Option<&Path>,
+) -> Vec<Check> {
+    profiles
+        .iter()
+        .filter_map(|r| {
+            let p = profile_of(r);
+            let line = read_json(&p.settings_json)?.get("statusLine")?.clone();
+            let parts = wrapper_parts(&line, &r.id)?;
+            let label = format!("statusline {}", r.id);
+            let fix = format!("`pooltime connect --statusline {}`", r.id);
+            if !is_executable(&parts.bin) {
+                return Some(
+                    Check::new(
+                        Level::Fail,
+                        label,
+                        format!(
+                            "the wrapper runs {}, which is missing or not executable",
+                            parts.bin.display()
+                        ),
+                    )
+                    .hint(fix),
+                );
+            }
+            match snapshot::read(&snapshot::snapshot_path(paths, &p)) {
+                SnapshotState::Present(_) => {}
+                _ => {
+                    return Some(
+                        Check::new(
+                            Level::Warn,
+                            label,
+                            "no readable snapshot of the original status line \
+                             (disconnect cannot restore it)",
+                        )
+                        .hint(fix),
+                    )
+                }
+            }
+            let reads = parts.home.as_deref().or(default_home);
+            if reads != Some(paths.home.as_path()) {
+                let shown = reads.map_or("an unknown data dir".to_string(), |h| {
+                    h.display().to_string()
+                });
+                return Some(
+                    Check::new(
+                        Level::Warn,
+                        label,
+                        format!(
+                            "the wrapper reads {shown}, not this data dir ({})",
+                            paths.home.display()
+                        ),
+                    )
+                    .hint(fix),
+                );
+            }
+            Some(Check::new(Level::Ok, label, "wrapper installed"))
+        })
+        .collect()
+}
+
+/// One line per recorded profile whose snapshot says the MCP server is registered there. Only
+/// those profiles' `.claude.json` is read.
+fn mcp_checks(paths: &Paths, profiles: &[ProfileRef], port: u16) -> Vec<Check> {
+    let key = std::fs::read_to_string(crate::mcp::mcp_key_path(paths))
+        .ok()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty());
+    profiles
+        .iter()
+        .filter_map(|r| {
+            let p = profile_of(r);
+            if !mcp::is_registered(paths, &p) {
+                return None;
+            }
+            let label = format!("mcp {}", r.id);
+            let fix = format!("`pooltime connect --mcp {}`", r.id);
+            let entry = read_json(&p.claude_json)
+                .and_then(|v| v.get("mcpServers")?.get(mcp::MCP_SERVER_NAME).cloned());
+            let Some(entry) = entry else {
+                return Some(
+                    Check::new(
+                        Level::Warn,
+                        label,
+                        format!(
+                            "registered, but {} has no mcpServers.{}",
+                            p.claude_json.display(),
+                            mcp::MCP_SERVER_NAME
+                        ),
+                    )
+                    .hint(fix),
+                );
+            };
+            let entry_port = entry["url"]
+                .as_str()
+                .and_then(|u| reqwest::Url::parse(u).ok())
+                .and_then(|u| u.port_or_known_default());
+            if entry_port != Some(port) {
+                let shown = entry_port.map_or("no port".to_string(), |p| format!("port {p}"));
+                return Some(
+                    Check::new(
+                        Level::Warn,
+                        label,
+                        format!("registered on {shown}, but the pool is on port {port}"),
+                    )
+                    .hint(fix),
+                );
+            }
+            let Some(key) = &key else {
+                return Some(
+                    Check::new(
+                        Level::Warn,
+                        label,
+                        "run/mcp.key is missing (the pool writes it when it starts)",
+                    )
+                    .hint(format!("start the pool, then {fix}")),
+                );
+            };
+            let have = entry["headers"]["Authorization"].as_str().unwrap_or("");
+            let want = format!("Bearer {key}");
+            if !bool::from(have.as_bytes().ct_eq(want.as_bytes())) {
+                return Some(
+                    Check::new(
+                        Level::Warn,
+                        label,
+                        "registered token does not match run/mcp.key",
+                    )
+                    .hint(fix),
+                );
+            }
+            Some(Check::new(
+                Level::Ok,
+                label,
+                format!("registered on port {port}"),
+            ))
+        })
+        .collect()
+}
+
+/// The pool's `GET /api/v1/stats` (management key), bounded by [`POOL_TIMEOUT`].
+async fn get_stats(c: &Client) -> Result<Value, String> {
+    match tokio::time::timeout(POOL_TIMEOUT, c.get_authed_opt("/api/v1/stats")).await {
+        Ok(Ok(Some(v))) => Ok(v),
+        Ok(Ok(None)) => Err("the pool has no journal stats".into()),
+        Ok(Err(e)) => Err(format!("{e:#}")),
+        Err(_) => Err(format!("no answer within {} s", POOL_TIMEOUT.as_secs())),
+    }
+}
+
+/// Error rates over the stats window. `None`: no pool.
+fn error_checks(stats: Option<&Result<Value, String>>) -> Vec<Check> {
+    let label = "errors";
+    let v = match stats {
+        None => {
+            return vec![Check::new(
+                Level::Info,
+                label,
+                "not checked (pool not running)",
+            )]
+        }
+        Some(Err(e)) => {
+            return vec![Check::new(
+                Level::Info,
+                label,
+                format!("not checked (could not read the journal stats: {e})"),
+            )]
+        }
+        Some(Ok(v)) => v,
+    };
+    let hours = v["window_secs"].as_u64().unwrap_or(86_400) / 3600;
+    let rows = v["accounts"].as_array().cloned().unwrap_or_default();
+    let mut out = Vec::new();
+    let (mut attempts, mut errors) = (0u64, 0u64);
+    for a in &rows {
+        let n = a["attempts"].as_u64().unwrap_or(0);
+        let e = a["errors"].as_u64().unwrap_or(0);
+        attempts += n;
+        errors += e;
+        let rate = a["error_rate"].as_f64().unwrap_or(0.0);
+        if n < ERROR_MIN_ATTEMPTS || rate < ERROR_RATE_WARN {
+            continue;
+        }
+        let id = a["account"].as_str().unwrap_or("?");
+        let mut detail = format!(
+            "{:.0}% of attempts failed in the last {hours} h ({e} of {n})",
+            rate * 100.0
+        );
+        if let Some(top) = a["top_error"].as_str() {
+            detail.push_str(&format!(", mostly {top}"));
+        }
+        if let (Some(p50), Some(p95)) = (a["p50_ms"].as_i64(), a["p95_ms"].as_i64()) {
+            detail.push_str(&format!("; latency p50 {p50} ms, p95 {p95} ms"));
+        }
+        out.push(
+            Check::new(Level::Warn, format!("{label} {id}"), detail)
+                .hint("see the dashboard's request journal, or `pooltime logs`"),
+        );
+    }
+    if out.is_empty() {
+        out.push(Check::new(
+            Level::Ok,
+            label,
+            format!(
+                "{attempts} attempts in the last {hours} h, {errors} failed; no account at \
+                 {:.0}% or more",
+                ERROR_RATE_WARN * 100.0
+            ),
+        ));
+    }
+    out
+}
+
+/// A release version: `major.minor.patch[-pre]` (a leading `v` and any `+build` ignored).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Version {
+    core: [u64; 3],
+    pre: Vec<String>,
+}
+
+impl Version {
+    fn parse(s: &str) -> Option<Version> {
+        let s = s.trim();
+        let s = s.strip_prefix('v').unwrap_or(s);
+        let s = s.split('+').next()?;
+        let (core, pre) = match s.split_once('-') {
+            Some((c, p)) => (c, Some(p)),
+            None => (s, None),
+        };
+        let nums: Vec<u64> = core
+            .split('.')
+            .map(|n| {
+                (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| n.parse().ok())
+                    .flatten()
+            })
+            .collect::<Option<_>>()?;
+        let [major, minor, patch] = nums[..] else {
+            return None;
+        };
+        let pre = match pre {
+            None => Vec::new(),
+            Some(p) => {
+                let ids: Vec<String> = p.split('.').map(str::to_string).collect();
+                let ok = ids.iter().all(|i| {
+                    !i.is_empty() && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                });
+                if !ok {
+                    return None;
+                }
+                ids
+            }
+        };
+        Some(Version {
+            core: [major, minor, patch],
+            pre,
+        })
+    }
+}
+
+impl Ord for Version {
+    /// Semver precedence: the core numbers, then a pre-release below the release, pre-release
+    /// identifiers compared numerically when both are numbers, numbers below words, and a
+    /// shorter list below a longer one it starts.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        self.core.cmp(&other.core).then_with(|| {
+            match (self.pre.is_empty(), other.pre.is_empty()) {
+                (true, true) => return Ordering::Equal,
+                (true, false) => return Ordering::Greater,
+                (false, true) => return Ordering::Less,
+                _ => {}
+            }
+            for (a, b) in self.pre.iter().zip(&other.pre) {
+                let o = match (a.parse::<u64>(), b.parse::<u64>()) {
+                    (Ok(x), Ok(y)) => x.cmp(&y),
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    (Err(_), Err(_)) => a.cmp(b),
+                };
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            self.pre.len().cmp(&other.pre.len())
+        })
+    }
+}
+
+impl PartialOrd for Version {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let [a, b, c] = self.core;
+        write!(f, "{a}.{b}.{c}")?;
+        if !self.pre.is_empty() {
+            write!(f, "-{}", self.pre.join("."))?;
+        }
+        Ok(())
+    }
+}
+
+/// The check for the latest release `tag` against this build's `current` version.
+fn version_verdict(current: &str, tag: Option<&str>) -> Check {
+    let label = "version";
+    let (Some(cur), Some(latest)) = (Version::parse(current), tag.and_then(Version::parse)) else {
+        return Check::new(
+            Level::Info,
+            label,
+            "not checked (the latest release has no version tag)",
+        );
+    };
+    if latest > cur {
+        Check::new(
+            Level::Warn,
+            label,
+            format!("{latest} available (brew upgrade pooltime / re-run install)"),
+        )
+    } else {
+        Check::new(Level::Ok, label, format!("up to date ({cur})"))
+    }
+}
+
+/// Ask for the latest release (unless opted out); returns the check and the answer's `Date`
+/// (with the origin it came from), for the clock check.
+async fn version_check(opts: &Options) -> (Check, Option<(String, OffsetDateTime)>) {
+    let label = "version";
+    if !opts.version_check {
+        return (Check::new(Level::Info, label, "release check off"), None);
+    }
+    let offline = |why: String| Check::new(Level::Info, label, format!("not checked ({why})"));
+    let http = match reqwest::Client::builder()
+        .connect_timeout(RELEASE_TIMEOUT)
+        .timeout(RELEASE_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return (offline(format!("no HTTP client: {e}")), None),
+    };
+    let resp = http
+        .get(&opts.releases_api)
+        .header(http::header::ACCEPT, "application/vnd.github+json")
+        .header(
+            http::header::USER_AGENT,
+            concat!("pooltime/", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => {
+            return (
+                offline(format!("no answer within {} s", RELEASE_TIMEOUT.as_secs())),
+                None,
+            )
+        }
+        Err(_) => return (offline("release server unreachable".into()), None),
+    };
+    let date = resp
+        .headers()
+        .get(http::header::DATE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_http_date)
+        .map(|d| {
+            let from = origin(&opts.releases_api).unwrap_or_else(|| "the release server".into());
+            (from, d)
+        });
+    let status = resp.status();
+    if !status.is_success() {
+        return (
+            offline(format!("release server answered HTTP {}", status.as_u16())),
+            date,
+        );
+    }
+    let tag = resp
+        .bytes()
+        .await
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["tag_name"].as_str().map(str::to_string));
+    (
+        version_verdict(env!("CARGO_PKG_VERSION"), tag.as_deref()),
+        date,
+    )
+}
+
+/// Which desktop notifier alerts would use.
+fn notify_check(enabled: bool, notifier: &SystemNotifier, macos: bool) -> Check {
+    let label = "notifications";
+    if !enabled {
+        return Check::new(Level::Info, label, "off (alerts.notify = false)");
+    }
+    let probe = Notification {
+        message: String::new(),
+        action: String::new(),
+        url: String::new(),
+    };
+    let backend = notifier
+        .command_for(&probe)
+        .and_then(|(prog, _)| prog.file_name().map(|f| f.to_string_lossy().into_owned()));
+    match (backend.as_deref(), macos) {
+        (Some("osascript"), true) => Check::new(Level::Ok, label, "osascript")
+            .hint("brew install terminal-notifier for clickable notifications"),
+        (Some(b), _) => Check::new(Level::Ok, label, b.to_string()),
+        (None, true) => Check::new(
+            Level::Warn,
+            label,
+            "no notifier found (alerts are only logged)",
+        )
+        .hint("brew install terminal-notifier"),
+        (None, false) => Check::new(
+            Level::Warn,
+            label,
+            "notify-send not found (alerts are only logged)",
+        )
+        .hint("install libnotify (notify-send)"),
+    }
 }
 
 /// What the account checks need to know about one account.
@@ -666,7 +1231,20 @@ fn private_paths(paths: &Paths) -> (Vec<PathBuf>, Vec<PathBuf>) {
         sibling(&paths.db, "-wal"),
         sibling(&paths.db, "-shm"),
         crate::server::mgmt::mgmt_key_path(paths),
+        crate::mcp::mcp_key_path(paths),
     ];
+    // Profile snapshots may hold the user's own auth token.
+    let snaps = paths.run.join("profiles");
+    if let Ok(rd) = std::fs::read_dir(&snaps) {
+        let mut found: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        found.sort();
+        files.extend(found);
+        dirs.push(snaps);
+    }
     if let Ok(rd) = std::fs::read_dir(&paths.accounts) {
         let mut accounts: Vec<PathBuf> = rd
             .flatten()
@@ -738,7 +1316,10 @@ fn mib(n: u64) -> String {
     format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0))
 }
 
-fn disk_check(paths: &Paths) -> Check {
+/// Database (with its WAL/SHM files) and logs against the retention caps; `journal_rows` is the
+/// pool's journal size, when it answered.
+fn storage_check(paths: &Paths, ret: &RetentionCfg, journal_rows: Option<u64>) -> Check {
+    let label = "storage";
     let db: u64 = [
         paths.db.clone(),
         sibling(&paths.db, "-wal"),
@@ -749,18 +1330,50 @@ fn disk_check(paths: &Paths) -> Check {
     .map(|m| m.len())
     .sum();
     let logs = dir_size(&paths.logs);
-    let detail = format!(
-        "{} (database {}, logs {})",
-        mib(db + logs),
-        mib(db),
-        mib(logs)
-    );
-    if db + logs > DISK_WARN {
-        Check::new(Level::Warn, "disk", detail)
-            .hint("lower the retention in config.toml, or delete old files in logs/")
-    } else {
-        Check::new(Level::Ok, "disk", detail)
+    let cap = u64::from(ret.journal_max_mb) * 1024 * 1024;
+    let mut detail = format!("{} in all: database {}", mib(db + logs), mib(db));
+    if cap > 0 {
+        detail.push_str(&format!(" of {} cap", mib(cap)));
     }
+    detail.push_str(&format!(", logs {}", mib(logs)));
+    if let Some(n) = journal_rows {
+        match ret.journal_max_requests {
+            0 => detail.push_str(&format!(", journal {n} requests")),
+            max => detail.push_str(&format!(", journal {n} of {max} requests")),
+        }
+    }
+    let near_cap = cap > 0 && db as f64 > cap as f64 * DB_CAP_WARN;
+    if near_cap || db + logs > DISK_WARN {
+        Check::new(Level::Warn, label, detail).hint(
+            "the pool prunes the oldest journal rows past the cap; lower or raise [retention] in \
+             config.toml, or delete old files in logs/",
+        )
+    } else {
+        Check::new(Level::Ok, label, detail)
+    }
+}
+
+/// The retention settings, for reference.
+fn retention_check(ret: &RetentionCfg) -> Check {
+    let rows = match ret.journal_max_requests {
+        0 => String::new(),
+        n => format!(" / {n} requests"),
+    };
+    Check::new(
+        Level::Info,
+        "retention",
+        format!(
+            "logs {} d / {} MiB; journal {} d / {} MiB{rows}; usage history hourly {} d, \
+             daily {} d, weekly {} d",
+            ret.logs_days,
+            ret.logs_max_mb,
+            ret.journal_days,
+            ret.journal_max_mb,
+            ret.history_hourly_days,
+            ret.history_daily_days,
+            ret.history_weekly_days
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -864,6 +1477,214 @@ mod tests {
             "https://proxy.example:8443"
         );
         assert_eq!(shown_url("not a url"), "an unparsable URL");
+    }
+
+    #[test]
+    fn semver_ordering() {
+        let v = |s: &str| Version::parse(s).unwrap();
+        assert!(v("v0.2.0") > v("0.1.9"));
+        assert!(v("0.10.0") > v("0.9.0"), "numeric, not lexical");
+        assert!(
+            v("1.0.0") > v("1.0.0-rc.1"),
+            "release above its pre-release"
+        );
+        assert!(v("1.0.0-rc.10") > v("1.0.0-rc.2"));
+        assert!(v("1.0.0-beta") > v("1.0.0-alpha.1"));
+        assert!(v("1.0.0-alpha.1") > v("1.0.0-alpha"));
+        assert_eq!(v("v1.2.3+build.5"), v("1.2.3"));
+        assert_eq!(v("v1.2.3-rc.1").to_string(), "1.2.3-rc.1");
+        for bad in ["", "1.2", "1.2.3.4", "x.y.z", "1.2.3-", "1..3", "1.2.3-a$b"] {
+            assert!(Version::parse(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn version_verdicts() {
+        let c = version_verdict("0.1.0", Some("v0.2.0"));
+        assert_eq!(c.level, Level::Warn);
+        assert_eq!(
+            c.to_string(),
+            "! version: 0.2.0 available (brew upgrade pooltime / re-run install)"
+        );
+        assert_eq!(version_verdict("0.1.0", Some("v0.1.0")).level, Level::Ok);
+        assert_eq!(version_verdict("0.2.0", Some("v0.1.0")).level, Level::Ok);
+        assert_eq!(version_verdict("0.1.0", Some("nightly")).level, Level::Info);
+        assert_eq!(version_verdict("0.1.0", None).level, Level::Info);
+    }
+
+    fn exe(dir: &Path, name: &str) {
+        let p = dir.join(name);
+        std::fs::write(&p, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn notifier_backends() {
+        let d = tempfile::tempdir().unwrap();
+        let n = || SystemNotifier::new(d.path().as_os_str(), true);
+        assert_eq!(notify_check(false, &n(), true).level, Level::Info);
+        assert_eq!(notify_check(true, &n(), true).level, Level::Warn);
+        exe(d.path(), "osascript");
+        let c = notify_check(true, &n(), true);
+        assert_eq!(c.level, Level::Ok);
+        assert!(c.to_string().contains("osascript"), "{c}");
+        assert_eq!(
+            c.hint.as_deref(),
+            Some("brew install terminal-notifier for clickable notifications")
+        );
+        exe(d.path(), "terminal-notifier");
+        let c = notify_check(true, &n(), true);
+        assert_eq!(
+            (c.level, c.detail.as_str(), c.hint),
+            (Level::Ok, "terminal-notifier", None)
+        );
+        // Linux: notify-send or a warning.
+        let linux = SystemNotifier::new(d.path().as_os_str(), false);
+        assert_eq!(notify_check(true, &linux, false).level, Level::Warn);
+        exe(d.path(), "notify-send");
+        let linux = SystemNotifier::new(d.path().as_os_str(), false);
+        assert_eq!(notify_check(true, &linux, false).detail, "notify-send");
+    }
+
+    /// A data dir and a connected profile `t` (snapshot plus base URL) under a temp dir.
+    fn connected() -> (tempfile::TempDir, Paths, ProfileRef) {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::under(&d.path().join("pt"));
+        let dir = d.path().join(".claude-t");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), "{}").unwrap();
+        let r = ProfileRef {
+            id: "t".into(),
+            settings_dir: dir,
+        };
+        let block = crate::claude_code::EnvBlock {
+            base_url: "http://127.0.0.1:3460".into(),
+            auth_token: "k".into(),
+            pins: Default::default(),
+            max_context: None,
+        };
+        crate::claude_code::apply(&profile_of(&r), &block, &paths).unwrap();
+        (d, paths, r)
+    }
+
+    #[test]
+    fn stale_status_cache_is_pool_down() {
+        let (_d, paths, r) = connected();
+        let url = "http://127.0.0.1:3460";
+        let one = |pool| profile_checks(&paths, std::slice::from_ref(&r), url, pool, None);
+        assert_eq!(one(PoolState::Up)[0].level, Level::Ok);
+        for pool in [PoolState::Down, PoolState::CacheStale] {
+            let c = &one(pool)[0];
+            assert_eq!(c.level, Level::Fail);
+            assert!(c.detail.starts_with("connected, pool down"), "{c}");
+            assert!(c.to_string().contains("pooltime service status"), "{c}");
+        }
+    }
+
+    #[test]
+    fn statusline_wrapper_health() {
+        let (d, paths, r) = connected();
+        let set = |cmd: &str| {
+            let v = serde_json::json!({"statusLine": {"type": "command", "command": cmd}});
+            std::fs::write(r.settings_dir.join("settings.json"), v.to_string()).unwrap();
+        };
+        let check = || statusline_checks(&paths, std::slice::from_ref(&r), None);
+        // Not our wrapper: no line.
+        set("ccline");
+        assert!(check().is_empty());
+
+        let bin = d.path().join("pooltime");
+        let ours = |bin: &Path, home: Option<&Path>| {
+            crate::claude_code::statusline::wrapper_command(bin, "t", home)
+        };
+        set(&ours(&bin, Some(&paths.home)));
+        let c = &check()[0];
+        assert_eq!(c.level, Level::Fail, "{c}");
+        assert_eq!(c.hint.as_deref(), Some("`pooltime connect --statusline t`"));
+
+        exe(d.path(), "pooltime");
+        assert_eq!(check()[0].level, Level::Ok, "{}", check()[0]);
+        // Another data dir: the status line shows that pool's state, not this one's.
+        set(&ours(&bin, Some(Path::new("/elsewhere"))));
+        assert_eq!(check()[0].level, Level::Warn);
+        // No prefix: reads the default dir, which here is not this one.
+        set(&ours(&bin, None));
+        assert_eq!(check()[0].level, Level::Warn);
+        let c = &statusline_checks(&paths, std::slice::from_ref(&r), Some(&paths.home))[0];
+        assert_eq!(c.level, Level::Ok);
+        // The snapshot holding the original is gone.
+        std::fs::remove_file(snapshot::snapshot_path(&paths, &profile_of(&r))).unwrap();
+        let c = &statusline_checks(&paths, std::slice::from_ref(&r), Some(&paths.home))[0];
+        assert_eq!(c.level, Level::Warn);
+    }
+
+    #[test]
+    fn mcp_registration_health_never_shows_the_token() {
+        let (_d, paths, r) = connected();
+        let p = profile_of(&r);
+        let key = "f".repeat(64);
+        std::fs::write(crate::mcp::mcp_key_path(&paths), format!("{key}\n")).unwrap();
+        let check = |port| mcp_checks(&paths, std::slice::from_ref(&r), port);
+        // Not registered: nothing read, no line.
+        assert!(check(3460).is_empty());
+
+        mcp::register(&paths, &p, "http://127.0.0.1:3460/mcp", &key).unwrap();
+        assert_eq!(check(3460)[0].level, Level::Ok);
+        let c = &check(4000)[0];
+        assert_eq!(c.level, Level::Warn);
+        assert!(
+            c.detail.contains("port 3460") && c.detail.contains("port 4000"),
+            "{c}"
+        );
+        assert_eq!(c.hint.as_deref(), Some("`pooltime connect --mcp t`"));
+
+        let stale = "0".repeat(64);
+        mcp::register(&paths, &p, "http://127.0.0.1:3460/mcp", &stale).unwrap();
+        let c = &check(3460)[0];
+        assert_eq!(c.level, Level::Warn);
+        let line = c.to_string();
+        assert!(!line.contains(&stale) && !line.contains(&key), "{line}");
+
+        // The entry removed behind the snapshot's back.
+        std::fs::write(&p.claude_json, "{}").unwrap();
+        assert_eq!(check(3460)[0].level, Level::Warn);
+    }
+
+    #[test]
+    fn error_rate_thresholds() {
+        let stats = |attempts: u64, errors: u64| {
+            Ok(serde_json::json!({"window_secs": 86400, "accounts": [{
+                "account": "a", "attempts": attempts, "errors": errors,
+                "error_rate": errors as f64 / attempts as f64,
+            }]}))
+        };
+        let one = |s| error_checks(Some(&s));
+        assert_eq!(one(stats(20, 2))[0].level, Level::Warn, "10% of 20");
+        assert_eq!(one(stats(19, 19))[0].level, Level::Ok, "too few attempts");
+        let ok = &one(stats(100, 9))[0];
+        assert_eq!((ok.level, ok.label.as_str()), (Level::Ok, "errors"));
+        assert_eq!(error_checks(None)[0].level, Level::Info);
+        assert_eq!(one(Err("boom".into()))[0].level, Level::Info);
+    }
+
+    #[test]
+    fn storage_near_the_cap() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::under(d.path());
+        std::fs::write(&paths.db, vec![0u8; 900 * 1024]).unwrap();
+        let ret = |mb| RetentionCfg {
+            journal_max_mb: mb,
+            ..RetentionCfg::default()
+        };
+        assert_eq!(storage_check(&paths, &ret(1), None).level, Level::Warn);
+        assert_eq!(storage_check(&paths, &ret(2), None).level, Level::Ok);
+        assert_eq!(
+            storage_check(&paths, &ret(0), None).level,
+            Level::Ok,
+            "no cap"
+        );
+        let c = storage_check(&paths, &ret(2), Some(7));
+        assert!(c.detail.contains("journal 7 of 100000 requests"), "{c}");
     }
 
     #[test]

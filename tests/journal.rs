@@ -263,6 +263,8 @@ async fn journal_row_per_request_with_attempt_chain() {
     };
     assert_eq!(acct("a1")["attempts"], 1);
     assert_eq!(acct("a1")["error_rate"], 1.0);
+    assert!(acct("a1")["top_error"].is_string(), "{st}");
+    assert!(acct("a2")["top_error"].is_null(), "{st}");
     assert_eq!(acct("a2")["attempts"], 2);
     assert_eq!(acct("a2")["errors"], 0);
     assert!(acct("a2")["p50_ms"].as_i64().is_some() && acct("a2")["p95_ms"].as_i64().is_some());
