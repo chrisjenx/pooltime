@@ -6,10 +6,12 @@
 //! (`sh -c`, same stdin, stdout captured, stderr dropped) and appends ` · <segment>` to its output.
 //!
 //! The segment is computed alongside the original command and must be ready within [`BUDGET`]
-//! of starting; otherwise (or if it fails) the original output is printed alone. The original's
-//! own run time is not limited here. The status line never errors loudly: every path exits 0.
+//! of starting; otherwise (or if it fails) the original output is printed alone. The original
+//! itself may take up to [`ORIGINAL_TIMEOUT`]; past that its process group is killed and the
+//! segment is printed alone. The status line never errors loudly: every path exits 0.
 
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -22,6 +24,8 @@ use crate::config::Paths;
 
 /// Time pooltime's own work (the segment) may take.
 pub const BUDGET: Duration = Duration::from_millis(150);
+/// Longest the user's original command may run before it is killed.
+pub const ORIGINAL_TIMEOUT: Duration = Duration::from_secs(5);
 const SEP: &str = " · ";
 
 /// Run the command; always `0`.
@@ -37,7 +41,13 @@ pub fn run(paths: &Paths, wrap: Option<String>) -> i32 {
             let _ = std::io::stdin().read_to_end(&mut stdin);
             let prior = prior_statusline(paths, &id);
             let paths = paths.clone();
-            wrap_with(&stdin, &prior, move || read_segment(&paths), BUDGET)
+            wrap_with(
+                &stdin,
+                &prior,
+                move || read_segment(&paths),
+                BUDGET,
+                ORIGINAL_TIMEOUT,
+            )
         }
     };
     let mut so = std::io::stdout().lock();
@@ -63,38 +73,67 @@ fn command_of(prior: &Value) -> Option<&str> {
         .filter(|c| !c.trim().is_empty())
 }
 
-/// Run `sh -c command` with `stdin`, returning its stdout (whatever it printed, even when it
-/// failed); `None` if it could not be started. stderr is discarded.
-fn run_original(command: &str, stdin: &[u8]) -> Option<Vec<u8>> {
+/// Run `sh -c command` (in its own process group) with `stdin`, returning its stdout (whatever it
+/// printed, even when it failed). `None` if it could not be started, or if it has not exited and
+/// closed its output within `timeout`: then the whole group is killed. stderr is discarded.
+fn run_original(command: &str, stdin: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
+        .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let mut pipe = child.stdin.take()?;
-    let input = stdin.to_vec();
-    // A writer thread so a command that prints before reading cannot deadlock us.
-    let writer = std::thread::spawn(move || {
-        let _ = pipe.write_all(&input);
+    let pid = child.id() as libc::pid_t;
+    // Writer and reader threads, so a command that prints before reading cannot deadlock us and
+    // a hung one cannot hold us past the deadline. Neither is joined: after a kill they end on
+    // the broken pipes.
+    let (mut input, mut output) = (child.stdin.take()?, child.stdout.take()?);
+    let bytes = stdin.to_vec();
+    std::thread::spawn(move || {
+        let _ = input.write_all(&bytes);
     });
-    let out = child.wait_with_output().ok()?;
-    let _ = writer.join();
-    Some(out.stdout)
+    let (out_tx, out_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = output.read_to_end(&mut buf);
+        let _ = out_tx.send(buf);
+    });
+    let (exit_tx, exit_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = exit_tx.send(child.wait());
+    });
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let done = exit_rx.recv_timeout(left()).is_ok();
+    let out = if done {
+        out_rx.recv_timeout(left()).ok()
+    } else {
+        None
+    };
+    if out.is_none() {
+        // SAFETY: plain kill(2) on the group we created; a stale group id fails harmlessly.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    out
 }
 
 /// The wrapper's output: the original status line (from `prior`, fed `stdin`) with ` · ` and the
 /// segment appended. `segment` runs on its own thread while the original runs; if it has not
 /// answered within `budget` of starting (or panicked), the original output is returned alone.
-/// One trailing newline of the original is kept after the segment. No original command, or no
-/// output from it: the segment alone (newline-terminated).
+/// One trailing newline of the original is kept after the segment. No original command, no
+/// output from it, or an original that ran past `original_timeout` (killed): the segment alone
+/// (newline-terminated).
 pub fn wrap_with(
     stdin: &[u8],
     prior: &Value,
     segment: impl FnOnce() -> String + Send + 'static,
     budget: Duration,
+    original_timeout: Duration,
 ) -> Vec<u8> {
     let started = Instant::now();
     let (tx, rx) = mpsc::channel();
@@ -102,7 +141,7 @@ pub fn wrap_with(
         let _ = tx.send(segment());
     });
     let original = command_of(prior)
-        .and_then(|c| run_original(c, stdin))
+        .and_then(|c| run_original(c, stdin, original_timeout))
         .unwrap_or_default();
     let segment = rx
         .recv_timeout(budget.saturating_sub(started.elapsed()))
@@ -146,26 +185,44 @@ mod tests {
     #[test]
     fn wrap_appends_segment_to_original_output() {
         // `cat` proves the original sees Claude Code's stdin bytes.
-        let out = wrap_with(b"{\"model\":\"x\"}\n", &cmd("cat"), seg, BUDGET);
+        let out = wrap_with(
+            b"{\"model\":\"x\"}\n",
+            &cmd("cat"),
+            seg,
+            BUDGET,
+            ORIGINAL_TIMEOUT,
+        );
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "{\"model\":\"x\"} · pool 6/8 · 7d 41% left · ⚠ 2 need login\n"
         );
         // No trailing newline in, none out; stderr never reaches the output.
-        let out = wrap_with(b"", &cmd("printf orig; echo noise >&2"), seg, BUDGET);
+        let out = wrap_with(
+            b"",
+            &cmd("printf orig; echo noise >&2"),
+            seg,
+            BUDGET,
+            ORIGINAL_TIMEOUT,
+        );
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "orig · pool 6/8 · 7d 41% left · ⚠ 2 need login"
         );
         // A failing original still has its stdout shown.
-        let out = wrap_with(b"", &cmd("echo partial; exit 3"), seg, BUDGET);
+        let out = wrap_with(
+            b"",
+            &cmd("echo partial; exit 3"),
+            seg,
+            BUDGET,
+            ORIGINAL_TIMEOUT,
+        );
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "partial · pool 6/8 · 7d 41% left · ⚠ 2 need login\n"
         );
         // No prior (or nothing printed): the segment alone.
         for prior in [Value::Null, cmd("true"), json!({"type": "static"})] {
-            let out = wrap_with(b"{}", &prior, seg, BUDGET);
+            let out = wrap_with(b"{}", &prior, seg, BUDGET, ORIGINAL_TIMEOUT);
             assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", seg()));
         }
     }
@@ -177,9 +234,31 @@ mod tests {
             seg()
         };
         let t = Instant::now();
-        let out = wrap_with(b"{}", &cmd("echo orig"), slow, BUDGET);
+        let out = wrap_with(b"{}", &cmd("echo orig"), slow, BUDGET, ORIGINAL_TIMEOUT);
         assert_eq!(out, b"orig\n");
         assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn hung_original_is_killed_and_segment_printed_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("late");
+        // Prints something, then hangs (a background grandchild holds the pipe too).
+        let c = format!(
+            "printf partial; (sleep 30; touch '{}') & sleep 30",
+            marker.display()
+        );
+        let t = Instant::now();
+        let out = wrap_with(b"{}", &cmd(&c), seg, BUDGET, Duration::from_millis(300));
+        assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", seg()));
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        // The whole group is gone: the grandchild never gets to run on.
+        std::thread::sleep(Duration::from_millis(100));
+        let out = Command::new("pgrep")
+            .args(["-f", &marker.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(out.stdout.is_empty(), "grandchild still running");
     }
 
     #[test]

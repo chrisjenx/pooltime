@@ -549,6 +549,8 @@ impl Flow {
         .context("saving credentials panicked")??;
         self.state
             .clear_refresh_dead(&self.account, OffsetDateTime::now_utc());
+        // A first login turns `needs_login` into `ready` without any state change.
+        self.state.notify_changed();
 
         let (reg, id) = (self.registry.clone(), self.account.clone());
         let meta_saved = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {

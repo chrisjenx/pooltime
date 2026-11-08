@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use pooltime::claude_code::statusline::{
+    cache_path, is_wrapper, spawn_status_cache, wrapper_command,
+};
 use pooltime::claude_code::{
     connect, connect_with, disconnect, is_connected, profile_of, sync_once, Profile, SYNC_INTERVAL,
 };
@@ -569,9 +572,13 @@ fn set_statusline(p: &Profile, v: Value) {
 async fn connect_disconnect_restores_original_statusline() {
     let fx = Fix::new().await;
     let bin = PathBuf::from("/opt/homebrew/bin/pooltime");
-    let wrapper = json!({"type": "command",
-        "command": "/opt/homebrew/bin/pooltime statusline --wrap claude-work"});
+    // The pool's data dir is a tempdir, not ~/.pooltime: the wrapper names it.
+    let home = fx.paths().home;
+    let command = |id: &str| wrapper_command(&bin, id, Some(&home));
+    assert!(command("claude-work").starts_with("POOLTIME_HOME="));
     let original = json!({"type": "command", "command": "~/.claude/ccline", "padding": 0});
+    // The original's other fields (`padding`) are kept on the wrapper.
+    let wrapper = json!({"type": "command", "command": command("claude-work"), "padding": 0});
     let snap_of = |id: &str| json_of(&fx.paths().run.join(format!("profiles/{id}.json")));
 
     // With an original status line: wrapped, snapshotted, restored exactly.
@@ -582,14 +589,28 @@ async fn connect_disconnect_restores_original_statusline() {
         .unwrap();
     assert_eq!(json_of(&p.settings_json)["statusLine"], wrapper);
     assert_eq!(snap_of("claude-work")["statusline_prior"], original);
-    // Re-connecting never snapshots our own wrapper as the prior.
-    connect_with(fx.app(), std::slice::from_ref(&p), Some(&bin))
+    // Re-connecting changes nothing and never snapshots our own wrapper as the prior.
+    let again = connect_with(fx.app(), std::slice::from_ref(&p), Some(&bin))
         .await
         .unwrap();
+    assert_eq!(again, vec![(p.id.clone(), WriteOutcome::Unchanged)]);
+    assert_eq!(snap_of("claude-work")["statusline_prior"], original);
+    // Another binary path: the wrapper follows, the prior stays the user's.
+    let moved = PathBuf::from("/usr/local/bin/pooltime");
+    connect_with(fx.app(), std::slice::from_ref(&p), Some(&moved))
+        .await
+        .unwrap();
+    assert_eq!(
+        json_of(&p.settings_json)["statusLine"]["command"],
+        wrapper_command(&moved, "claude-work", Some(&home))
+    );
     assert_eq!(snap_of("claude-work")["statusline_prior"], original);
     // Without --statusline the installed wrapper is left as it is.
     connect(fx.app(), std::slice::from_ref(&p)).await.unwrap();
-    assert_eq!(json_of(&p.settings_json)["statusLine"], wrapper);
+    assert!(is_wrapper(
+        &json_of(&p.settings_json)["statusLine"],
+        "claude-work"
+    ));
     disconnect(&fx.paths(), std::slice::from_ref(&p)).unwrap();
     assert_eq!(json_of(&p.settings_json)["statusLine"], original);
     assert_eq!(env_of(&p), json!({"KEEP": "1"}));
@@ -600,8 +621,8 @@ async fn connect_disconnect_restores_original_statusline() {
         .await
         .unwrap();
     assert_eq!(
-        json_of(&q.settings_json)["statusLine"]["command"],
-        "/opt/homebrew/bin/pooltime statusline --wrap claude-other"
+        json_of(&q.settings_json)["statusLine"],
+        json!({"type": "command", "command": command("claude-other")})
     );
     assert!(snap_of("claude-other")["statusline_prior"].is_null());
     disconnect(&fx.paths(), std::slice::from_ref(&q)).unwrap();
@@ -614,4 +635,35 @@ async fn connect_disconnect_restores_original_statusline() {
     assert_eq!(json_of(&r.settings_json)["statusLine"], original);
     disconnect(&fx.paths(), std::slice::from_ref(&r)).unwrap();
     assert_eq!(json_of(&r.settings_json)["statusLine"], original);
+}
+
+#[tokio::test]
+async fn state_change_rewrites_the_status_cache_promptly() {
+    let pool = Pool::new();
+    let srv = pool.boot(Boot::default()).await;
+    let path = cache_path(&Paths::under(pool.dir.path()));
+    let read = || -> Option<Value> { serde_json::from_slice(&fs::read(&path).ok()?).ok() };
+    let cache = spawn_status_cache(srv.app.clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while read().is_none_or(|v| v["pool"]["available"] != 1) {
+        assert!(std::time::Instant::now() < deadline, "no first write");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Past the 1 s debounce of the first read, so this measures the change path alone.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let t = std::time::Instant::now();
+    pool.state
+        .mark_billing(&pool.meta.id, time::OffsetDateTime::now_utc());
+    while read().is_none_or(|v| v["pool"]["available"] != 0) {
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "no rewrite within 2 s of a state change"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Shutdown deletes the cache, and nothing writes it again.
+    cache.shutdown().await;
+    assert!(!path.exists());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!path.exists());
 }
