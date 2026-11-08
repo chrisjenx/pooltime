@@ -1,0 +1,152 @@
+# pooltime
+
+> pooltime pools several Claude Max/Pro and ChatGPT (Codex) subscription accounts behind one local
+> Anthropic-compatible endpoint (http://127.0.0.1:3460) for Claude Code. macOS and Linux. One binary,
+> data in ~/.pooltime. This file is for coding agents setting pooltime up for a user: every step
+> below is non-interactive unless it says a human must act.
+
+Rules for agents:
+- Never print, log or paste tokens, ~/.pooltime/run/*.key, or credentials files.
+- Signing in needs the human: they open a URL in a browser and sign in. Do not try to automate it.
+- Only connect the Claude Code profiles the user names. Do not use `pooltime connect --all` unless
+  they ask for every ~/.claude* profile.
+- If bro-cli is in use, the user must stop it (`bro pool down`) before pooltime serves imported accounts.
+- These steps need pooltime v1.0.0 or later (main branch). `pooltime --version` shows the version.
+
+## 1. Install
+
+```sh
+brew install chrisjenx/tap/pooltime
+```
+
+or, without Homebrew (installs to ~/.local/bin, no sudo; make sure it is on PATH):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/chrisjenx/pooltime/main/install.sh | sh
+```
+
+Check:
+
+```sh run
+pooltime --version
+```
+
+## 2. Non-interactive setup
+
+`pooltime setup` with `--yes` never asks; it does only what the flags say. Flags:
+
+- `--import-bro`: import accounts/settings from bro-cli (when ~/.claude-max-pool or ~/.bro exists and
+  pooltime has no accounts yet).
+- `--account NAME`: sign in a first Claude account (when pooltime has none and nothing is imported).
+  Needs the human (see step 3). Optional `--email EMAIL`, `--mode callback|paste`.
+- `--service`: install the background service (launchd on macOS, systemd --user on Linux).
+- `--connect PROFILES`: comma-separated Claude Code profile ids to connect: `default` = ~/.claude,
+  `claude-personal` = ~/.claude-personal, etc.
+- `--yes` / `-y`: never ask; also binds a first sign-in to the account without asking.
+
+Migrating from bro (ask the user to run `bro pool down` first):
+
+```sh
+pooltime setup --import-bro --service --connect default --yes
+```
+
+Fresh install, first Claude account signed in by the human, then service and one profile:
+
+```sh
+pooltime setup --account personal --email you@example.com --service --connect default --yes
+```
+
+setup prints one line per step, runs `pooltime doctor`, then prints the dashboard URL. Exit 1 if a
+step or a doctor check failed. It is safe to re-run.
+
+Then add the status line segment and the MCP server to the connected profiles (setup does not do
+this yet):
+
+```sh
+pooltime connect default --statusline --mcp
+```
+
+## 3. Sign-in (the human must act)
+
+Claude account:
+
+```sh
+pooltime accounts login personal
+```
+
+With a local browser this opens it and waits up to 5 minutes for the redirect.
+
+Headless / SSH (pooltime picks paste mode automatically when `SSH_TTY` is set, or on Linux without
+DISPLAY/WAYLAND_DISPLAY; force it with `--mode paste`): pooltime prints a URL. The human opens it in
+any browser, signs in, and pastes the `code#state` line the page shows at the `Code:` prompt on
+stdin. Run the command where the human can type into it.
+
+```sh
+pooltime accounts login personal --mode paste
+```
+
+ChatGPT / Codex account:
+
+```sh
+pooltime accounts add codex-1 --provider openai --login
+```
+
+The browser is redirected to http://localhost:1455/auth/callback (or 1457). Headless options:
+1. On the human's laptop, forward the ports, then open the printed URL there; it finishes by itself:
+   `ssh -L 1455:127.0.0.1:1455 -L 1457:127.0.0.1:1457 user@server`
+2. Or, after signing in, the browser lands on a page that fails to load: paste that full address
+   at the `Code:` prompt.
+
+Reuse an existing Codex CLI sign-in instead (no browser; pooltime then owns it, so the Codex CLI
+needs `codex login` again):
+
+```sh
+pooltime accounts add codex-1 --provider openai --from-codex-auth
+```
+
+Re-login later: `pooltime accounts relogin --dead` or `--expiring` (one at a time, same modes).
+
+## 4. Linux service persistence
+
+A systemd user service stops when the user logs out. On servers / SSH-only machines:
+
+```sh
+loginctl enable-linger "$USER"
+pooltime service install
+pooltime service status
+```
+
+## 5. Verify
+
+```sh
+pooltime doctor
+pooltime status
+pooltime accounts list
+```
+
+`doctor` exits 1 on any failure and prints the command that fixes each problem. Each account shows
+one state: ready, expiring, rate_limited, erroring, access_denied, billing, needs_login.
+
+## 6. Use
+
+Start `claude` in a connected profile; nothing else to configure. `pooltime open` prints and opens
+the dashboard URL (it contains a local key: do not share it). `pooltime disconnect` restores the
+profiles' own settings; `pooltime service uninstall` disconnects every profile and removes the service.
+
+## Commands
+
+```sh run
+pooltime --help
+pooltime setup --help
+pooltime accounts --help
+```
+
+## Docs
+
+- Install: https://github.com/chrisjenx/pooltime/blob/main/docs/install.md
+- Accounts: https://github.com/chrisjenx/pooltime/blob/main/docs/accounts.md
+- Re-login and headless sign-in: https://github.com/chrisjenx/pooltime/blob/main/docs/relogin.md
+- Claude Code profiles: https://github.com/chrisjenx/pooltime/blob/main/docs/profiles.md
+- Debugging: https://github.com/chrisjenx/pooltime/blob/main/docs/debugging.md
+- Configuration: https://github.com/chrisjenx/pooltime/blob/main/docs/configuration.md
+- Migrating from bro: https://github.com/chrisjenx/pooltime/blob/main/docs/migrating-from-bro.md
