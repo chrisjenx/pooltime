@@ -2,10 +2,11 @@
 //!
 //! Layout: [`router`] builds the route table and middleware, [`auth`] guards inference and
 //! management traffic, [`mgmt`] is the `/api/v1/*` management API, [`models_route`] serves `/v1/models`, [`health`] serves `/health` and the startup preflight, [`shutdown`] owns
-//! signal handling and the drain sequence.
+//! signal handling and the drain sequence, [`daemon`] boots it all for `pooltime serve`.
 
 pub mod auth;
 pub mod classifier;
+pub mod daemon;
 pub mod fallback;
 pub mod health;
 pub mod inference;
@@ -28,6 +29,7 @@ use crate::routing::Tuning;
 use crate::store::Store;
 use crate::upstream::Upstream;
 
+pub use daemon::run_daemon;
 pub use router::router;
 pub use shutdown::{serve, serve_listener, serve_until_signal, Outcome, ServeOpts};
 
