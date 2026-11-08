@@ -1,0 +1,106 @@
+---
+source: tests/codex_translate_req.rs
+expression: "serde_json::to_string_pretty(&out).unwrap()"
+---
+{
+  "model": "gpt-5.6-sol",
+  "instructions": "You are helpful.\nBe brief.",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "look at this"
+        },
+        {
+          "type": "input_image",
+          "image_url": "data:image/jpeg;base64,QUJD"
+        }
+      ]
+    },
+    {
+      "type": "reasoning",
+      "id": "rs_1",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "need the file"
+        }
+      ],
+      "encrypted_content": "enc-blob"
+    },
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "reading"
+        }
+      ]
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_1",
+      "name": "read_file",
+      "arguments": "{\"path\":\"a.rs\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_1",
+      "output": "fn main() {}"
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_image",
+          "image_url": "https://x.test/shot.png"
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "thanks"
+        }
+      ]
+    }
+  ],
+  "stream": true,
+  "store": false,
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "reasoning": {
+    "effort": "max"
+  },
+  "tools": [
+    {
+      "type": "function",
+      "name": "read_file",
+      "description": "reads a file",
+      "strict": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  ],
+  "tool_choice": "required",
+  "parallel_tool_calls": false,
+  "temperature": 0.5
+}
