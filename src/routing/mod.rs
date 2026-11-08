@@ -7,6 +7,7 @@
 
 pub mod reserve;
 pub mod score;
+pub mod sessions;
 pub mod tuning;
 
 use std::collections::HashSet;
