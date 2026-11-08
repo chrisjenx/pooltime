@@ -9,7 +9,7 @@ mod profile;
 mod safe_write;
 mod scrub;
 mod settings_env;
-mod snapshot;
+pub(crate) mod snapshot;
 
 pub use connect::{
     catalog, connect, disconnect, profile_of, spawn_profile_sync, sync_once, SYNC_INTERVAL,

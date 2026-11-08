@@ -1,0 +1,9 @@
+{
+  "models": [
+    { "id": "my-custom-gpt", "provider": "openai", "upstreamModel": "gpt-5.5", "contextWindow": 272000, "maxContextWindow": 272000 }
+  ],
+  "mappingEnabled": true,
+  "mappings": [
+    { "from": "opus", "to": "gpt-5.5", "effort": { "high": "xhigh" } }
+  ]
+}

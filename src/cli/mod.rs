@@ -5,6 +5,7 @@
 pub mod accounts;
 pub mod client;
 pub mod connect;
+pub mod import;
 pub mod logs;
 pub mod models;
 pub mod open;
@@ -63,6 +64,9 @@ pub enum Command {
     /// Run the daemon as a background service (launchd on macOS, systemd on Linux).
     #[command(subcommand)]
     Service(service::ServiceCmd),
+    /// Migrate from another tool (bro-cli).
+    #[command(subcommand)]
+    Import(import::ImportCmd),
 }
 
 /// `pooltime serve` flags. `--port`/`--host` override `config.toml` and `POOLTIME_PORT`/`POOLTIME_HOST`.
@@ -111,6 +115,8 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
             Command::Logs(args) => logs::run(&paths, args),
             // Short blocking calls to launchctl/systemctl.
             Command::Service(cmd) => service::run(&paths, cmd),
+            // Blocking file and Keychain reads, then the identity fetches.
+            Command::Import(cmd) => import::run(&paths, cmd).await,
         }
     })
 }
