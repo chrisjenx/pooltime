@@ -1,29 +1,45 @@
 //! OAuth refresh for Claude subscription accounts (docs/spikes.md S1/S2).
 //!
-//! Exclusion layers, outermost first: a per-account async mutex (callers in this process share one
-//! refresh), then the per-account `flock` (other pooltime processes), both held across the token
-//! HTTP call. After each layer is acquired the credentials are re-read, because whoever held it
-//! may have refreshed (refresh tokens rotate, so spending the old one again would kill the
-//! account). Nothing here logs or persists a token or an upstream message: only the classified
+//! Exclusion layers, outermost first: one shared in-flight task per account (callers in this
+//! process share one refresh), a per-account async mutex serialising forced/unforced tasks, then the
+//! per-account `flock` (other pooltime processes), the last two held across the token HTTP call.
+//! After each layer is acquired the credentials are re-read, because whoever held it may have
+//! refreshed (refresh tokens rotate, so spending the old one again would kill the account).
+//!
+//! Cancellation safety: the critical section (flock, re-read, POST, persist, state updates) runs in
+//! a `tokio::spawn`ed task owning its inputs. Callers only await its result, so a dropped caller
+//! (client disconnect, wrapping timeout) can never lose a rotated refresh token.
+//!
+//! Nothing here logs or persists a token or an upstream message: only the classified
 //! [`RefreshErrorKind`], the account and the upstream `request-id`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use serde::Deserialize;
 use time::OffsetDateTime;
 use tokio::time::Instant;
 
 use super::AnthropicProvider;
-use crate::accounts::{AccountId, AccountMeta, Credentials, ErrorRecord};
+use crate::accounts::{AccountId, AccountMeta, Credentials, ErrorRecord, Registry, StateBook};
+use crate::config::AnthropicCfg;
 use crate::errors::{FailReason, RefreshErrorKind};
 use crate::fsutil::FileLock;
-use crate::upstream::Limits;
+use crate::upstream::{Limits, Upstream};
 
 /// Used when the token response omits `expires_in` (bro's default).
 const DEFAULT_EXPIRES_IN_SECS: i64 = 3600;
 /// Upper bound on server-supplied lifetimes so date arithmetic can never overflow.
 const MAX_LIFETIME_SECS: i64 = 10 * 365 * 86_400;
+
+type RefreshResult = Result<String, RefreshErrorKind>;
+/// A refresh running (or just finished) in a spawned task, awaitable by any number of callers.
+pub(super) type InFlight = Shared<BoxFuture<'static, RefreshResult>>;
+/// Keyed by (account, force): a forced caller must not be satisfied by an unforced run.
+pub(super) type InFlightMap = Arc<Mutex<HashMap<(AccountId, bool), InFlight>>>;
 
 /// New `refresh_expires_at`: the earlier of the old value and `now + new_secs`. Either side may be
 /// absent; both absent stays absent.
@@ -48,28 +64,163 @@ struct TokenResponse {
     scope: Option<String>,
 }
 
+/// Everything the spawned refresh task needs, owned.
+struct Ctx {
+    cfg: AnthropicCfg,
+    reg: Arc<Registry>,
+    state: Arc<StateBook>,
+    up: Arc<Upstream>,
+    skew: time::Duration,
+    timeout: Duration,
+}
+
+/// Removes the in-flight entry when the task ends, even by panic.
+struct Cleanup {
+    map: InFlightMap,
+    key: (AccountId, bool),
+}
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
+}
+
 impl AnthropicProvider {
     /// A usable access token for `acct`, refreshing when `force` or when it expires within the
     /// skew. A token without an expiry counts as fresh; an account without a refresh token returns
     /// its stored token unless `force`. `refresh_expires_at` is never consulted: only the OAuth
-    /// endpoint can declare a refresh token dead.
-    pub async fn access_token(
-        &self,
-        acct: &AccountMeta,
-        force: bool,
-    ) -> Result<String, RefreshErrorKind> {
+    /// endpoint can declare a refresh token dead. A refresh token already known dead is not
+    /// re-POSTed (`InvalidGrant` straight away).
+    ///
+    /// Cancel-safe: dropping the returned future never loses an in-progress refresh.
+    pub async fn access_token(&self, acct: &AccountMeta, force: bool) -> RefreshResult {
         let id = &acct.id;
-        let creds = self.load(id)?;
-        if let Some(r) = self.settled(&creds, force, None) {
+        let creds = load(&self.reg, &self.state, id)?;
+        if let Some(r) = settled(&self.state, self.skew, id, &creds, force, None) {
             return r;
         }
         // The token this caller saw; a different one later means someone else refreshed.
-        let seen = creds.access_token;
+        self.in_flight(id, force, creds.access_token).await
+    }
 
+    /// The shared refresh task for `(id, force)`, starting it if none is running.
+    fn in_flight(&self, id: &AccountId, force: bool, seen: String) -> InFlight {
+        let key = (id.clone(), force);
+        let mut map = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = map.get(&key) {
+            return f.clone();
+        }
+        let ctx = Ctx {
+            cfg: self.cfg.clone(),
+            reg: self.reg.clone(),
+            state: self.state.clone(),
+            up: self.up.clone(),
+            skew: self.skew,
+            timeout: self.refresh_timeout,
+        };
         let gate = self.gate(id);
-        let _in_process = gate.lock().await;
-        let creds = self.load(id)?;
-        if let Some(r) = self.settled(&creds, force, Some(&seen)) {
+        let cleanup = Cleanup {
+            map: self.inflight.clone(),
+            key: key.clone(),
+        };
+        let id = id.clone();
+        // Spawned while holding the map lock: the task's `Cleanup` cannot run before the entry
+        // below exists.
+        let handle = tokio::spawn(async move {
+            let _cleanup = cleanup;
+            ctx.run(&id, force, &seen, gate).await
+        });
+        let fut: InFlight = async move { handle.await.unwrap_or(Err(RefreshErrorKind::Other)) }
+            .boxed()
+            .shared();
+        map.insert(key, fut.clone());
+        fut
+    }
+
+    fn gate(&self, id: &AccountId) -> Arc<tokio::sync::Mutex<()>> {
+        let mut m = self.gates.lock().unwrap_or_else(|e| e.into_inner());
+        m.entry(id.clone()).or_default().clone()
+    }
+}
+
+/// `Some(result)` when no refresh is needed (or possible) for `creds`.
+fn settled(
+    state: &StateBook,
+    skew: time::Duration,
+    id: &AccountId,
+    creds: &Credentials,
+    force: bool,
+    seen: Option<&str>,
+) -> Option<RefreshResult> {
+    let now = OffsetDateTime::now_utc();
+    let fresh = creds.expires_at.is_none_or(|e| e - now > skew);
+    // A forced refresh is satisfied by another caller's refresh (token changed since we looked).
+    let satisfied = !force || seen.is_some_and(|s| s != creds.access_token);
+    if fresh && satisfied {
+        return Some(Ok(creds.access_token.clone()));
+    }
+    if creds.refresh_token.is_none() {
+        return Some(if force {
+            Err(fail(state, id, RefreshErrorKind::Other, None))
+        } else {
+            Ok(creds.access_token.clone())
+        });
+    }
+    None
+}
+
+fn load(
+    reg: &Registry,
+    state: &StateBook,
+    id: &AccountId,
+) -> Result<Credentials, RefreshErrorKind> {
+    match reg.read_creds(id) {
+        Ok(Some(c)) => Ok(c),
+        // read_creds already logged the sanitized corruption reason (when corrupt).
+        Ok(None) | Err(_) => Err(fail(state, id, RefreshErrorKind::Other, None)),
+    }
+}
+
+/// Log the classified outcome, record it as the account's last error, return it.
+fn fail(
+    state: &StateBook,
+    id: &AccountId,
+    kind: RefreshErrorKind,
+    request_id: Option<String>,
+) -> RefreshErrorKind {
+    tracing::warn!(
+        account = %id,
+        outcome = %kind.detail(),
+        request_id = request_id.as_deref().unwrap_or("-"),
+        "oauth refresh failed"
+    );
+    state.record_error(
+        id,
+        ErrorRecord {
+            at: OffsetDateTime::now_utc(),
+            reason: FailReason::Refresh(kind),
+            upstream_request_id: request_id,
+        },
+    );
+    kind
+}
+
+impl Ctx {
+    /// The whole critical section; runs in a spawned task.
+    async fn run(
+        &self,
+        id: &AccountId,
+        force: bool,
+        seen: &str,
+        gate: Arc<tokio::sync::Mutex<()>>,
+    ) -> RefreshResult {
+        let _in_process = gate.lock_owned().await;
+        let creds = load(&self.reg, &self.state, id)?;
+        if let Some(r) = settled(&self.state, self.skew, id, &creds, force, Some(seen)) {
             return r;
         }
 
@@ -81,76 +232,40 @@ impl AnthropicProvider {
                 .map_err(|_| RefreshErrorKind::Other)?
                 .map_err(|e| {
                     tracing::warn!(account = %id, error_kind = ?e.kind(), "oauth refresh could not take the account lock");
-                    RefreshErrorKind::Other
+                    fail(&self.state, id, RefreshErrorKind::Other, None)
                 })?
         };
-        let creds = self.load(id)?;
-        if let Some(r) = self.settled(&creds, force, Some(&seen)) {
+        let creds = load(&self.reg, &self.state, id)?;
+        if let Some(r) = settled(&self.state, self.skew, id, &creds, force, Some(seen)) {
             return r;
         }
         self.refresh(id, creds, &flock).await
     }
 
-    /// `Some(result)` when no refresh is needed (or possible) for `creds`.
-    fn settled(
-        &self,
-        creds: &Credentials,
-        force: bool,
-        seen: Option<&str>,
-    ) -> Option<Result<String, RefreshErrorKind>> {
-        let now = OffsetDateTime::now_utc();
-        let fresh = creds.expires_at.is_none_or(|e| e - now > self.skew);
-        // A forced refresh is satisfied by another caller's refresh (token changed since we looked).
-        let satisfied = !force || seen.is_some_and(|s| s != creds.access_token);
-        if fresh && satisfied {
-            return Some(Ok(creds.access_token.clone()));
+    /// One token-endpoint call. The caller holds the account flock (`_flock` is the guard
+    /// [`Registry::lock`] returned).
+    async fn refresh(&self, id: &AccountId, cur: Credentials, _flock: &FileLock) -> RefreshResult {
+        let old_rt = cur
+            .refresh_token
+            .clone()
+            .ok_or_else(|| fail(&self.state, id, RefreshErrorKind::Other, None))?;
+        // Claude Code never retries a known-dead refresh token (S2 item 4); neither do we.
+        if self.state.is_refresh_dead(id, &old_rt) {
+            tracing::debug!(account = %id, "oauth refresh skipped: refresh token known dead");
+            return Err(RefreshErrorKind::InvalidGrant);
         }
-        if creds.refresh_token.is_none() {
-            return Some(if force {
-                Err(RefreshErrorKind::Other)
-            } else {
-                Ok(creds.access_token.clone())
-            });
-        }
-        None
-    }
-
-    fn load(&self, id: &AccountId) -> Result<Credentials, RefreshErrorKind> {
-        match self.reg.read_creds(id) {
-            Ok(Some(c)) => Ok(c),
-            Ok(None) => {
-                tracing::warn!(account = %id, "oauth refresh: account has no credentials");
-                Err(RefreshErrorKind::Other)
-            }
-            // read_creds already logged the sanitized corruption reason.
-            Err(_) => Err(RefreshErrorKind::Other),
-        }
-    }
-
-    fn gate(&self, id: &AccountId) -> Arc<tokio::sync::Mutex<()>> {
-        let mut m = self.gates.lock().unwrap_or_else(|e| e.into_inner());
-        m.entry(id.clone()).or_default().clone()
-    }
-
-    /// One token-endpoint call. The caller holds the in-process gate and the account flock
-    /// (`_flock` is the guard [`crate::accounts::Registry::lock`] returned).
-    async fn refresh(
-        &self,
-        id: &AccountId,
-        cur: Credentials,
-        _flock: &FileLock,
-    ) -> Result<String, RefreshErrorKind> {
-        let old_rt = cur.refresh_token.clone().ok_or(RefreshErrorKind::Other)?;
-        let req = self.build_request(&cur, &old_rt)?;
+        let req = self
+            .build_request(&cur, &old_rt)
+            .map_err(|k| fail(&self.state, id, k, None))?;
         let lim = Limits {
-            header_wait: self.refresh_timeout,
-            idle: self.refresh_timeout,
-            deadline: Instant::now() + self.refresh_timeout,
+            header_wait: self.timeout,
+            idle: self.timeout,
+            deadline: Instant::now() + self.timeout,
         };
 
         let resp = match self.up.send(req, &lim).await {
             Ok(r) => r,
-            Err(k) => return Err(self.fail(id, RefreshErrorKind::Network(k), None)),
+            Err(k) => return Err(fail(&self.state, id, RefreshErrorKind::Network(k), None)),
         };
         let status = resp.status.as_u16();
         let request_id = resp
@@ -160,7 +275,14 @@ impl AnthropicProvider {
             .map(str::to_owned);
         let body = match resp.body.text().await {
             Ok(b) => b,
-            Err(k) => return Err(self.fail(id, RefreshErrorKind::Network(k), request_id)),
+            Err(k) => {
+                return Err(fail(
+                    &self.state,
+                    id,
+                    RefreshErrorKind::Network(k),
+                    request_id,
+                ))
+            }
         };
 
         if !(200..300).contains(&status) {
@@ -175,7 +297,7 @@ impl AnthropicProvider {
                 }
                 _ => {}
             }
-            return Err(self.fail(id, kind, request_id));
+            return Err(fail(&self.state, id, kind, request_id));
         }
 
         let now = OffsetDateTime::now_utc();
@@ -184,7 +306,7 @@ impl AnthropicProvider {
             let a = p.access_token.clone().filter(|a| !a.is_empty())?;
             Some((a, p))
         }) else {
-            return Err(self.fail(id, RefreshErrorKind::Other, request_id));
+            return Err(fail(&self.state, id, RefreshErrorKind::Other, request_id));
         };
 
         let lifetime = parsed
@@ -204,7 +326,7 @@ impl AnthropicProvider {
                 parsed
                     .refresh_token
                     .filter(|t| !t.is_empty())
-                    .unwrap_or(old_rt),
+                    .unwrap_or_else(|| old_rt.clone()),
             ),
             expires_at: Some(now + time::Duration::seconds(lifetime)),
             refresh_expires_at: expiry_after_refresh(
@@ -227,11 +349,12 @@ impl AnthropicProvider {
         };
         if !matches!(persisted, Ok(Ok(()))) {
             tracing::error!(account = %id, "oauth refresh succeeded but persisting the rotated credentials failed");
-            return Err(self.fail(id, RefreshErrorKind::Other, request_id));
+            return Err(fail(&self.state, id, RefreshErrorKind::Other, request_id));
         }
 
-        // A successful refresh proves the token we spent was alive.
-        if self.state.state(id, now).dead_refresh_fp.is_some() {
+        // A dead marker for the token we just spent is stale (a marker for any other token is not
+        // ours to retire; the login flow owns that).
+        if self.state.is_refresh_dead(id, &old_rt) {
             self.state.clear_refresh_dead(id, now);
         }
         tracing::info!(account = %id, request_id = request_id.as_deref().unwrap_or("-"), "oauth refresh ok");
@@ -270,46 +393,29 @@ impl AnthropicProvider {
         *req.body_mut() = Some(reqwest::Body::from(Bytes::from(body.to_string())));
         Ok(req)
     }
-
-    /// Log the classified outcome, record it as the account's last error, return it.
-    fn fail(
-        &self,
-        id: &AccountId,
-        kind: RefreshErrorKind,
-        request_id: Option<String>,
-    ) -> RefreshErrorKind {
-        tracing::warn!(
-            account = %id,
-            outcome = %kind.detail(),
-            request_id = request_id.as_deref().unwrap_or("-"),
-            "oauth refresh failed"
-        );
-        self.state.record_error(
-            id,
-            ErrorRecord {
-                at: OffsetDateTime::now_utc(),
-                reason: FailReason::Refresh(kind),
-                upstream_request_id: request_id,
-            },
-        );
-        kind
-    }
 }
 
 /// Classify a non-2xx token response. Looks only at structure and the `account_on_hold` marker; the
-/// message text is never kept.
+/// message text is never kept. `InvalidGrant` is terminal (the token is marked dead), so it needs
+/// the HTTP statuses the endpoint actually uses for it (400/401); a 5xx or other status carrying
+/// that text is just a server failure.
 fn classify_failure(status: u16, body: &str) -> RefreshErrorKind {
     if matches!(status, 400 | 401 | 403) && body.contains("account_on_hold") {
         return RefreshErrorKind::AccountOnHold;
     }
-    let json: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
-    let is = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()) == Some("invalid_grant");
-    let error = json.get("error");
-    // `{"error":"invalid_grant"}` (the endpoint's spec shape) or Anthropic's envelope
-    // `{"error":{"type":"invalid_grant"}}`.
-    if is(error) || is(error.and_then(|e| e.get("type"))) || is(error.and_then(|e| e.get("error")))
-    {
-        return RefreshErrorKind::InvalidGrant;
+    if matches!(status, 400 | 401) {
+        let json: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        let is =
+            |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()) == Some("invalid_grant");
+        let error = json.get("error");
+        // `{"error":"invalid_grant"}` (the endpoint's spec shape) or Anthropic's envelope
+        // `{"error":{"type":"invalid_grant"}}`.
+        if is(error)
+            || is(error.and_then(|e| e.get("type")))
+            || is(error.and_then(|e| e.get("error")))
+        {
+            return RefreshErrorKind::InvalidGrant;
+        }
     }
     RefreshErrorKind::Server(status)
 }
@@ -760,15 +866,150 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_refresh_clears_a_stale_dead_marker() {
+    async fn known_dead_refresh_token_is_not_reposted() {
         let fx = fx(creds_expiring_in(10));
         fx.state
             .mark_refresh_dead(&fx.meta.id, OLD_RT, OffsetDateTime::now_utc());
+        let fake = fake_token_endpoint(|_| reply(200, &ok_body("never", Some("rt2"), 3600))).await;
+        let p = fx.provider(&fake.url);
+        for force in [false, true] {
+            assert_eq!(
+                p.access_token(&fx.meta, force).await.unwrap_err(),
+                RefreshErrorKind::InvalidGrant
+            );
+        }
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 0);
         assert_eq!(fx.status(), AccountStatus::NeedsLogin);
+        assert_eq!(fx.creds().refresh_token.as_deref(), Some(OLD_RT));
+    }
+
+    #[tokio::test]
+    async fn marker_for_a_different_token_does_not_block_and_is_not_ours_to_clear() {
+        // Re-login case: the marker fingerprints an earlier token; the stored one is live.
+        let fx = fx(creds_expiring_in(10));
+        fx.state.mark_refresh_dead(
+            &fx.meta.id,
+            "previous-dead-token",
+            OffsetDateTime::now_utc(),
+        );
         let fake = fake_token_endpoint(|_| reply(200, &ok_body("alive", Some("rt2"), 3600))).await;
         let p = fx.provider(&fake.url);
         assert_eq!(p.access_token(&fx.meta, false).await.unwrap(), "alive");
-        assert_eq!(fx.status(), AccountStatus::Ready);
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+        // The login flow (not refresh) retires markers for tokens we did not spend.
+        let st = fx.state.state(&fx.meta.id, OffsetDateTime::now_utc());
+        assert_eq!(st.dead_refresh_fp, Some(fingerprint("previous-dead-token")));
+        assert!(!fx.state.is_refresh_dead(&fx.meta.id, "rt2"));
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_text_on_other_statuses_is_not_dead() {
+        for status in [403, 429, 500, 503] {
+            let fx = fx(creds_expiring_in(10));
+            let fake = fake_token_endpoint(move |_| {
+                reply(
+                    status,
+                    r#"{"error":"invalid_grant","error_description":"x"}"#,
+                )
+            })
+            .await;
+            let p = fx.provider(&fake.url);
+            assert_eq!(
+                p.access_token(&fx.meta, false).await.unwrap_err(),
+                RefreshErrorKind::Server(status)
+            );
+            let st = fx.state.state(&fx.meta.id, OffsetDateTime::now_utc());
+            assert_eq!(st.dead_refresh_fp, None, "{status}");
+            assert_eq!(fx.status(), AccountStatus::Ready, "{status}");
+        }
+        // 401 is a terminal invalid_grant status too.
+        let fx = fx(creds_expiring_in(10));
+        let fake = fake_token_endpoint(|_| reply(401, r#"{"error":"invalid_grant"}"#)).await;
+        let p = fx.provider(&fake.url);
+        assert_eq!(
+            p.access_token(&fx.meta, false).await.unwrap_err(),
+            RefreshErrorKind::InvalidGrant
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_does_not_lose_the_rotated_token() {
+        let fx = fx(creds_expiring_in(10));
+        let fake = fake_token_endpoint(|_| Reply {
+            delay: Duration::from_millis(400),
+            ..reply(
+                200,
+                &ok_body("rotated-access", Some("rotated-refresh"), 3600),
+            )
+        })
+        .await;
+        let p = Arc::new(fx.provider(&fake.url));
+        let caller = {
+            let (p, meta) = (p.clone(), fx.meta.clone());
+            tokio::spawn(async move { p.access_token(&meta, false).await })
+        };
+        // Wait until the token endpoint has the request (the old refresh token is now spent).
+        for _ in 0..200 {
+            if fake.hits.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+        caller.abort(); // client disconnect / wrapping timeout
+        assert!(caller.await.unwrap_err().is_cancelled());
+
+        // The detached refresh still finishes and persists the rotation.
+        let mut persisted = None;
+        for _ in 0..200 {
+            let c = fx.creds();
+            if c.refresh_token.as_deref() == Some("rotated-refresh") {
+                persisted = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let c = persisted.expect("rotated refresh token must be persisted after caller abort");
+        assert_eq!(c.access_token, "rotated-access");
+
+        // And the in-flight entry is gone: the next call is served from the fresh creds.
+        assert_eq!(
+            p.access_token(&fx.meta, false).await.unwrap(),
+            "rotated-access"
+        );
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
+        // (The task's last steps run just after the write, so allow it a moment to wind down.)
+        for _ in 0..100 {
+            if p.inflight.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(p.inflight.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn waiters_share_a_refresh_even_if_the_starter_is_cancelled() {
+        let fx = fx(creds_expiring_in(10));
+        let fake = fake_token_endpoint(|_| Reply {
+            delay: Duration::from_millis(300),
+            ..reply(200, &ok_body("shared", Some("rt2"), 3600))
+        })
+        .await;
+        let p = Arc::new(fx.provider(&fake.url));
+        let starter = {
+            let (p, meta) = (p.clone(), fx.meta.clone());
+            tokio::spawn(async move { p.access_token(&meta, false).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let waiter = {
+            let (p, meta) = (p.clone(), fx.meta.clone());
+            tokio::spawn(async move { p.access_token(&meta, false).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        starter.abort();
+        assert_eq!(waiter.await.unwrap().unwrap(), "shared");
+        assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
