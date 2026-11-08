@@ -59,6 +59,14 @@ pub struct AccountMeta {
     pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight_override: Option<TimedOverride>,
+    /// Set by `pooltime import` (credentials copied from bro). While bro's pool answers on its
+    /// port, `serve` refuses to run with such accounts unless `--i-stopped-bro` (spec §16).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub imported: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn default_priority() -> u32 {
@@ -80,6 +88,7 @@ impl AccountMeta {
             identity: Identity::default(),
             note: None,
             weight_override: None,
+            imported: false,
         }
     }
 
@@ -293,6 +302,22 @@ mod tests {
 
     fn meta(s: &str) -> AccountMeta {
         AccountMeta::new(id(s), ProviderId::Anthropic)
+    }
+
+    #[test]
+    fn imported_flag_defaults_false_and_round_trips() {
+        let (_d, _p, reg) = setup();
+        reg.upsert(meta("plain")).unwrap();
+        let mut m = meta("from-bro");
+        m.imported = true;
+        reg.upsert(m).unwrap();
+        assert!(!reg.get(&id("plain")).unwrap().imported);
+        assert!(reg.get(&id("from-bro")).unwrap().imported);
+        let toml = fs::read_to_string(reg.dir(&id("plain")).join("account.toml")).unwrap();
+        assert!(!toml.contains("imported"), "false is not written: {toml}");
+        // A pre-existing account.toml without the key still loads.
+        let old: AccountMeta = toml::from_str("id = \"old\"\nprovider = \"anthropic\"\n").unwrap();
+        assert!(!old.imported);
     }
 
     fn creds() -> Credentials {

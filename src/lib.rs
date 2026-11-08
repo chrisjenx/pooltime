@@ -7,6 +7,7 @@ pub mod logging;
 pub mod models;
 pub mod providers;
 pub mod routing;
+pub mod server;
 pub mod sse;
 pub mod store;
 #[cfg(test)]

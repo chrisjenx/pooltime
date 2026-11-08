@@ -73,6 +73,139 @@ impl Pool {
     pub fn creds(&self) -> Credentials {
         self.reg.read_creds(&self.meta.id).unwrap().unwrap()
     }
+
+    /// Start the real HTTP server on 127.0.0.1:0 over this pool (no providers registered).
+    pub async fn boot(&self, opts: Boot) -> Booted {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = pooltime::config::Config {
+            port: addr.port(),
+            proxy_key: opts.proxy_key,
+            ..pooltime::config::Config::default()
+        };
+        let paths = Paths::under(self.dir.path());
+        let sessions = Arc::new(pooltime::routing::sessions::Sessions::load(
+            self.store.clone(),
+            Duration::from_secs(1800),
+        ));
+        let app = Arc::new(pooltime::server::AppState::new(
+            cfg,
+            paths,
+            self.reg.clone(),
+            self.state.clone(),
+            sessions,
+            pooltime::routing::reserve::Reservations::new(Default::default()),
+            pooltime::models::ModelTable::defaults(),
+            Default::default(),
+            self.store.clone(),
+            "mgmt-test-key".into(),
+        ));
+        let mut router = pooltime::server::router::routes(app.clone());
+        if let Some(extra) = opts.extra {
+            router = extra(router);
+        }
+        let router = pooltime::server::router::finish(router, app.clone());
+        let (shutdown, rx) = tokio::sync::oneshot::channel::<()>();
+        let (force, force_rx) = tokio::sync::oneshot::channel::<()>();
+        let serve_opts = pooltime::server::ServeOpts::default()
+            .with_drain_timeout(opts.drain_timeout)
+            .with_force(async move {
+                let _ = force_rx.await;
+            });
+        let join = tokio::spawn(pooltime::server::serve_listener(
+            listener,
+            app.clone(),
+            router,
+            async move {
+                let _ = rx.await;
+            },
+            serve_opts,
+        ));
+        Booted {
+            addr,
+            app,
+            shutdown: Some(shutdown),
+            force: Some(force),
+            join,
+        }
+    }
+}
+
+/// Knobs for [`Pool::boot`].
+pub struct Boot {
+    pub proxy_key: Option<String>,
+    pub drain_timeout: Duration,
+    /// Adds test-only routes before the standard layers are applied.
+    pub extra: Option<Box<dyn FnOnce(axum::Router) -> axum::Router + Send>>,
+}
+
+impl Default for Boot {
+    fn default() -> Self {
+        Boot {
+            proxy_key: None,
+            drain_timeout: Duration::from_secs(30),
+            extra: None,
+        }
+    }
+}
+
+/// A running test server.
+pub struct Booted {
+    pub addr: std::net::SocketAddr,
+    pub app: Arc<pooltime::server::AppState>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    force: Option<tokio::sync::oneshot::Sender<()>>,
+    pub join: tokio::task::JoinHandle<anyhow::Result<pooltime::server::Outcome>>,
+}
+
+impl Booted {
+    /// First signal: start draining.
+    pub fn signal(&mut self) {
+        let _ = self.shutdown.take().expect("already signalled").send(());
+    }
+
+    /// Second signal: force exit.
+    pub fn force(&mut self) {
+        let _ = self.force.take().expect("already forced").send(());
+    }
+
+    /// Wait for `serve` to return.
+    pub async fn finished(self, within: Duration) -> pooltime::server::Outcome {
+        tokio::time::timeout(within, self.join)
+            .await
+            .expect("serve did not return in time")
+            .expect("serve task panicked")
+            .expect("serve failed")
+    }
+}
+
+/// A route handler streaming whatever is sent on the returned channel (chunked, no end until the
+/// sender is dropped). Mount at `path` through [`Boot::extra`].
+pub fn stream_route(
+    path: &'static str,
+) -> (
+    tokio::sync::mpsc::Sender<Bytes>,
+    Box<dyn FnOnce(axum::Router) -> axum::Router + Send>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+    let rx = Arc::new(Mutex::new(Some(rx)));
+    let add = Box::new(move |router: axum::Router| {
+        router.route(
+            path,
+            axum::routing::get(move || {
+                let rx = rx.lock().unwrap().take().expect("stream route used once");
+                async move {
+                    let body = futures_util::stream::unfold(rx, |mut rx| async move {
+                        rx.recv()
+                            .await
+                            .map(|b| (Ok::<_, std::convert::Infallible>(b), rx))
+                    });
+                    axum::response::Response::new(axum::body::Body::from_stream(body))
+                }
+            }),
+        )
+    });
+    (tx, add)
 }
 
 pub fn creds(access: &str, expires_in: i64) -> Credentials {

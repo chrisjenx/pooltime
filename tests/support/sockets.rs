@@ -130,3 +130,83 @@ impl RawStream {
 pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
 }
+
+/// A parsed HTTP/1.1 response from [`http_req`] (not chunked-decoded: only for bodies sent with
+/// a content-length).
+pub struct HttpResp {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl HttpResp {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body)
+            .unwrap_or_else(|e| panic!("body is not JSON ({e}): {:?}", self.text()))
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+}
+
+/// One request on a fresh connection (`connection: close`). `host` defaults to `addr` unless
+/// `headers` carries its own.
+pub async fn http_req(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> HttpResp {
+    let mut req = format!("{method} {path} HTTP/1.1\r\n");
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        req.push_str(&format!("host: {addr}\r\n"));
+    }
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str(&format!(
+        "content-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    ));
+    let mut bytes = req.into_bytes();
+    bytes.extend_from_slice(body);
+    let mut conn = raw_client(addr, &bytes).await;
+    let raw = conn.read_to_end(Duration::from_secs(10)).await;
+    parse_response(&raw)
+}
+
+pub async fn http_get(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> HttpResp {
+    http_req(addr, "GET", path, headers, b"").await
+}
+
+pub fn parse_response(raw: &[u8]) -> HttpResp {
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or_else(|| panic!("no header terminator in {:?}", String::from_utf8_lossy(raw)));
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|s| s.parse().ok())
+        .expect("status line");
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .collect();
+    HttpResp {
+        status,
+        headers,
+        body: raw[split + 4..].to_vec(),
+    }
+}
