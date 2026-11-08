@@ -4,3 +4,25 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false
+description = "Differential harness: runs bro-cli and pooltime against the same fake upstreams and compares them"
+
+# The harness spawns the `pooltime` binary as a child process; it does not link the library.
+# The fake upstream is shared with the integration tests by path (`src/fake.rs` includes
+# `tests/support/fake_anthropic.rs`), so it needs the same server-side crates.
+[dependencies]
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3.34"
+http = "1.5.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+regex = "1"
+reqwest = { version = "0.13.5", default-features = false, features = ["stream", "json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+tempfile = "3.27.0"
+time = { version = "0.3.55", features = ["formatting", "parsing", "macros"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "net", "process", "sync", "io-util"] }
+toml = "1.2.1"

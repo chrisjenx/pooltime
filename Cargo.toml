@@ -1,5 +1,8 @@
 [workspace]
 members = [".", "harness"]
+# `cargo clippy --all-targets` / `cargo test` at the root also cover the harness (its unit tests
+# need neither bun nor bro; running it does, see harness/README.md).
+default-members = [".", "harness"]
 
 [package]
 name = "pooltime"
@@ -8,6 +11,7 @@ edition = "2021"
 description = "Pool Claude Max and ChatGPT/Codex accounts behind one local Anthropic-compatible endpoint"
 license = "MIT"
 repository = "https://github.com/chrisjenx/pooltime"
+default-run = "pooltime"
 
 [dependencies]
 anyhow = "1"
