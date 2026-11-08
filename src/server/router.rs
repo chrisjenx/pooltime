@@ -22,7 +22,7 @@ use http_body::Frame;
 use serde_json::Value;
 
 use super::inference::{self, RequestId, REQUEST_ID_HEADER};
-use super::{auth, health, mgmt, models_route, AppState, PendingGuard};
+use super::{auth, dashboard, health, mgmt, models_route, AppState, PendingGuard};
 use crate::logging::new_request_id;
 use crate::providers::anthropic::anthropic_error;
 
@@ -52,6 +52,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
             get(models_route::models).fallback(|| async { method_not_allowed("GET") }),
         )
         .merge(mgmt::routes(state.clone()))
+        .merge(dashboard::routes())
         .fallback(not_found)
         .with_state(state)
 }

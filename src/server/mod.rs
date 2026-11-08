@@ -1,12 +1,15 @@
 //! The local HTTP server: shared state, routing, auth, health and graceful drain.
 //!
 //! Layout: [`router`] builds the route table and middleware, [`auth`] guards inference and
-//! management traffic, [`mgmt`] is the `/api/v1/*` management API, [`models_route`] serves `/v1/models`, [`health`] serves `/health` and the startup preflight, [`shutdown`] owns
-//! signal handling and the drain sequence, [`daemon`] boots it all for `pooltime serve`.
+//! management traffic, [`mgmt`] is the `/api/v1/*` management API, [`dashboard`] serves the
+//! embedded web UI at `/`, [`models_route`] serves `/v1/models`, [`health`] serves `/health` and
+//! the startup preflight, [`shutdown`] owns signal handling and the drain sequence, [`daemon`]
+//! boots it all for `pooltime serve`.
 
 pub mod auth;
 pub mod classifier;
 pub mod daemon;
+pub mod dashboard;
 pub mod fallback;
 pub mod health;
 pub mod inference;
@@ -57,6 +60,9 @@ pub struct AppState {
     tuning: RwLock<Tuning>,
     /// In-flight and finished sign-in flows, addressable by id (management API).
     pub signins: mgmt::SignIns,
+    /// Dev/test hook: when set, `GET /api/v1/status` serves this document instead of the live
+    /// state (`POOLTIME_FIXTURE_STATE`, see [`daemon`]). `None` in normal operation.
+    pub fixture_state: Option<serde_json::Value>,
 }
 
 impl AppState {
@@ -91,12 +97,19 @@ impl AppState {
             cursor: AtomicUsize::new(0),
             tuning,
             signins: mgmt::SignIns::default(),
+            fixture_state: None,
         }
     }
 
     /// The routing knobs in effect now.
     pub fn tuning(&self) -> Tuning {
         *self.tuning.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Serve `fixture` from `/api/v1/status` instead of the live state (dev/test only).
+    pub fn with_fixture_state(mut self, fixture: Option<serde_json::Value>) -> AppState {
+        self.fixture_state = fixture;
+        self
     }
 
     /// Use this upstream client (the daemon shares one with the providers).

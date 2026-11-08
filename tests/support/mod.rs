@@ -134,7 +134,8 @@ impl Pool {
                 self.store.clone(),
                 "mgmt-test-key".into(),
             )
-            .with_upstream(self.up.clone()),
+            .with_upstream(self.up.clone())
+            .with_fixture_state(opts.fixture_state),
         );
         let mut router = pooltime::server::router::routes(app.clone());
         if let Some(extra) = opts.extra {
@@ -182,6 +183,8 @@ pub struct Boot {
     pub models: Option<pooltime::models::ModelTable>,
     /// Edits the daemon config after the port/proxy key are set.
     pub configure: Option<ConfigEdit>,
+    /// Serve this document from `/api/v1/status` (the `POOLTIME_FIXTURE_STATE` hook).
+    pub fixture_state: Option<serde_json::Value>,
 }
 
 impl Default for Boot {
@@ -193,6 +196,7 @@ impl Default for Boot {
             providers: HashMap::new(),
             models: None,
             configure: None,
+            fixture_state: None,
         }
     }
 }

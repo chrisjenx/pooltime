@@ -65,6 +65,7 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
     ]));
     let models = ModelTable::load(&paths)?;
     let mgmt_key = mgmt::ensure_mgmt_key(&paths)?;
+    let fixture_state = load_fixture_state()?;
     let upstream = Arc::new(Upstream::new());
 
     let t = &cfg.timeouts;
@@ -104,7 +105,8 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
             store.clone(),
             mgmt_key,
         )
-        .with_upstream(upstream),
+        .with_upstream(upstream)
+        .with_fixture_state(fixture_state),
     );
 
     tracing::info!(
@@ -168,4 +170,29 @@ where
             f().await;
         }
     })
+}
+
+/// Dev/test hook for dashboard screenshots: `POOLTIME_FIXTURE_STATE=<path to a JSON file>` makes
+/// `GET /api/v1/status` serve that document verbatim (e.g. `tests/support/fixtures/dashboard.json`)
+/// so the dashboard can be exercised without real accounts. Inert unless the variable is set;
+/// the service units never set it. Inference and every mutation still act on the real state.
+/// A set but unreadable or non-JSON file stops startup rather than serving live data unawares.
+pub const FIXTURE_STATE_ENV: &str = "POOLTIME_FIXTURE_STATE";
+
+fn load_fixture_state() -> anyhow::Result<Option<serde_json::Value>> {
+    let Some(path) = std::env::var_os(FIXTURE_STATE_ENV).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let raw = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "reading {FIXTURE_STATE_ENV} file {}",
+            path.to_string_lossy()
+        )
+    })?;
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("{FIXTURE_STATE_ENV} file is not JSON"))?;
+    tracing::warn!(
+        "{FIXTURE_STATE_ENV} is set: /api/v1/status serves fixture data, not the live pool"
+    );
+    Ok(Some(v))
 }

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>pooltime</title>
+<link rel="stylesheet" href="/assets/style.css">
+<script src="/assets/app.js"></script>
+</head>
+<body data-mode="__POOLTIME_MODE__">
+<header class="top">
+  <a class="brand" href="#overview">pooltime</a>
+  <nav class="tabs" aria-label="Views">
+    <a href="#overview" data-view="overview">Overview</a>
+    <a href="#accounts" data-view="accounts">Accounts</a>
+    <a href="#routing" data-view="routing">Routing</a>
+    <a href="#mappings" data-view="mappings">Mappings</a>
+    <a href="#settings" data-view="settings">Settings</a>
+  </nav>
+  <div class="tools">
+    <span id="conn" class="conn" role="status"></span>
+    <button type="button" id="theme" class="ghost" title="Toggle light/dark theme">Theme</button>
+  </div>
+</header>
+
+<div class="ro-only hint" id="readonly-hint">
+  <p><strong>Read-only view.</strong> To manage accounts, run <code>pooltime open</code> in a terminal,
+    or paste the management key (<code>~/.pooltime/run/mgmt.key</code>):</p>
+  <form id="key-form" class="inline">
+    <input type="password" id="key-input" autocomplete="off" spellcheck="false" placeholder="management key" aria-label="Management key">
+    <button type="submit">Unlock</button>
+    <span id="key-msg" class="msg"></span>
+  </form>
+</div>
+
+<div id="banner" class="banner" hidden></div>
+
+<main id="main">
+  <section id="view-overview" class="view" data-view="overview"></section>
+  <section id="view-accounts" class="view" data-view="accounts"></section>
+  <section id="view-routing" class="view" data-view="routing"></section>
+  <section id="view-mappings" class="view" data-view="mappings"></section>
+  <section id="view-settings" class="view" data-view="settings"></section>
+</main>
+
+<dialog id="relogin" aria-labelledby="relogin-title">
+  <h2 id="relogin-title">Re-login</h2>
+  <p id="relogin-step" class="step"></p>
+  <p id="relogin-status" class="status-line"></p>
+  <p id="relogin-link-row" hidden>If no tab opened: <a id="relogin-link" target="_blank" rel="noopener noreferrer">open the sign-in page</a>.</p>
+  <form id="relogin-code" class="inline" hidden>
+    <label for="relogin-code-input">Browser on another machine? Paste the code shown after sign-in:</label>
+    <input id="relogin-code-input" autocomplete="off" spellcheck="false" placeholder="code#state">
+    <button type="submit">Submit code</button>
+  </form>
+  <div class="dialog-actions">
+    <button type="button" id="relogin-bind" hidden>Bind to this account</button>
+    <button type="button" id="relogin-retry" hidden>Try again</button>
+    <button type="button" id="relogin-next" hidden>Next account</button>
+    <button type="button" id="relogin-close" class="ghost">Close</button>
+  </div>
+</dialog>
+</body>
+</html>

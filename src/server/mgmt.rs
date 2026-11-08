@@ -16,7 +16,10 @@
 //! (`ready | needs_login | rate_limited | billing | access_denied`).
 //!
 //! [`build_status`] is a pure function of [`StatusInputs`] and a clock, which is what makes the
-//! status shape snapshot-testable; [`gather`] does the I/O.
+//! status shape snapshot-testable; [`gather`] does the I/O. The HTTP handler adds `profiles`
+//! (connected Claude Code profiles from `config.toml`) and `storage` (data dir, database and log
+//! bytes) for the dashboard's Settings view. With `POOLTIME_FIXTURE_STATE` set (dev/screenshots
+//! only, see [`super::daemon`]) the handler serves that document verbatim instead.
 
 #![allow(clippy::result_large_err)]
 
@@ -118,7 +121,7 @@ pub fn session_cookie_header(key: &str) -> String {
 }
 
 /// Whether the request carries the key (bearer) or the session cookie derived from it.
-fn authorized(h: &HeaderMap, key: &str) -> bool {
+pub(crate) fn authorized(h: &HeaderMap, key: &str) -> bool {
     if key.is_empty() {
         return false; // never "open": an unset key authorizes nothing
     }
@@ -525,11 +528,73 @@ pub async fn gather(app: &Arc<AppState>, now: OffsetDateTime) -> Result<StatusIn
 }
 
 async fn status(State(app): State<Arc<AppState>>) -> Response {
-    let now = OffsetDateTime::now_utc();
-    match gather(&app, now).await {
-        Ok(inputs) => ok(build_status(&inputs, now)),
-        Err(r) => r,
+    if let Some(fixture) = &app.fixture_state {
+        return ok(fixture.clone());
     }
+    let now = OffsetDateTime::now_utc();
+    let inputs = match gather(&app, now).await {
+        Ok(inputs) => inputs,
+        Err(r) => return r,
+    };
+    let mut v = build_status(&inputs, now);
+    let paths = app.paths.clone();
+    let (profiles, storage) =
+        match blocking(move || (profiles_on_file(&paths), storage_json(&paths))).await {
+            Ok(x) => x,
+            Err(r) => return r,
+        };
+    if let Value::Object(o) = &mut v {
+        o.insert("profiles".into(), profiles);
+        o.insert("storage".into(), storage);
+    }
+    ok(v)
+}
+
+/// The connected Claude Code profiles as recorded in `config.toml` (`connect` keeps it current;
+/// the startup copy in `AppState::cfg` would go stale). Unreadable config = empty list.
+fn profiles_on_file(paths: &Paths) -> Value {
+    let profiles = Config::load_file(paths)
+        .map(|c| c.profiles)
+        .unwrap_or_else(|e| {
+            tracing::debug!(error = %format!("{e:#}"), "could not read config.toml for status");
+            Vec::new()
+        });
+    Value::Array(
+        profiles
+            .iter()
+            .map(|p| json!({ "id": p.id, "settings_dir": p.settings_dir.to_string_lossy() }))
+            .collect(),
+    )
+}
+
+/// Data dir and the bytes held by the database (with its WAL/SHM files) and the logs.
+fn storage_json(paths: &Paths) -> Value {
+    let db: u64 = ["", "-wal", "-shm"]
+        .iter()
+        .map(|suffix| {
+            let mut p = paths.db.clone().into_os_string();
+            p.push(suffix);
+            fs::metadata(PathBuf::from(p)).map_or(0, |m| m.len())
+        })
+        .sum();
+    json!({
+        "home": paths.home.to_string_lossy(),
+        "db_bytes": db,
+        "logs_bytes": dir_size(&paths.logs),
+    })
+}
+
+fn dir_size(p: &std::path::Path) -> u64 {
+    let Ok(rd) = fs::read_dir(p) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map_or(0, |m| m.len()),
+            _ => 0,
+        })
+        .sum()
 }
 
 // ---- session ---------------------------------------------------------------------------------

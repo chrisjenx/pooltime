@@ -58,12 +58,13 @@ pub(crate) fn keys_match(presented: &str, expected: &str) -> bool {
         == 0
 }
 
-/// Paths the Host/Origin guard covers: the dashboard (`/`) and the management API (`/api/*`).
+/// Paths the Host/Origin guard covers: the dashboard (`/`, `/assets/*`) and the management API
+/// (`/api/*`).
 fn is_guarded(path: &str) -> bool {
-    path == "/" || path == "/api" || path.starts_with("/api/")
+    path == "/" || path == "/api" || path.starts_with("/api/") || path.starts_with("/assets/")
 }
 
-/// Reject requests to `/` and `/api/*` whose `Host` is not `127.0.0.1:<port>` / `localhost:<port>`
+/// Reject requests to `/`, `/assets/*` and `/api/*` whose `Host` is not `127.0.0.1:<port>` / `localhost:<port>`
 /// or whose `Origin` (when sent) is not the matching `http://` origin. There is deliberately no
 /// CORS support: browsers never get a grant, so only same-origin pages can read responses.
 pub async fn host_origin_guard(
@@ -139,6 +140,7 @@ mod tests {
         assert!(is_guarded("/"));
         assert!(is_guarded("/api/status"));
         assert!(!is_guarded("/apiary"));
+        assert!(is_guarded("/assets/app.js"));
         assert!(!is_guarded("/health"));
         assert!(!is_guarded("/v1/messages"));
     }
