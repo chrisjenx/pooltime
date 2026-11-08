@@ -1071,6 +1071,10 @@ fn apply_tuning(app: &AppState, body: &Map<String, Value>) -> Result<Tuning, Res
     if body.is_empty() {
         return Err(bad("provide at least one tuning field"));
     }
+    // Every config.toml writer holds `config_write` across its load → save, so a tuning save
+    // cannot drop a proxy key or profile record that connect saved meanwhile. Taken before the
+    // tuning lock (connect never takes the tuning lock); this runs on a blocking thread.
+    let _write = app.config_write.blocking_lock();
     let mut guard = app.tuning.write().unwrap_or_else(|e| e.into_inner());
     let mut next = *guard;
     for (key, value) in body {
@@ -1483,9 +1487,11 @@ async fn profiles_disconnect(
         Ok(n) => n,
         Err(r) => return r,
     };
-    let paths = app.paths.clone();
     let result = blocking(move || -> Result<Value, Response> {
-        let cfg = Config::load_file(&paths).map_err(|e| {
+        // Held across the read and disconnect's load → save of config.toml (file I/O only).
+        let _write = app.config_write.blocking_lock();
+        let paths = &app.paths;
+        let cfg = Config::load_file(paths).map_err(|e| {
             tracing::error!(error = %format!("{e:#}"), "could not read config.toml");
             internal("could not read config.toml")
         })?;
@@ -1494,7 +1500,7 @@ async fn profiles_disconnect(
         } else {
             resolve_profiles(&names, &cfg.profiles).map_err(bad)?
         };
-        let outcomes = crate::claude_code::disconnect(&paths, &profiles).map_err(|e| {
+        let outcomes = crate::claude_code::disconnect(paths, &profiles).map_err(|e| {
             tracing::warn!(error = %format!("{e:#}"), "disconnect failed");
             internal(&format!("disconnect failed: {e:#}"))
         })?;

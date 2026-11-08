@@ -301,6 +301,53 @@ async fn concurrent_first_connects_agree_on_one_key() {
     }
 }
 
+/// Tuning saves (load → modify → save of config.toml) racing a first connect must not drop the
+/// proxy key or the profile record connect just saved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tuning_save_during_connect_keeps_the_proxy_key() {
+    for round in 0..15 {
+        let fx = Arc::new(Fix::new().await);
+        let p = fx.profile(&format!(".claude-tune{round}"));
+        let addr = fx.srv.addr;
+        let tuner = tokio::spawn(async move {
+            for i in 0..8 {
+                let body = json!({"five_hour_exp": 1.0 + f64::from(i) / 10.0}).to_string();
+                let auth = "Bearer mgmt-test-key";
+                let r = support::sockets::http_req(
+                    addr,
+                    "POST",
+                    "/api/v1/tuning",
+                    &[
+                        ("content-type", "application/json"),
+                        ("authorization", auth),
+                    ],
+                    body.as_bytes(),
+                )
+                .await;
+                assert_eq!(r.status, 200, "{}", r.text());
+            }
+        });
+        let connector = {
+            let fx = fx.clone();
+            let p = p.clone();
+            tokio::spawn(async move { connect(fx.app(), &[p]).await.unwrap() })
+        };
+        connector.await.unwrap();
+        tuner.await.unwrap();
+        let cfg = fx.config();
+        let saved = cfg
+            .proxy_key
+            .unwrap_or_else(|| panic!("round {round}: the proxy key was lost"));
+        assert_eq!(
+            fx.app().proxy_key().as_deref(),
+            Some(saved.as_str()),
+            "round {round}"
+        );
+        assert_eq!(cfg.profiles.len(), 1, "round {round}: profile record lost");
+        assert_eq!(cfg.routing.five_hour_exp, 1.7, "round {round}");
+    }
+}
+
 #[tokio::test]
 async fn connect_refuses_when_pool_unhealthy() {
     // Nothing listens on the configured port.
