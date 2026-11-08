@@ -39,7 +39,10 @@ pub async fn health(State(app): State<Arc<AppState>>) -> Response {
         (metas.len(), available)
     })
     .await;
-    let (accounts, available) = counts.unwrap_or((0, 0));
+    let (accounts, available) = counts.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "health: account count task failed");
+        (0, 0)
+    });
     json_response(
         200,
         &json!({
@@ -99,13 +102,21 @@ pub enum Probe {
     Unresponsive,
 }
 
+/// How long a health probe may take end to end.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// `GET http://<addr>/health` and classify the answer.
 pub async fn probe(addr: SocketAddr) -> Probe {
+    probe_within(addr, PROBE_TIMEOUT).await
+}
+
+/// [`probe`] with an explicit overall timeout (tests shorten it).
+pub async fn probe_within(addr: SocketAddr, timeout: Duration) -> Probe {
     let client = match reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(1))
-        .timeout(Duration::from_secs(3))
+        .connect_timeout(timeout.min(Duration::from_secs(1)))
+        .timeout(timeout)
         .build()
     {
         Ok(c) => c,
@@ -113,15 +124,25 @@ pub async fn probe(addr: SocketAddr) -> Probe {
     };
     let mut resp = match client.get(format!("http://{addr}/health")).send().await {
         Ok(r) => r,
+        // Timeouts first: a connect timeout also reports `is_connect()`, but a listener too
+        // busy to accept is the opposite of "nothing there".
+        Err(e) if e.is_timeout() => return Probe::Unresponsive,
         Err(e) if e.is_connect() => return Probe::Free,
         Err(_) => return Probe::Unresponsive,
     };
     // A health body is tiny; refuse to buffer an arbitrary listener's output.
     let mut body = Vec::new();
-    while let Ok(Some(chunk)) = resp.chunk().await {
-        body.extend_from_slice(&chunk);
-        if body.len() > 16 * 1024 {
-            return Probe::Other;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                body.extend_from_slice(&chunk);
+                if body.len() > 16 * 1024 {
+                    return Probe::Other;
+                }
+            }
+            Ok(None) => break,
+            // Headers arrived but the body stalled or broke: still something we cannot read.
+            Err(_) => return Probe::Unresponsive,
         }
     }
     let Ok(v) = serde_json::from_slice::<Value>(&body) else {
@@ -166,11 +187,21 @@ pub async fn check_bro_shadow(
     bro_port: u16,
     i_stopped_bro: bool,
 ) -> Result<(), StartupError> {
+    check_bro_shadow_within(registry, bro_port, i_stopped_bro, PROBE_TIMEOUT).await
+}
+
+/// [`check_bro_shadow`] with an explicit probe timeout (tests shorten it).
+pub async fn check_bro_shadow_within(
+    registry: &Registry,
+    bro_port: u16,
+    i_stopped_bro: bool,
+    timeout: Duration,
+) -> Result<(), StartupError> {
     if i_stopped_bro || !registry.list().iter().any(|m| m.imported) {
         return Ok(());
     }
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bro_port);
-    match probe(addr).await {
+    match probe_within(addr, timeout).await {
         // An unresponsive listener may be an overloaded bro: err on the side of refusing.
         Probe::Bro | Probe::Unresponsive => Err(StartupError::BroRunning { port: bro_port }),
         Probe::Free | Probe::Pooltime | Probe::Other => Ok(()),
