@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 # Homebrew formula for pooltime; the published copy lives in chrisjenx/homebrew-tap (Formula/pooltime.rb).
 # Installs the prebuilt release binary (the version is read from the URLs). After a release, run
 # `packaging/homebrew/update-formula.sh <version>` to fill in the URLs and sha256s.
