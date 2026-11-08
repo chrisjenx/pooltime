@@ -503,7 +503,7 @@ fn account_check(a: AccountFacts, live: bool, warn_days: u32, now: OffsetDateTim
         }
     }
     let level = match a.status.as_str() {
-        "billing" | "access_denied" => Level::Warn,
+        "billing" | "access_denied" | "erroring" => Level::Warn,
         _ => Level::Ok,
     };
     Check::new(level, label, format!("{}{source}", a.status))

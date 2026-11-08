@@ -930,4 +930,104 @@ fn status_and_state_serde_round_trip() {
         serde_json::to_string(&AccountStatus::NeedsLogin).unwrap(),
         r#"{"status":"needs_login"}"#
     );
+    assert_eq!(
+        serde_json::to_string(&AccountStatus::Erroring {
+            class: "status:401".into(),
+            count: 3
+        })
+        .unwrap(),
+        r#"{"status":"erroring","class":"status:401","count":3}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&AccountStatus::Expiring { expires_at: t(0) }).unwrap(),
+        format!(
+            r#"{{"status":"expiring","expires_at":"{}"}}"#,
+            t(0).format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        )
+    );
+}
+
+fn failure(reason: FailReason, at: OffsetDateTime) -> ErrorRecord {
+    ErrorRecord {
+        at,
+        reason,
+        upstream_request_id: None,
+    }
+}
+
+#[test]
+fn erroring_threshold_and_clear() {
+    use crate::health::states::Erroring;
+    let f = fixture();
+    let b = &f.book;
+    let a = id("a");
+    let server = || FailReason::Refresh(RefreshErrorKind::Server(503));
+
+    // Two counted failures: not erroring yet. Quota failures never count.
+    b.record_error(&a, failure(server(), t(0)));
+    b.record_error(&a, failure(FailReason::Quota { reset: None }, t(10)));
+    b.record_error(&a, failure(server(), t(20)));
+    assert_eq!(b.erroring(&a, t(30)), None);
+    // The third within 15 minutes: erroring, with the last class and the count.
+    b.record_error(&a, failure(FailReason::Status(401), t(30)));
+    assert_eq!(
+        b.erroring(&a, t(40)),
+        Some(Erroring {
+            class: "status:401".into(),
+            count: 3,
+            since: t(0),
+        })
+    );
+    // Display only: routing availability is untouched.
+    assert_eq!(b.status(&a, true, t(40)), AccountStatus::Ready);
+    // Failures age out of the 15-minute window.
+    assert_eq!(b.erroring(&a, t(15 * 60 + 5)), None);
+
+    // A served request clears the count.
+    let c = id("c");
+    for s in [0, 10, 20] {
+        b.record_error(&c, failure(FailReason::AccessDenied, t(s)));
+    }
+    assert!(b.erroring(&c, t(30)).is_some());
+    b.record_success(&c, usage(1, 1), t(40));
+    assert_eq!(b.erroring(&c, t(41)), None);
+    b.record_error(&c, failure(FailReason::AccessDenied, t(50)));
+    b.record_error(&c, failure(FailReason::AccessDenied, t(60)));
+    assert_eq!(b.erroring(&c, t(61)), None, "a success restarts the count");
+
+    // A successful poll clears too.
+    let p = id("p");
+    for s in [0, 10, 20] {
+        b.record_error(&p, failure(server(), t(s)));
+    }
+    b.replace_poll_snapshot(&p, snap(vec![], t(30)), t(25));
+    assert_eq!(b.erroring(&p, t(31)), None);
+
+    // A successful refresh clears refresh failures, not a persistent 401.
+    let r = id("r");
+    for s in [0, 10, 20] {
+        b.record_error(&r, failure(server(), t(s)));
+    }
+    b.mark_verified(&r, t(30));
+    assert_eq!(b.erroring(&r, t(31)), None);
+    for s in [40, 50, 60] {
+        b.record_error(&r, failure(FailReason::Status(401), t(s)));
+        b.mark_verified(&r, t(s + 1));
+    }
+    assert_eq!(b.erroring(&r, t(70)).map(|e| e.count), Some(3));
+
+    // A failed expiry probe is erroring on its own until a success.
+    let q = id("q");
+    b.record_probe_failure(&q, "refresh:network:connect", t(0));
+    assert_eq!(
+        b.erroring(&q, t(3600)),
+        Some(Erroring {
+            class: "refresh:network:connect".into(),
+            count: 1,
+            since: t(0),
+        })
+    );
+    b.mark_verified(&q, t(3700));
+    assert_eq!(b.erroring(&q, t(3701)), None);
 }

@@ -7,11 +7,14 @@
 //! pool 2/3 ready · 7d 23% left
 //!
 //! ACCOUNT  PROVIDER   STATUS       7D LEFT  PRIO  WEIGHT  EMAIL
-//! alpha    anthropic  ready        60%      0     1       a@example.com
 //! gamma    anthropic  needs_login  -        0     1       -
+//! alpha    anthropic  ready        60%      0     1       a@example.com
 //!
 //! alerts: gamma needs login (never_logged_in)
 //! ```
+//!
+//! Accounts are listed most severe state first (spec §4: `needs_login > billing >
+//! access_denied > erroring > rate_limited > expiring > ready`), then by id.
 //!
 //! "7d N% left" for the pool is the summed 7-day headroom (`pool.seven_day_left_total`, one
 //! account = 1.0) over the number of accounts, so a pool of fresh accounts reads 100% and an
@@ -65,9 +68,34 @@ pub fn table(rows: &[Vec<String>]) -> String {
     out
 }
 
-/// The account table (`accounts list` and `status`).
+/// Sort rank of a status word, most severe first (spec §4; unknown words last).
+fn severity(word: &str) -> u8 {
+    match word {
+        "needs_login" => 0,
+        "billing" => 1,
+        "access_denied" => 2,
+        "erroring" => 3,
+        "rate_limited" => 4,
+        "expiring" => 5,
+        "ready" => 6,
+        _ => 7,
+    }
+}
+
+/// The accounts, most severe state first, then by id.
+fn by_severity(status: &Value) -> Vec<Value> {
+    let mut accounts = status["accounts"].as_array().cloned().unwrap_or_default();
+    accounts.sort_by(|a, b| {
+        severity(str_of(a, "status"))
+            .cmp(&severity(str_of(b, "status")))
+            .then_with(|| str_of(a, "id").cmp(str_of(b, "id")))
+    });
+    accounts
+}
+
+/// The account table (`accounts list` and `status`), most severe state first.
 pub fn accounts_table(status: &Value) -> String {
-    let accounts = status["accounts"].as_array().cloned().unwrap_or_default();
+    let accounts = by_severity(status);
     if accounts.is_empty() {
         return "no accounts (add one with `pooltime accounts login <name>`)\n".into();
     }
@@ -102,17 +130,20 @@ pub fn accounts_table(status: &Value) -> String {
 /// Lines for every account that is not ready: `<id> <status words> (<reason>)`.
 fn alerts(status: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    for a in status["accounts"].as_array().into_iter().flatten() {
+    for a in &by_severity(status) {
         let words = match str_of(a, "status") {
             "ready" => continue,
             "needs_login" => "needs login".to_string(),
             "rate_limited" => format!("is rate-limited until {}", str_of(a, "until")),
             "billing" => "has a billing problem".to_string(),
             "access_denied" => format!("is access-denied until {}", str_of(a, "until")),
+            "expiring" => format!("login expires {}", str_of(a, "until")),
+            "erroring" => format!("is erroring ({} failures)", num(&a["count"])),
             other => format!("is {other}"),
         };
         let reason = a["reason"]
             .as_str()
+            .filter(|r| *r != "refresh_token_expiring")
             .map(|r| format!(" ({r})"))
             .unwrap_or_default();
         out.push(format!("{} {words}{reason}", str_of(a, "id")));
@@ -182,6 +213,41 @@ mod tests {
         );
         assert!(
             out.contains("alerts: beta needs login (never_logged_in)"),
+            "{out}"
+        );
+        assert!(
+            out.find("beta ").unwrap() < out.find("alpha ").unwrap(),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn health_states_sort_and_alert() {
+        let row =
+            |id: &str, status: &str| json!({"id": id, "provider": "anthropic", "status": status});
+        let mut flaky = row("flaky", "erroring");
+        flaky["count"] = json!(3);
+        flaky["reason"] = json!("refresh:server:503");
+        let mut soon = row("soon", "expiring");
+        soon["until"] = json!("2026-11-09T12:00:00Z");
+        soon["reason"] = json!("refresh_token_expiring");
+        let s = json!({"version": "0.1.0",
+            "pool": {"accounts": 4, "available": 3, "seven_day_left_total": 0.0},
+            "accounts": [row("a-ready", "ready"), soon, row("limited", "rate_limited"), flaky]});
+        let out = render(&s, "x");
+        let at = |id: &str| {
+            out.find(&format!("\n{id} "))
+                .unwrap_or_else(|| panic!("{id}: {out}"))
+        };
+        assert!(
+            at("flaky") < at("limited") && at("limited") < at("soon") && at("soon") < at("a-ready"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "alerts: flaky is erroring (3 failures) (refresh:server:503); limited is \
+                 rate-limited until -; soon login expires 2026-11-09T12:00:00Z"
+            ),
             "{out}"
         );
     }

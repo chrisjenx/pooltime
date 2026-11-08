@@ -676,6 +676,7 @@ mod mgmt {
     fn view(name: &str, status: AccountStatus, state: AccountState) -> AccountView {
         AccountView {
             meta: AccountMeta::new(id(name), ProviderId::Anthropic),
+            available: status == AccountStatus::Ready,
             status,
             status_since: None,
             state,
@@ -776,6 +777,7 @@ mod mgmt {
             mapping_enabled: table.mapping_enabled(),
             mappings: table.mappings().to_vec(),
             inert_mappings: vec![],
+            expiry_warn: time::Duration::days(3),
         };
         let v = build_status(&inputs, now);
         insta::assert_snapshot!(serde_json::to_string_pretty(&v).unwrap());
@@ -802,6 +804,7 @@ mod mgmt {
             mapping_enabled: false,
             mappings: vec![],
             inert_mappings: vec![],
+            expiry_warn: time::Duration::days(3),
         };
         let live = build_status(&inputs, now);
         assert_eq!(live["accounts"][0]["weight_override"]["weight"], 5.0);
@@ -2572,5 +2575,152 @@ mod mgmt {
         let srv = live.boot(Boot::default()).await;
         let v = http_get(srv.addr, "/api/v1/status", &[]).await.json();
         assert_eq!(v["accounts"][0]["id"], "work");
+    }
+
+    // ---- health states (F1) ----
+
+    /// Give `name` a recorded refresh-token expiry (`None` = unknown).
+    fn set_refresh_expiry(pool: &Pool, name: &str, at: Option<OffsetDateTime>) {
+        let id = id(name);
+        let mut c = pool.reg.read_creds(&id).unwrap().unwrap();
+        c.refresh_expires_at = at;
+        pool.reg.write_creds(&id, &c).unwrap();
+    }
+
+    fn account<'a>(v: &'a Value, name: &str) -> &'a Value {
+        v["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == name)
+            .unwrap_or_else(|| panic!("no account {name} in {v}"))
+    }
+
+    #[tokio::test]
+    async fn banner_counts() {
+        let pool = Pool::new();
+        let now = OffsetDateTime::now_utc();
+        // work: expires within 24 h; soon: in 2 days; later: in 30 days; unknown: no expiry.
+        set_refresh_expiry(&pool, "work", Some(now + time::Duration::hours(12)));
+        for name in ["soon", "later", "unknown", "dead", "flaky"] {
+            pool.add_account(name, ProviderId::Anthropic, 0, "at");
+        }
+        set_refresh_expiry(&pool, "soon", Some(now + time::Duration::days(2)));
+        set_refresh_expiry(&pool, "later", Some(now + time::Duration::days(30)));
+        // A dead account whose clock also says "today": counted once, as needs_login.
+        set_refresh_expiry(&pool, "dead", Some(now + time::Duration::hours(1)));
+        pool.state.mark_refresh_dead(&id("dead"), "rt-dead", now);
+        for s in 0..3 {
+            pool.state.record_error(
+                &id("flaky"),
+                ErrorRecord {
+                    at: now + time::Duration::seconds(s),
+                    reason: FailReason::Refresh(RefreshErrorKind::Server(502)),
+                    upstream_request_id: None,
+                },
+            );
+        }
+        let srv = pool.boot(Boot::default()).await;
+        let v = http_get(srv.addr, "/api/v1/status", &[]).await.json();
+
+        assert_eq!(
+            v["counts"],
+            json!({"needs_login": 1, "expiring_today": 1, "expiring": 2}),
+            "{v}"
+        );
+        let work = account(&v, "work");
+        assert_eq!(work["status"], "expiring", "{work}");
+        assert_eq!(work["until"], work["refresh_expires_at"], "{work}");
+        assert_eq!(work["reason"], "refresh_token_expiring", "{work}");
+        assert!(work["status_since"].is_string(), "{work}");
+        assert_eq!(account(&v, "soon")["status"], "expiring");
+        assert_eq!(account(&v, "later")["status"], "ready");
+        assert_eq!(account(&v, "unknown")["status"], "ready");
+        assert_eq!(account(&v, "dead")["status"], "needs_login");
+        let flaky = account(&v, "flaky");
+        assert_eq!(flaky["status"], "erroring", "{flaky}");
+        assert_eq!(flaky["class"], "refresh:server:502", "{flaky}");
+        assert_eq!(flaky["count"], 3, "{flaky}");
+        assert_eq!(flaky["reason"], "refresh:server:502", "{flaky}");
+        // Expiring and erroring accounts still route: they count as available.
+        assert_eq!(v["pool"]["available"], 5, "{v}");
+    }
+
+    #[tokio::test]
+    async fn probe_confirms_needs_login_only_on_invalid_grant() {
+        use pooltime::health::{ExpiryProbe, ProbeOutcome};
+
+        /// A pool whose `work` login expired a minute ago, refreshed against `fake`.
+        async fn expired(fake: &FakeAnthropic) -> (Pool, Booted, OffsetDateTime) {
+            let pool = Pool::new();
+            let expiry = OffsetDateTime::now_utc() - time::Duration::minutes(1);
+            set_refresh_expiry(&pool, "work", Some(expiry));
+            let (policy, _) = super::support::fast_policy();
+            let provider = Arc::new(pool.provider(fake, policy));
+            let srv = pool.boot(Boot::default().provider(provider)).await;
+            (pool, srv, expiry)
+        }
+
+        // A transient failure (5xx) is erroring, never needs_login.
+        let fake = FakeAnthropic::start().await;
+        fake.route(TOKEN, |_, _| Reply::new(503));
+        let (_pool, srv, expiry) = expired(&fake).await;
+        let probe = ExpiryProbe::default();
+        // Before the expiry nothing is probed.
+        let early = probe
+            .tick(&srv.app, expiry - time::Duration::seconds(1))
+            .await;
+        assert!(early.is_empty(), "{early:?}");
+        assert!(fake.requests_to(TOKEN).is_empty());
+        let now = OffsetDateTime::now_utc();
+        let out = probe.tick(&srv.app, now).await;
+        assert_eq!(
+            out,
+            [(
+                id("work"),
+                ProbeOutcome::Erroring("refresh:server:503".into())
+            )]
+        );
+        assert_eq!(fake.requests_to(TOKEN).len(), 1);
+        let a = work_account(&srv).await;
+        assert_eq!(a["status"], "erroring", "{a}");
+        assert_eq!(a["class"], "refresh:server:503", "{a}");
+        // Once per expiry value: the next tick does not probe again.
+        assert!(probe.tick(&srv.app, now).await.is_empty());
+        assert_eq!(fake.requests_to(TOKEN).len(), 1);
+
+        // invalid_grant confirms the dead login.
+        let fake = FakeAnthropic::start().await;
+        fake.route(TOKEN, |_, _| {
+            Reply::json(400, &json!({"error": "invalid_grant"}))
+        });
+        let (_pool, srv, _) = expired(&fake).await;
+        let probe = ExpiryProbe::default();
+        let out = probe.tick(&srv.app, OffsetDateTime::now_utc()).await;
+        assert_eq!(out, [(id("work"), ProbeOutcome::NeedsLogin)]);
+        let a = work_account(&srv).await;
+        assert_eq!(a["status"], "needs_login", "{a}");
+        assert_eq!(a["reason"], "refresh_token_dead", "{a}");
+
+        // A refresh that works keeps the account usable (expiring by the clock: the min rule
+        // keeps the passed expiry), and it is not probed again.
+        let fake = FakeAnthropic::start().await;
+        fake.route(TOKEN, |_, _| {
+            Reply::json(
+                200,
+                &json!({"access_token": "at-new", "refresh_token": "rt-new", "expires_in": 28800}),
+            )
+        });
+        let (_pool, srv, _) = expired(&fake).await;
+        let probe = ExpiryProbe::default();
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            probe.tick(&srv.app, now).await,
+            [(id("work"), ProbeOutcome::Refreshed)]
+        );
+        let a = work_account(&srv).await;
+        assert_eq!(a["status"], "expiring", "{a}");
+        assert!(probe.tick(&srv.app, now).await.is_empty());
+        assert_eq!(fake.requests_to(TOKEN).len(), 1);
     }
 }

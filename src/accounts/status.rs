@@ -30,6 +30,7 @@ use tokio::sync::broadcast;
 
 use super::id::AccountId;
 use crate::errors::FailReason;
+use crate::health::states::{erroring_class, ErrorStreak, Erroring};
 use crate::store::Store;
 
 /// Broadcast channel capacity for [`Transition`] subscribers.
@@ -182,8 +183,11 @@ fn replace_snapshot(
 
 // ---- status ---------------------------------------------------------------
 
-/// Derived availability of an account. Precedence: `NeedsLogin` > `Billing` >
-/// `AccessDenied` > `RateLimited` > `Ready`.
+/// The state of an account (spec §4). [`StateBook::status`] derives the *availability* routing
+/// acts on (`NeedsLogin` > `Billing` > `AccessDenied` > `RateLimited` > `Ready`) and never yields
+/// `Expiring` or `Erroring`; those two are display states layered on top by
+/// [`crate::health::states::derive_health`] (`Expiring` routes like `Ready`; `Erroring` leaves
+/// routing to the per-request failover).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum AccountStatus {
@@ -199,10 +203,21 @@ pub enum AccountStatus {
         #[serde(with = "time::serde::rfc3339")]
         until: OffsetDateTime,
     },
+    /// Usable, but the recorded login expiry is within the warn window (or passed unconfirmed).
+    Expiring {
+        #[serde(with = "time::serde::rfc3339")]
+        expires_at: OffsetDateTime,
+    },
+    /// Repeated non-quota failures: the latest failure's class and how many are live.
+    Erroring {
+        class: String,
+        count: u32,
+    },
 }
 
 impl AccountStatus {
-    /// Stable label (spec §16): `ready | needs_login | rate_limited | billing | access_denied`.
+    /// Stable label (spec §4/§16): `ready | needs_login | rate_limited | billing |
+    /// access_denied | expiring | erroring`.
     pub fn label(&self) -> &'static str {
         match self {
             AccountStatus::Ready => "ready",
@@ -210,6 +225,8 @@ impl AccountStatus {
             AccountStatus::RateLimited { .. } => "rate_limited",
             AccountStatus::Billing => "billing",
             AccountStatus::AccessDenied { .. } => "access_denied",
+            AccountStatus::Expiring { .. } => "expiring",
+            AccountStatus::Erroring { .. } => "erroring",
         }
     }
 }
@@ -378,6 +395,8 @@ struct Entry {
     last_status: AccountStatus,
     /// Last credentials verdict from [`StateBook::reevaluate`] (mutators reuse it).
     creds_ok: bool,
+    /// Recent non-quota failures behind `erroring` (memory only, never persisted).
+    streak: ErrorStreak,
 }
 
 impl Entry {
@@ -387,6 +406,7 @@ impl Entry {
             state,
             last_status,
             creds_ok: true,
+            streak: ErrorStreak::default(),
         }
     }
 }
@@ -673,8 +693,10 @@ impl StateBook {
     }
 
     /// A token refresh or usage poll succeeded: the credentials work, so the account is no
-    /// longer unverified. No-op (no transition, no write) for a verified account.
+    /// longer unverified. No-op (no transition, no write) for a verified account. Refresh
+    /// failures (and a failed expiry probe) stop counting towards `erroring`.
     pub fn mark_verified(&self, id: &AccountId, now: OffsetDateTime) {
+        self.with_streak(id, now, ErrorStreak::clear_refresh_failures);
         if !self.is_unverified(id) {
             return;
         }
@@ -694,6 +716,7 @@ impl StateBook {
 
     /// A fresh login replaced the dead token.
     pub fn clear_refresh_dead(&self, id: &AccountId, now: OffsetDateTime) {
+        self.with_streak(id, now, ErrorStreak::clear);
         self.mutate(id, now, "refresh_token_replaced", |s| {
             s.dead_refresh_fp = None;
             s.unverified = false; // a fresh login proves the account healthy
@@ -731,6 +754,7 @@ impl StateBook {
         started_at: OffsetDateTime,
     ) {
         let now = s.updated_at;
+        self.with_streak(id, now, ErrorStreak::clear);
         self.mutate(id, now, "poll_snapshot", |st| {
             let snap = replace_snapshot(st.snapshot.as_ref(), s);
             st.unverified = false; // the token worked: unreadable-state quarantine is over
@@ -781,6 +805,7 @@ impl StateBook {
     /// `last_error`, the access-denied cooldown and any billing block (serving proves entitlement).
     pub fn record_success(&self, id: &AccountId, usage: TokenUsage, now: OffsetDateTime) {
         let window = self.usage_window;
+        self.with_streak(id, now, ErrorStreak::clear);
         self.mutate(id, now, "success", |s| {
             roll_window(s, now, window);
             s.window_counters.add_success(&usage);
@@ -794,10 +819,14 @@ impl StateBook {
     }
 
     /// A failed attempt: counts it and records `last_error`. Does not bump `last_used_at`
-    /// and does not change status by itself (use the `mark_*` calls for that).
+    /// and does not change status by itself (use the `mark_*` calls for that). A non-quota
+    /// failure ([`erroring_class`]) also counts towards the `erroring` display state.
     pub fn record_error(&self, id: &AccountId, e: ErrorRecord) {
         let window = self.usage_window;
         let now = e.at;
+        if let Some(class) = erroring_class(&e.reason) {
+            self.with_streak(id, now, |s| s.record(class, now));
+        }
         self.mutate(id, now, "error", |s| {
             roll_window(s, now, window);
             s.window_counters.add_error();
@@ -806,7 +835,27 @@ impl StateBook {
         });
     }
 
+    /// The expiry probe's forced refresh failed without confirming a dead login (`class`, e.g.
+    /// `refresh:server:503`): `erroring` until a success clears it.
+    pub fn record_probe_failure(&self, id: &AccountId, class: &str, now: OffsetDateTime) {
+        let class = class.to_string();
+        self.with_streak(id, now, |s| s.record_probe_failure(class, now));
+    }
+
+    /// The account's live `erroring` verdict at `now` (a display state: routing ignores it).
+    pub fn erroring(&self, id: &AccountId, now: OffsetDateTime) -> Option<Erroring> {
+        self.lock().get(id)?.streak.current(now)
+    }
+
     // ---- internals ----
+
+    fn with_streak(&self, id: &AccountId, now: OffsetDateTime, f: impl FnOnce(&mut ErrorStreak)) {
+        let mut map = self.lock();
+        let e = map
+            .entry(id.clone())
+            .or_insert_with(|| Entry::new(AccountState::default(), now));
+        f(&mut e.streak);
+    }
 
     /// Apply `f` to the account's state under the lock: surface any time-based transition
     /// first, run `f`, surface the transition it caused (labelled `reason`), then persist

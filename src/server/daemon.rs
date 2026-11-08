@@ -153,6 +153,17 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
             }
         }),
         crate::claude_code::spawn_profile_sync(app.clone()),
+        // Health tick: one probe refresh per passed login expiry (spec §16).
+        spawn_every(crate::health::HEALTH_TICK, {
+            let app = app.clone();
+            let probe = Arc::new(crate::health::ExpiryProbe::default());
+            move || {
+                let (app, probe) = (app.clone(), probe.clone());
+                async move {
+                    probe.tick(&app, OffsetDateTime::now_utc()).await;
+                }
+            }
+        }),
         spawn_every(SESSION_PRUNE_EVERY, move || {
             sessions.prune(OffsetDateTime::now_utc());
             std::future::ready(())

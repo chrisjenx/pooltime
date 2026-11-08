@@ -21,19 +21,23 @@
   const SIGNIN_POLL_MS = 1500;
   const EXPIRY_WARN_MS = 3 * 24 * 3600 * 1000;
 
-  // Exact status words (spec §4/§16): the same everywhere.
+  // Exact status words (spec §4/§16): the same everywhere, most severe first.
   const WORDS = {
-    ready: "Ready",
     needs_login: "Needs login",
-    rate_limited: "Rate-limited",
     billing: "Billing",
     access_denied: "Access denied",
+    erroring: "Erroring",
+    rate_limited: "Rate-limited",
+    expiring: "Expiring",
+    ready: "Ready",
   };
-  const SEVERITY = { needs_login: 0, billing: 1, access_denied: 2, rate_limited: 3, ready: 4 };
+  const SEVERITY = { needs_login: 0, billing: 1, access_denied: 2, erroring: 3, rate_limited: 4, expiring: 5, ready: 6 };
   const REASONS = {
     never_logged_in: "never logged in",
     refresh_token_dead: "refresh token rejected by the provider",
     refresh_token_expired: "login expired",
+    refresh_token_expiring: "login expiring",
+    state_unreadable: "saved state unreadable; recheck it",
     credentials_unreadable: "credentials file unreadable",
     credentials_unavailable: "credentials unavailable",
     billing: "provider reports a billing / entitlement problem",
@@ -138,10 +142,17 @@
     return accounts.slice().sort((a, b) =>
       (SEVERITY[a.status] ?? 9) - (SEVERITY[b.status] ?? 9) || String(a.id).localeCompare(String(b.id)));
   }
+  // The server decides `expiring` (warn window from config); an account showing a more severe
+  // state (e.g. rate-limited) whose login also expires soon still counts for re-login.
   function loginExpiringSoon(a) {
+    if (a.status === "expiring") return true;
     if (isDead(a) || !a.refresh_expires_at) return false;
-    const left = Date.parse(a.refresh_expires_at) - now();
-    return left > 0 && left < EXPIRY_WARN_MS;
+    return Date.parse(a.refresh_expires_at) - now() < EXPIRY_WARN_MS;
+  }
+  // "expires in 2d 4h" / "expired 3h ago, still working" (only a refused refresh ends a login).
+  function expiryCountdown(ts) {
+    const left = Date.parse(ts) - now();
+    return left > 0 ? "login expires " + rel(ts) : "login expired " + rel(ts) + ", still working";
   }
   function pill(status) {
     return h("span", { class: "pill " + status, text: WORDS[status] || status });
@@ -247,20 +258,29 @@
     document.querySelectorAll(".view").forEach((s) => s.classList.toggle("active", s.dataset.view === ui.view));
   }
 
+  // "N accounts need login · M expire today [Re-login all]" from the status `counts`.
   function renderBanner() {
     const b = $("banner");
     const accts = ui.data.accounts || [];
     const dead = accts.filter(isDead);
-    const expiring = accts.filter(loginExpiringSoon);
+    const expiring = accts.filter((a) => !isDead(a) && loginExpiringSoon(a));
     const blocked = accts.filter((a) => a.status === "billing" || a.status === "access_denied");
+    const erroring = accts.filter((a) => a.status === "erroring");
+    const c = ui.data.counts || { needs_login: dead.length, expiring_today: 0, expiring: expiring.length };
+    const later = c.expiring - c.expiring_today;
     const parts = [];
-    if (dead.length) parts.push(dead.length + (dead.length === 1 ? " account needs" : " accounts need") + " login");
-    if (expiring.length) parts.push(expiring.length + (expiring.length === 1 ? " login expires" : " logins expire") + " within 3 days");
+    if (c.needs_login) parts.push(c.needs_login + (c.needs_login === 1 ? " account needs" : " accounts need") + " login");
+    if (c.expiring_today) parts.push(c.expiring_today + (c.expiring_today === 1 ? " expires" : " expire") + " today");
+    if (later > 0) parts.push(later + (later === 1 ? " login expires" : " logins expire") + " soon");
     if (blocked.length) parts.push(blocked.length + " blocked (billing / access)");
+    if (erroring.length) parts.push(erroring.length + " erroring");
     if (!parts.length) { b.hidden = true; return; }
     b.hidden = false;
-    b.className = dead.length || blocked.length ? "banner" : "banner warn";
-    const queue = sorted(dead).concat(expiring).map((a) => a.id);
+    b.className = dead.length || blocked.length || erroring.length ? "banner" : "banner warn";
+    // Re-login all: needs-login first, then the soonest expiry; one sign-in at a time (the
+    // dialog starts the next only after the current one has settled).
+    const soonest = (a, z) => Date.parse(a.refresh_expires_at) - Date.parse(z.refresh_expires_at);
+    const queue = sorted(dead).concat(expiring.slice().sort(soonest)).map((a) => a.id);
     b.replaceChildren(
       h("span", { class: "grow", text: parts.join(" · ") }),
       ...(queue.length && manage
@@ -313,7 +333,7 @@
         h("td", null, pill(a.status)),
         h("td", { class: "dim nowrap", text: a.status_since ? "for " + dur(now() - Date.parse(a.status_since)) : "—" }),
         h("td", { text: statusDetail(a) || "" }),
-        h("td", { class: "nowrap" }, a.status === "needs_login" && manage
+        h("td", { class: "nowrap" }, (isDead(a) || a.status === "expiring") && manage
           ? h("button", { type: "button", class: "small", onclick: () => relogin.start([a.id]) }, "Re-login")
           : null)));
       const list = h("div", { class: "panel" },
@@ -454,12 +474,13 @@
 
   function statusDetail(a) {
     const bits = [];
-    const r = reasonText(a.reason);
+    const r = a.status === "expiring" ? null : reasonText(a.reason);
     if (r) bits.push(r);
     if (a.until && (a.status === "rate_limited" || a.status === "access_denied")) {
       bits.push("until " + clock(a.until) + " (" + rel(a.until) + ")");
     }
-    if (loginExpiringSoon(a)) bits.push("login expires " + rel(a.refresh_expires_at));
+    if (a.status === "erroring" && a.count) bits.push(a.count + (a.count === 1 ? " failure" : " failures") + " in 15 min");
+    if (loginExpiringSoon(a) && a.refresh_expires_at) bits.push(expiryCountdown(a.refresh_expires_at));
     return bits.join(" · ");
   }
 
@@ -489,12 +510,14 @@
         h("h3", { text: a.id }),
         h("span", { class: "pill badge", text: a.provider }),
         pill(a.status),
-        loginExpiringSoon(a) ? h("span", { class: "pill badge warn", text: "expiring" }) : null),
+        loginExpiringSoon(a) && a.status !== "expiring" ? h("span", { class: "pill badge warn", text: "expiring" }) : null),
       a.identity && a.identity.email ? h("div", { class: "email", text: a.identity.email }) : null,
       h("dl", { class: "kv" },
         kv("Since", a.status_since ? rel(a.status_since) + " (" + clock(a.status_since) + ")" : "—"),
-        kv("Why", reasonText(a.reason) || (a.status === "ready" ? "usable" : "—")),
-        a.until ? kv("Until", clock(a.until) + " (" + rel(a.until) + ")") : null,
+        kv("Why", a.status === "expiring" || a.status === "erroring"
+          ? statusDetail(a)
+          : reasonText(a.reason) || (a.status === "ready" ? "usable" : "—")),
+        a.until && a.status !== "expiring" ? kv("Until", clock(a.until) + " (" + rel(a.until) + ")") : null,
         kv("Login", expiry, expiryCls),
         kv("Routing", routingText),
         kv("Activity", a.in_flight + " in flight · " + a.sessions + " sessions"),
