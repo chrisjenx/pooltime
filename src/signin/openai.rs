@@ -4,9 +4,12 @@
 //! registered for the client id); authorize with the Codex CLI's parameters; exchange the code
 //! form-encoded; read the account from the id_token claims.
 //!
-//! Identity: the ChatGPT account id (`chatgpt_account_id`) fills the `account_uuid` slot of
-//! [`Identity`] (so `accounts::verify` matches on it) and the email claim is for display / the
-//! email fallback.
+//! Identity: the ChatGPT account id (`chatgpt_account_id`) names the workspace, shared by Team
+//! members, so it fills the `org_uuid` slot of [`Identity`]; the user id (`chatgpt_user_id`)
+//! fills `account_uuid`; plus the email claim. [`verify_openai`] compares them.
+//!
+//! Only one ChatGPT sign-in is pending per process (the ports are fixed): starting one
+//! supersedes the previous (it fails "superseded by a new sign-in" and its listener closes).
 //!
 //! Paste mode: OpenAI has no manual "copy this code" page, so the user pastes the URL the browser
 //! was redirected to (`parse_pasted` accepts it). The listener is still bound when possible (a
@@ -32,7 +35,7 @@ use super::{
     parse_pasted, FlowControl, PendingSignIn, SignInFlow, SignInMode, SignInResult, SubmitError,
     FLOW_TTL,
 };
-use crate::accounts::{verify, AccountId, Credentials, Identity, Registry, StateBook, Verify};
+use crate::accounts::{AccountId, Credentials, Identity, Registry, StateBook, Verify};
 use crate::config::OpenAiCfg;
 use crate::providers::openai::{id_token_claims, token_expiry, TokenResponse};
 use crate::providers::ProviderId;
@@ -42,6 +45,8 @@ use crate::upstream::{Limits, Upstream};
 pub const CALLBACK_PATH: &str = "/auth/callback";
 /// Token-exchange timeout.
 const TOKEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long [`OpenAiSignIn::start_superseding`] waits for a superseded listener to close.
+const SUPERSEDE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Token bodies are small; never accept more than this.
 const MAX_TOKEN_BODY: usize = 256 * 1024;
 
@@ -51,10 +56,31 @@ pub struct OpenAiSignIn {
     registry: Arc<Registry>,
     state: Arc<StateBook>,
     upstream: Arc<Upstream>,
+    /// The pending flow a new start supersedes (shared by every `OpenAiSignIn` of a process
+    /// through [`OpenAiSignIn::with_active`]).
+    active: ActiveSignIn,
     /// Test seam: fixed `(verifier, state)` instead of random ones.
     #[cfg(test)]
     fixed: Option<(String, String)>,
 }
+
+/// The one ChatGPT sign-in a process may have pending: the callback ports are fixed, so a new
+/// sign-in ends the previous one (and frees its port). Cheap to clone; clones share the slot.
+#[derive(Clone, Default)]
+pub struct ActiveSignIn(Arc<Mutex<Option<Active>>>);
+
+struct Active {
+    flow: std::sync::Weak<Flow>,
+    /// The callback server task (ends once its listener is closed and connections drained).
+    server: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Both callback ports are taken (mapped to 409 by the management API).
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "sign-in callback ports {0:?} are all in use (another Codex/pooltime login?); close it and retry"
+)]
+pub struct CallbackPortsBusy(pub Vec<u16>);
 
 impl OpenAiSignIn {
     pub fn new(
@@ -68,9 +94,42 @@ impl OpenAiSignIn {
             registry,
             state,
             upstream,
+            active: ActiveSignIn::default(),
             #[cfg(test)]
             fixed: None,
         }
+    }
+
+    /// Share the pending-flow slot with other instances (the management API keeps one).
+    pub fn with_active(mut self, active: ActiveSignIn) -> OpenAiSignIn {
+        self.active = active;
+        self
+    }
+
+    /// Supersede the pending flow, wait (bounded) until its listener has let go of its port,
+    /// then [`SignInFlow::start`]. Use this from async callers so the new flow gets the
+    /// preferred port.
+    pub async fn start_superseding(
+        &self,
+        account: &AccountId,
+        hint: Option<&str>,
+        mode: SignInMode,
+    ) -> anyhow::Result<PendingSignIn> {
+        if let Some(server) = self.supersede() {
+            let _ = tokio::time::timeout(SUPERSEDE_WAIT, server).await;
+        }
+        self.start(account, hint, mode)
+    }
+
+    /// End the pending flow (if any): an unclaimed one fails as superseded; one already
+    /// exchanging its code finishes on its own. Either way its listener closes. Returns the
+    /// callback server task to await.
+    fn supersede(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let old = lock(&self.active.0).take()?;
+        if let Some(flow) = old.flow.upgrade() {
+            flow.supersede();
+        }
+        old.server
     }
 
     #[cfg(test)]
@@ -112,14 +171,9 @@ impl OpenAiSignIn {
     }
 
     /// Bind the redirect listener on the first free configured port.
-    fn bind(&self) -> anyhow::Result<callback::BoundCallback> {
-        callback::bind_first(&self.cfg.callback_ports, CALLBACK_PATH).with_context(|| {
-            format!(
-                "sign-in callback ports {:?} are all in use (another Codex/pooltime login?); \
-                 close it and retry",
-                self.cfg.callback_ports
-            )
-        })
+    fn bind(&self) -> Result<callback::BoundCallback, CallbackPortsBusy> {
+        callback::bind_first(&self.cfg.callback_ports, CALLBACK_PATH)
+            .map_err(|_| CallbackPortsBusy(self.cfg.callback_ports.clone()))
     }
 }
 
@@ -138,6 +192,9 @@ impl SignInFlow for OpenAiSignIn {
         if meta.provider != ProviderId::OpenAi {
             bail!("account {account} is not an OpenAI account");
         }
+        // One pending ChatGPT sign-in per process (fixed ports); async callers use
+        // `start_superseding`, which also waits for the old listener to close.
+        drop(self.supersede());
 
         let bound = match mode {
             SignInMode::Callback => Some(self.bind()?),
@@ -172,7 +229,7 @@ impl SignInFlow for OpenAiSignIn {
             done,
         });
 
-        if let Some(bound) = bound {
+        let server = bound.map(|bound| {
             let f = flow.clone();
             let handler: Handler = Arc::new(move |ev| {
                 let f = f.clone();
@@ -181,7 +238,15 @@ impl SignInFlow for OpenAiSignIn {
             let mut closed = flow.done.subscribe();
             bound.serve(oauth_state, handler, async move {
                 let _ = closed.wait_for(|d| *d).await;
-            });
+            })
+        });
+        // A flow started concurrently since the supersede above is superseded in turn.
+        let displaced = lock(&self.active.0).replace(Active {
+            flow: Arc::downgrade(&flow),
+            server,
+        });
+        if let Some(old) = displaced.and_then(|a| a.flow.upgrade()) {
+            old.supersede();
         }
 
         let f = flow.clone();
@@ -250,6 +315,16 @@ impl Flow {
             true
         } else {
             false
+        }
+    }
+
+    /// A newer sign-in replaces this one: an unclaimed flow fails as superseded; one already
+    /// exchanging its code finishes on its own. Either way the listener closes.
+    fn supersede(self: &Arc<Self>) {
+        if self.claim() {
+            self.finish(SignInResult::Failed("superseded by a new sign-in".into()));
+        } else {
+            self.done.send_replace(true);
         }
     }
 
@@ -404,7 +479,7 @@ impl Flow {
             .and_then(id_token_claims)
             .unwrap_or_default();
         let got = claims.identity();
-        if got.account_uuid.is_none() && got.email.is_none() {
+        if got.account_uuid.is_none() && got.email.is_none() && got.org_uuid.is_none() {
             return failed("could not verify the signed-in account: no identity reported".into());
         }
         let prev = {
@@ -433,16 +508,14 @@ impl Flow {
                 .clone()
                 .or_else(|| prev.as_ref().and_then(|c| c.plan.clone())),
             tier: None,
-            openai_account_id: claims
-                .account_id
-                .clone()
-                .or_else(|| prev.as_ref().and_then(|c| c.openai_account_id.clone())),
+            // Only what this sign-in proved: a stale workspace id would misroute requests.
+            openai_account_id: claims.account_id.clone(),
         };
 
         let Some(meta) = self.registry.get(&self.account) else {
             return failed("the account was removed during sign-in".into());
         };
-        match verify(&meta.identity, &got) {
+        match verify_openai(&meta.identity, &got) {
             Verify::Match => {
                 let identity = merge(&meta.identity, got);
                 match self.save(creds, identity.clone()).await {
@@ -506,6 +579,45 @@ impl Flow {
     }
 }
 
+/// Compare a ChatGPT sign-in with the account's baseline (identity slots per
+/// `IdTokenClaims::identity`: `account_uuid` = user id, `org_uuid` = workspace account id).
+/// `accounts::verify` (Claude) is not used: the workspace id is shared by Team members, so it can
+/// only rule a login *out*.
+///
+/// 1. Both have a workspace id and they differ: another subscription, `Mismatch`.
+/// 2. Both have a user id: it decides.
+/// 3. Both have an email: it decides (case-insensitive, trimmed), even when the workspace
+///    ids match.
+/// 4. Only the (equal) workspace ids are comparable: `Match`.
+/// 5. Nothing comparable: `NoBaseline`.
+pub fn verify_openai(expected: &Identity, got: &Identity) -> Verify {
+    fn present(s: &Option<String>) -> Option<&str> {
+        s.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+    let both = |f: fn(&Identity) -> &Option<String>| present(f(expected)).zip(present(f(got)));
+    let workspace = both(|i| &i.org_uuid);
+    if workspace.is_some_and(|(e, g)| e != g) {
+        return Verify::Mismatch;
+    }
+    let decide = |same: bool| {
+        if same {
+            Verify::Match
+        } else {
+            Verify::Mismatch
+        }
+    };
+    if let Some((e, g)) = both(|i| &i.account_uuid) {
+        return decide(e == g);
+    }
+    if let Some((e, g)) = both(|i| &i.email) {
+        return decide(e.eq_ignore_ascii_case(g));
+    }
+    if workspace.is_some() {
+        return Verify::Match;
+    }
+    Verify::NoBaseline
+}
+
 /// `got` over `old`: fresh values win, fields not reported keep their old value.
 fn merge(old: &Identity, got: Identity) -> Identity {
     Identity {
@@ -545,7 +657,9 @@ mod tests {
 
     use crate::accounts::AccountMeta;
     use crate::config::Paths;
-    use crate::providers::openai::testkit::{fake_token_endpoint, id_token, reply, FakeToken};
+    use crate::providers::openai::testkit::{
+        fake_token_endpoint, id_token, id_token_with_user, reply, FakeToken,
+    };
     use crate::store::Store;
 
     const VERIFIER: &str = "test-verifier-0123456789-abcdefghijklmnopqrstuvwxyz";
@@ -630,9 +744,9 @@ mod tests {
 
     fn baseline(account_id: &str) -> Identity {
         Identity {
-            account_uuid: Some(account_id.into()),
+            account_uuid: None,
             email: Some("me@example.com".into()),
-            org_uuid: None,
+            org_uuid: Some(account_id.into()),
         }
     }
 
@@ -802,7 +916,7 @@ mod tests {
         let SignInResult::Saved { identity } = p.wait().await else {
             panic!("expected Saved")
         };
-        assert_eq!(identity.account_uuid.as_deref(), Some(ACCT));
+        assert_eq!(identity.org_uuid.as_deref(), Some(ACCT));
         let c = fx.creds();
         assert_eq!(c.provider, ProviderId::OpenAi);
         assert_eq!(c.access_token, "at-new");
@@ -825,7 +939,7 @@ mod tests {
         let SignInResult::Mismatch { got, .. } = p.wait().await else {
             panic!("expected Mismatch")
         };
-        assert_eq!(got.account_uuid.as_deref(), Some("acct-bbbb"));
+        assert_eq!(got.org_uuid.as_deref(), Some("acct-bbbb"));
         assert_eq!(fx.creds().access_token, "old-access");
         assert!(fx.state.is_refresh_dead(&fx.id, OLD_RT));
     }
@@ -840,9 +954,9 @@ mod tests {
         assert!(matches!(p.wait().await, SignInResult::NeedsBinding { .. }));
         assert_eq!(fx.creds().access_token, "old-access");
         let got = h.bind().await.unwrap();
-        assert_eq!(got.account_uuid.as_deref(), Some(ACCT));
+        assert_eq!(got.org_uuid.as_deref(), Some(ACCT));
         assert_eq!(fx.creds().access_token, "at-new");
-        assert_eq!(fx.meta().identity.account_uuid.as_deref(), Some(ACCT));
+        assert_eq!(fx.meta().identity.org_uuid.as_deref(), Some(ACCT));
     }
 
     #[tokio::test]
@@ -890,6 +1004,184 @@ mod tests {
             .start(&claude, None, SignInMode::Callback)
             .unwrap_err();
         assert!(e.to_string().contains("not an OpenAI account"));
+    }
+
+    /// Run one callback-mode sign-in whose token endpoint returns `body`.
+    async fn login_with(fx: &mut Fx, body: String) -> SignInResult {
+        let fake = fake_token_endpoint(move |_| reply(200, body.clone())).await;
+        fx.flow.cfg.token_url = fake.url.clone();
+        let p = fx.flow.start(&fx.id, None, SignInMode::Callback).unwrap();
+        let redirect = param(&p.authorize_url, "redirect_uri");
+        hit_callback(&redirect, &format!("code=c&state={STATE}")).await;
+        p.wait().await
+    }
+
+    fn body_with(id_token: String) -> String {
+        serde_json::json!({
+            "id_token": id_token,
+            "access_token": "at-new",
+            "refresh_token": "rt-new",
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn verify_openai_rules() {
+        let i = |user: Option<&str>, email: Option<&str>, ws: Option<&str>| Identity {
+            account_uuid: user.map(Into::into),
+            email: email.map(Into::into),
+            org_uuid: ws.map(Into::into),
+        };
+        let base = i(Some("u1"), Some("me@x.com"), Some("ws1"));
+        for (got, want) in [
+            (i(Some("u1"), Some("new@x.com"), Some("ws1")), Verify::Match),
+            (
+                i(Some("u2"), Some("me@x.com"), Some("ws1")),
+                Verify::Mismatch,
+            ),
+            (
+                i(Some("u1"), Some("me@x.com"), Some("ws2")),
+                Verify::Mismatch,
+            ),
+            (i(None, Some(" ME@x.com "), Some("ws1")), Verify::Match),
+            (i(None, Some("other@x.com"), Some("ws1")), Verify::Mismatch),
+            (i(None, None, Some("ws1")), Verify::Match),
+            (i(None, None, None), Verify::NoBaseline),
+        ] {
+            assert_eq!(verify_openai(&base, &got), want, "{got:?}");
+        }
+        assert_eq!(
+            verify_openai(&Identity::default(), &base),
+            Verify::NoBaseline
+        );
+    }
+
+    #[tokio::test]
+    async fn same_account_id_different_email_is_a_mismatch() {
+        // Team members share the workspace account id: the email tells them apart.
+        let mut fx = fx(baseline(ACCT), ACCT).await;
+        let r = login_with(
+            &mut fx,
+            body_with(id_token(ACCT, " Other@Example.com ", "team")),
+        )
+        .await;
+        let SignInResult::Mismatch { got, .. } = r else {
+            panic!("expected Mismatch, got {r:?}")
+        };
+        assert_eq!(got.email.as_deref(), Some("Other@Example.com"));
+        assert_eq!(fx.creds().access_token, "old-access", "nothing saved");
+        assert_eq!(fx.meta().identity, baseline(ACCT));
+
+        // Same email modulo case/whitespace: the same person.
+        let r = login_with(
+            &mut fx,
+            body_with(id_token(ACCT, " ME@example.com", "team")),
+        )
+        .await;
+        assert!(matches!(r, SignInResult::Saved { .. }), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn user_id_decides_when_both_have_it() {
+        let base = Identity {
+            account_uuid: Some("user-1".into()),
+            email: Some("me@example.com".into()),
+            org_uuid: Some(ACCT.into()),
+        };
+        let mut fx = fx(base.clone(), ACCT).await;
+        // Another member of the same workspace, same email on file or not: mismatch.
+        let r = login_with(
+            &mut fx,
+            body_with(id_token_with_user(ACCT, "user-2", "me@example.com")),
+        )
+        .await;
+        assert!(matches!(r, SignInResult::Mismatch { .. }), "{r:?}");
+        // Same user with a changed email: match, and the new email is recorded.
+        let r = login_with(
+            &mut fx,
+            body_with(id_token_with_user(ACCT, "user-1", "renamed@example.com")),
+        )
+        .await;
+        let SignInResult::Saved { identity } = r else {
+            panic!("expected Saved, got {r:?}")
+        };
+        assert_eq!(identity.account_uuid.as_deref(), Some("user-1"));
+        assert_eq!(identity.email.as_deref(), Some("renamed@example.com"));
+        assert_eq!(fx.creds().access_token, "at-new");
+        // Same user signed into a different workspace: a different pooled subscription.
+        let r = login_with(
+            &mut fx,
+            body_with(id_token_with_user(
+                "acct-other-ws",
+                "user-1",
+                "renamed@example.com",
+            )),
+        )
+        .await;
+        assert!(matches!(r, SignInResult::Mismatch { .. }), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn exchange_without_account_id_claim_stores_none() {
+        let email_only = Identity {
+            account_uuid: None,
+            email: Some("me@example.com".into()),
+            org_uuid: None,
+        };
+        let mut fx = fx(email_only, ACCT).await;
+        let mut c = fx.creds();
+        c.openai_account_id = Some("acct-previous".into());
+        fx.reg.write_creds(&fx.id, &c).unwrap();
+        let tok = crate::providers::openai::testkit::fake_jwt(
+            &serde_json::json!({"email": "me@example.com"}),
+        );
+        let r = login_with(&mut fx, body_with(tok)).await;
+        assert!(matches!(r, SignInResult::Saved { .. }), "{r:?}");
+        assert_eq!(fx.creds().access_token, "at-new");
+        assert_eq!(fx.creds().openai_account_id, None);
+    }
+
+    #[tokio::test]
+    async fn new_signin_supersedes_the_pending_one_and_frees_its_port() {
+        let mut fx = fx(baseline(ACCT), ACCT).await;
+        let a = fx.flow.start(&fx.id, None, SignInMode::Callback).unwrap();
+        let a_redirect = param(&a.authorize_url, "redirect_uri");
+        let a_port = reqwest::Url::parse(&a_redirect).unwrap().port().unwrap();
+
+        // B prefers A's port: it must get it once A is superseded.
+        fx.flow.cfg.callback_ports = vec![a_port, 0];
+        let b = fx
+            .flow
+            .start_superseding(&fx.id, None, SignInMode::Callback)
+            .await
+            .unwrap();
+        assert_eq!(
+            a.wait().await,
+            SignInResult::Failed("superseded by a new sign-in".into())
+        );
+        let b_redirect = param(&b.authorize_url, "redirect_uri");
+        assert_eq!(b_redirect, a_redirect, "B binds the freed port");
+        assert_eq!(
+            hit_callback(&b_redirect, &format!("code=c&state={STATE}")).await,
+            200
+        );
+        assert!(matches!(b.wait().await, SignInResult::Saved { .. }));
+
+        // The plain (sync) start supersedes too, even across instances sharing the slot.
+        let other = OpenAiSignIn::new(
+            fx.flow.cfg.clone(),
+            fx.reg.clone(),
+            fx.state.clone(),
+            Arc::new(Upstream::new()),
+        )
+        .with_active(fx.flow.active.clone());
+        fx.flow.cfg.callback_ports = vec![0];
+        let c = fx.flow.start(&fx.id, None, SignInMode::PasteCode).unwrap();
+        let _d = other.start(&fx.id, None, SignInMode::PasteCode).unwrap();
+        assert_eq!(
+            c.wait().await,
+            SignInResult::Failed("superseded by a new sign-in".into())
+        );
     }
 
     #[tokio::test(start_paused = true)]

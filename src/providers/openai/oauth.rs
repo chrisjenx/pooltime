@@ -6,8 +6,8 @@
 //! the credentials re-read after each layer, and the critical section (flock, POST, persist, state
 //! updates) running in a spawned task so a dropped caller can never lose a rotated refresh token.
 //!
-//! Dead detection: a 400/401 whose OAuth error code is `invalid_grant` or `refresh_token_reused`
-//! marks the refresh token we sent dead (fingerprint only). Transport errors, 5xx and every other
+//! Dead detection: a 400/401 whose OAuth error code is `invalid_grant`, `refresh_token_reused`,
+//! `refresh_token_expired` or `refresh_token_invalidated` marks the refresh token we sent dead (fingerprint only). Transport errors, 5xx and every other
 //! status never do.
 //!
 //! The id_token is read without verifying its signature: it comes straight from the token
@@ -74,6 +74,8 @@ pub(crate) struct TokenResponse {
 pub struct IdTokenClaims {
     /// `https://api.openai.com/auth`.`chatgpt_account_id` (the `chatgpt-account-id` header value).
     pub account_id: Option<String>,
+    /// `https://api.openai.com/auth`.`chatgpt_user_id` (else `user_id`): the person.
+    pub user_id: Option<String>,
     /// `email` (or `https://api.openai.com/profile`.`email`).
     pub email: Option<String>,
     /// `https://api.openai.com/auth`.`chatgpt_plan_type`.
@@ -81,12 +83,14 @@ pub struct IdTokenClaims {
 }
 
 impl IdTokenClaims {
-    /// The account identity: account id as the stable key (uuid slot), email for display.
+    /// The account identity. `chatgpt_account_id` names the *workspace* (Team members share it),
+    /// so it fills the `org_uuid` slot; the user id (the person) fills `account_uuid`; the email
+    /// sits alongside. Compared by `signin::openai::verify_openai`.
     pub fn identity(&self) -> Identity {
         Identity {
-            account_uuid: self.account_id.clone(),
+            account_uuid: self.user_id.clone(),
             email: self.email.clone(),
-            org_uuid: None,
+            org_uuid: self.account_id.clone(),
         }
     }
 }
@@ -115,6 +119,8 @@ pub fn id_token_claims(id_token: &str) -> Option<IdTokenClaims> {
     let auth = p.get(AUTH_CLAIM);
     Some(IdTokenClaims {
         account_id: nonempty(auth.and_then(|a| a.get("chatgpt_account_id"))),
+        user_id: nonempty(auth.and_then(|a| a.get("chatgpt_user_id")))
+            .or_else(|| nonempty(auth.and_then(|a| a.get("user_id")))),
         email: nonempty(p.get("email"))
             .or_else(|| nonempty(p.get(PROFILE_CLAIM).and_then(|x| x.get("email")))),
         plan: nonempty(auth.and_then(|a| a.get("chatgpt_plan_type"))),
@@ -201,9 +207,9 @@ fn normalize_codex_auth(bytes: &[u8]) -> anyhow::Result<CodexAuthImport> {
             openai_account_id: account_id.clone(),
         },
         identity: Identity {
-            account_uuid: account_id,
+            account_uuid: claims.user_id,
             email: claims.email,
-            org_uuid: None,
+            org_uuid: account_id,
         },
     })
 }
@@ -466,7 +472,14 @@ impl Ctx {
                     .unwrap_or_else(|| old_rt.clone()),
             ),
             plan: claims.plan.or(cur.plan.clone()),
-            openai_account_id: claims.account_id.or(cur.openai_account_id.clone()),
+            openai_account_id: match (cur.openai_account_id.clone(), claims.account_id) {
+                // Never switch an account to another workspace behind the user's back.
+                (Some(stored), Some(new)) if stored != new => {
+                    tracing::warn!(account = %id, "openai oauth refresh returned a different ChatGPT account id; keeping the stored one");
+                    Some(stored)
+                }
+                (stored, new) => stored.or(new),
+            },
             ..cur
         };
         // Persist (atomically, before anyone uses the new token). The old refresh token may now be
@@ -535,7 +548,15 @@ fn classify_failure(status: u16, body: &str) -> RefreshErrorKind {
     };
     if has("refresh_token_reused") {
         RefreshErrorKind::TokenReused
-    } else if has("invalid_grant") {
+    } else if [
+        "invalid_grant",
+        "refresh_token_expired",
+        "refresh_token_invalidated",
+    ]
+    .iter()
+    .any(|c| has(c))
+    {
+        // codex-rs treats expired / invalidated refresh tokens as "sign in again" too.
         RefreshErrorKind::InvalidGrant
     } else {
         RefreshErrorKind::Server(status)
@@ -576,6 +597,18 @@ pub(crate) mod testkit {
             "https://api.openai.com/auth": {
                 "chatgpt_account_id": account_id,
                 "chatgpt_plan_type": plan,
+            },
+        }))
+    }
+
+    /// An id_token that also names the ChatGPT user (`chatgpt_user_id`).
+    pub fn id_token_with_user(account_id: &str, user_id: &str, email: &str) -> String {
+        fake_jwt(&serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account_id,
+                "chatgpt_user_id": user_id,
+                "chatgpt_plan_type": "team",
             },
         }))
     }
@@ -763,14 +796,33 @@ mod tests {
             id_token_claims(&tok),
             Some(IdTokenClaims {
                 account_id: Some("acct-123".into()),
+                user_id: None,
                 email: Some("me@example.com".into()),
                 plan: Some("pro".into()),
             })
         );
-        // Identity: the account id is the stable key, the email is for display.
+        // Identity: the workspace account id goes in the org slot (Team members share it), the
+        // user id (absent here) in the uuid slot, the email alongside.
         let i = id_token_claims(&tok).unwrap().identity();
-        assert_eq!(i.account_uuid.as_deref(), Some("acct-123"));
+        assert_eq!(i.org_uuid.as_deref(), Some("acct-123"));
+        assert_eq!(i.account_uuid, None);
         assert_eq!(i.email.as_deref(), Some("me@example.com"));
+
+        // `chatgpt_user_id`, else `user_id`, names the person.
+        let i = id_token_claims(&id_token_with_user("ws-1", "user-1", "a@b.c"))
+            .unwrap()
+            .identity();
+        assert_eq!(
+            (i.account_uuid.as_deref(), i.org_uuid.as_deref()),
+            (Some("user-1"), Some("ws-1"))
+        );
+        let tok = fake_jwt(&serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "ws-2", "user_id": "user-2"},
+        }));
+        assert_eq!(
+            id_token_claims(&tok).unwrap().user_id.as_deref(),
+            Some("user-2")
+        );
 
         // Email from the profile claim; missing / empty claims are absent.
         let tok = fake_jwt(&serde_json::json!({
@@ -781,6 +833,7 @@ mod tests {
             id_token_claims(&tok),
             Some(IdTokenClaims {
                 account_id: None,
+                user_id: None,
                 email: Some("p@example.com".into()),
                 plan: None,
             })
@@ -837,7 +890,8 @@ mod tests {
         assert_eq!(c.plan.as_deref(), Some("pro"));
         // Expiry from the access token's `exp`.
         assert_eq!(c.expires_at.unwrap().unix_timestamp(), 2_000_000_000);
-        assert_eq!(got.identity.account_uuid.as_deref(), Some("acct-bare"));
+        assert_eq!(got.identity.org_uuid.as_deref(), Some("acct-bare"));
+        assert_eq!(got.identity.account_uuid, None, "no user id claim");
         assert_eq!(got.identity.email.as_deref(), Some("me@example.com"));
 
         // Browser-login shape: no bare account id, opaque access token.
@@ -1005,6 +1059,68 @@ mod tests {
         ] {
             assert_marks_dead(status, body, RefreshErrorKind::TokenReused).await;
         }
+    }
+
+    #[tokio::test]
+    async fn refresh_token_expired_marks_dead() {
+        for (status, body) in [
+            (
+                401,
+                r#"{"error":{"message":"x","type":"invalid_request_error","code":"refresh_token_expired"}}"#,
+            ),
+            (400, r#"{"error":"refresh_token_expired"}"#),
+        ] {
+            assert_marks_dead(status, body, RefreshErrorKind::InvalidGrant).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_token_invalidated_marks_dead() {
+        for (status, body) in [
+            (401, r#"{"error":{"code":"refresh_token_invalidated"}}"#),
+            (400, r#"{"code":"refresh_token_invalidated"}"#),
+        ] {
+            assert_marks_dead(status, body, RefreshErrorKind::InvalidGrant).await;
+        }
+        // Only on 400/401.
+        let fx = fx(creds_expiring_in(10));
+        let fake =
+            fake_token_endpoint(|_| reply(503, r#"{"error":"refresh_token_invalidated"}"#)).await;
+        assert_eq!(
+            fx.provider(&fake.url)
+                .access_token(&fx.meta, false)
+                .await
+                .unwrap_err(),
+            RefreshErrorKind::Server(503)
+        );
+        assert_eq!(fx.dead_fp(), None);
+    }
+
+    #[tokio::test]
+    async fn refresh_never_replaces_the_stored_account_id() {
+        let fx = fx(creds_expiring_in(10));
+        let fake = fake_token_endpoint(|_| {
+            reply(
+                200,
+                serde_json::json!({
+                    "access_token": "a2",
+                    "id_token": id_token("acct-OTHER", "me@example.com", "pro"),
+                })
+                .to_string(),
+            )
+        })
+        .await;
+        let p = fx.provider(&fake.url);
+        assert_eq!(p.access_token(&fx.meta, false).await.unwrap(), "a2");
+        assert_eq!(fx.creds().openai_account_id.as_deref(), Some("acct-1"));
+
+        // An account without a stored id adopts the token's.
+        let mut c = creds_expiring_in(10);
+        c.openai_account_id = None;
+        let fx = self::fx(c);
+        let p = fx.provider(&fake.url);
+        p.access_token(&fx.meta, false).await.unwrap();
+        assert_eq!(fx.creds().openai_account_id.as_deref(), Some("acct-OTHER"));
     }
 
     #[tokio::test]

@@ -98,13 +98,14 @@ impl BoundCallback {
         self.port
     }
 
-    /// Serve until `shutdown` resolves (then stop accepting; in-flight requests finish).
+    /// Serve until `shutdown` resolves (then stop accepting; in-flight requests finish). The
+    /// returned task ends once the listener is closed and open connections are drained.
     pub fn serve(
         self,
         expected_state: String,
         handler: Handler,
         shutdown: impl Future<Output = ()> + Send + 'static,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         let shared = Arc::new(Shared {
             state: expected_state,
             used: AtomicBool::new(false),
@@ -117,7 +118,7 @@ impl BoundCallback {
             let _ = axum::serve(self.listener, app)
                 .with_graceful_shutdown(shutdown)
                 .await;
-        });
+        })
     }
 }
 

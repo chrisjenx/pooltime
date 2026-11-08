@@ -1876,6 +1876,7 @@ mod mgmt {
 
         // A new account created by its first login, and an existing one.
         pool.add_account("codex1", ProviderId::OpenAi, 100, "x");
+        let mut ids = Vec::new();
         for (path, body) in [
             (
                 "/api/v1/accounts/oa/login",
@@ -1895,12 +1896,45 @@ mod mgmt {
             let redirect = reqwest::Url::parse(&param(url, "redirect_uri").unwrap()).unwrap();
             assert_eq!(redirect.host_str(), Some("localhost"));
             assert_eq!(redirect.path(), "/auth/callback");
-            assert!(v["signin_id"].as_str().is_some());
+            ids.push(v["signin_id"].as_str().unwrap().to_string());
         }
         assert_eq!(
             pool.reg.get(&id("oa")).unwrap().provider,
             ProviderId::OpenAi
         );
+        // The second ChatGPT sign-in superseded the first (the callback ports are fixed).
+        let first = wait_signin(&srv, &ids[0], "pending").await;
+        assert_eq!(first["status"], "failed");
+        assert!(
+            first["message"].as_str().unwrap().contains("superseded"),
+            "{first}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_login_with_both_ports_busy_is_409() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let held_port = held.local_addr().unwrap().port();
+        let pool = Pool::new();
+        let srv = pool
+            .boot(Boot {
+                configure: Some(Box::new(move |cfg: &mut Config| {
+                    cfg.openai.callback_ports = vec![held_port, held_port];
+                })),
+                ..Boot::default()
+            })
+            .await;
+        pool.add_account("codex1", ProviderId::OpenAi, 100, "x");
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts/codex1/login",
+            Some(json!({"mode": "callback"})),
+        )
+        .await;
+        assert_eq!(r.status, 409, "{}", r.text());
+        assert!(message(&r).contains("in use"), "{}", message(&r));
+        drop(held);
     }
 
     // ---- profiles & models (Task 30) ----
