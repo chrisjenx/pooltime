@@ -22,6 +22,7 @@
 
 pub mod callback;
 pub mod claude;
+pub mod openai;
 pub mod pkce;
 
 use std::fmt;

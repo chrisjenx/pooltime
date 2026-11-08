@@ -23,8 +23,10 @@ use super::client::{self, seg, Client};
 use super::status::accounts_table;
 use crate::accounts::{AccountId, AccountMeta, Identity, Registry, StateBook};
 use crate::config::{Config, Paths};
+use crate::providers::openai::{codex_auth_json_import, default_codex_auth_path, CodexAuthImport};
 use crate::providers::ProviderId;
 use crate::signin::claude::ClaudeSignIn;
+use crate::signin::openai::OpenAiSignIn;
 use crate::signin::{PendingSignIn, SignInFlow, SignInHandle, SignInMode, SignInResult};
 use crate::store::Store;
 use crate::upstream::Upstream;
@@ -50,6 +52,16 @@ pub enum AccountsCmd {
         /// this account) and pre-filled on the sign-in page.
         #[arg(long)]
         email: Option<String>,
+        /// openai only: import the Codex CLI's sign-in from its auth.json (PATH, default
+        /// $CODEX_HOME/auth.json or ~/.codex/auth.json) instead of signing in.
+        #[arg(
+            long,
+            value_name = "PATH",
+            num_args = 0..=1,
+            default_missing_value = "",
+            conflicts_with = "login"
+        )]
+        from_codex_auth: Option<std::path::PathBuf>,
         #[command(flatten)]
         signin: SignInFlags,
     },
@@ -148,8 +160,17 @@ pub async fn run(paths: &Paths, cmd: AccountsCmd) -> anyhow::Result<i32> {
             provider,
             login: then_login,
             email,
+            from_codex_auth,
             signin,
         } => {
+            let imported = match &from_codex_auth {
+                None => None,
+                Some(_) if provider != "openai" => {
+                    bail!("--from-codex-auth needs --provider openai")
+                }
+                Some(p) => Some(codex_auth_json_import(&codex_auth_path(p)?)?),
+            };
+            let email = email.or_else(|| imported.as_ref().and_then(|i| i.identity.email.clone()));
             let c = client::require(paths).await?;
             let v = c
                 .post(
@@ -166,6 +187,11 @@ pub async fn run(paths: &Paths, cmd: AccountsCmd) -> anyhow::Result<i32> {
                 v["id"].as_str().unwrap_or(&name),
                 v["provider"].as_str().unwrap_or(&provider)
             );
+            if let Some(imp) = imported {
+                save_codex_import(paths, &name, imp)?;
+                println!("imported the Codex CLI sign-in into '{name}'");
+                return Ok(0);
+            }
             if !then_login {
                 println!("sign in with: pooltime accounts login {name}");
                 return Ok(0);
@@ -266,6 +292,31 @@ fn parse_until(raw: &str, now: OffsetDateTime) -> anyhow::Result<String> {
     Ok(t.format(&Rfc3339)?)
 }
 
+/// `--from-codex-auth` without a value means the Codex CLI's default location.
+fn codex_auth_path(given: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    if !given.as_os_str().is_empty() {
+        return Ok(given.to_path_buf());
+    }
+    default_codex_auth_path(|k| std::env::var(k).ok())
+        .context("cannot locate the Codex auth.json (HOME is not set); pass its path")
+}
+
+/// Write the imported credentials (the registry reads them from disk, so a running daemon picks
+/// them up) and record the ChatGPT account id as the account's identity baseline.
+fn save_codex_import(paths: &Paths, name: &str, imp: CodexAuthImport) -> anyhow::Result<()> {
+    let id: AccountId = name.parse()?;
+    let reg = Registry::load(paths)?;
+    reg.write_creds(&id, &imp.creds)?;
+    if let Some(mut meta) = reg.get(&id) {
+        meta.identity.account_uuid = imp.identity.account_uuid;
+        if meta.identity.email.is_none() {
+            meta.identity.email = imp.identity.email;
+        }
+        reg.upsert(meta)?;
+    }
+    Ok(())
+}
+
 fn mode_of(flags: &SignInFlags) -> Mode {
     flags.mode.unwrap_or(if client::headless() {
         Mode::Paste
@@ -292,7 +343,10 @@ fn present(url: &str, mode: Mode) {
             println!("Open this URL in a browser on this machine to sign in:")
         }
         (Mode::Paste, _) => {
-            println!("Open this URL in any browser, sign in, then paste the code it shows:")
+            println!(
+                "Open this URL in any browser, sign in, then paste the code it shows \
+                 (or, if the page fails to load, the address it ended on):"
+            )
         }
     }
     println!("  {url}");
@@ -449,8 +503,10 @@ pub async fn login(
         }
         None => {
             let local = Local::open(paths)?;
-            local.ensure_account(&account)?;
-            let pending = local.flow().start(&account, hint, signin_mode(mode))?;
+            let provider = local.ensure_account(&account)?;
+            let pending = local
+                .flow(provider)
+                .start(&account, hint, signin_mode(mode))?;
             present(&pending.authorize_url, mode);
             let backend = Backend::Local {
                 handle: pending.handle(),
@@ -535,26 +591,34 @@ impl Local {
         })
     }
 
-    /// Create `id` as a Claude account when missing; refuse other providers.
-    fn ensure_account(&self, id: &AccountId) -> anyhow::Result<()> {
+    /// The account's provider; a missing account is created as a Claude account.
+    fn ensure_account(&self, id: &AccountId) -> anyhow::Result<ProviderId> {
         match self.registry.get(id) {
-            Some(m) if m.provider != ProviderId::Anthropic => {
-                bail!("sign-in for {} accounts is not yet supported", m.provider)
+            Some(m) => Ok(m.provider),
+            None => {
+                self.registry
+                    .upsert(AccountMeta::new(id.clone(), ProviderId::Anthropic))?;
+                Ok(ProviderId::Anthropic)
             }
-            Some(_) => Ok(()),
-            None => self
-                .registry
-                .upsert(AccountMeta::new(id.clone(), ProviderId::Anthropic)),
         }
     }
 
-    fn flow(&self) -> ClaudeSignIn {
-        ClaudeSignIn::new(
-            self.cfg.anthropic.clone(),
-            self.registry.clone(),
-            self.state.clone(),
-            Arc::new(Upstream::new()),
-        )
+    fn flow(&self, provider: ProviderId) -> Box<dyn SignInFlow> {
+        let up = Arc::new(Upstream::new());
+        match provider {
+            ProviderId::Anthropic => Box::new(ClaudeSignIn::new(
+                self.cfg.anthropic.clone(),
+                self.registry.clone(),
+                self.state.clone(),
+                up,
+            )),
+            ProviderId::OpenAi => Box::new(OpenAiSignIn::new(
+                self.cfg.openai.clone(),
+                self.registry.clone(),
+                self.state.clone(),
+                up,
+            )),
+        }
     }
 }
 
