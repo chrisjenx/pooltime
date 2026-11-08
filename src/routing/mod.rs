@@ -5,6 +5,7 @@
 //! pure apart from the round-robin cursor, which advances only when the winning score is
 //! tied.
 
+pub mod reserve;
 pub mod score;
 pub mod tuning;
 
