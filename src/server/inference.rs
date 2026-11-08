@@ -28,7 +28,7 @@ use time::OffsetDateTime;
 
 use super::classifier;
 use super::fallback::{self, ProviderPool, Served, Verdict};
-use super::router::read_json;
+use super::router::{read_json, BodyReadAborted};
 use super::AppState;
 use crate::accounts::{AccountId, AccountMeta, AccountStatus, RateLimitSnapshot};
 use crate::errors::{FailReason, RefreshErrorKind};
@@ -77,6 +77,11 @@ pub async fn messages(State(app): State<Arc<AppState>>, req: Request) -> Respons
     let (raw_body, json) = match read_json(&parts.headers, body).await {
         Ok(v) => v,
         Err(resp) => {
+            // The body broke off mid-read: the client went away. Nothing is recorded, so the
+            // entry is written as `client_cancelled` (no status: no response reached anyone).
+            if resp.extensions().get::<BodyReadAborted>().is_some() {
+                return resp;
+            }
             journal.respond(
                 resp.status().as_u16(),
                 "error",
@@ -123,6 +128,7 @@ async fn handle(app: &Arc<AppState>, req: InboundRequest) -> Response {
         Verdict::Failed(r) => ("error", Some(r.detail())),
         Verdict::NoAccount => ("error", Some("no_account".to_string())),
     };
+    journal.set_served_provider(served.provider.as_str());
     journal.respond(served.response.status().as_u16(), outcome, reason);
     served.response
 }
@@ -380,6 +386,7 @@ async fn serve_provider(
                 &format!("pooltime: no {pid} provider is available to serve this request"),
             ),
             verdict: Verdict::NoAccount,
+            provider: pid,
         };
     };
     let family = family_for(pid, &req.model);
@@ -474,6 +481,7 @@ async fn serve_provider(
                 return Served {
                     response: resp,
                     verdict: Verdict::Served,
+                    provider: pid,
                 };
             }
             AttemptOutcome::Terminal(mut resp, reason) => {
@@ -491,6 +499,7 @@ async fn serve_provider(
                 return Served {
                     response: resp,
                     verdict: Verdict::Failed(reason),
+                    provider: pid,
                 };
             }
             AttemptOutcome::Retry {
@@ -535,6 +544,7 @@ async fn serve_provider(
             Served {
                 response: resp,
                 verdict: Verdict::Failed(reason),
+                provider: pid,
             }
         }
         None => Served {
@@ -548,6 +558,7 @@ async fn serve_provider(
                 },
             ),
             verdict: Verdict::NoAccount,
+            provider: pid,
         },
     }
 }

@@ -563,6 +563,15 @@ async fn retention_prunes_journal() {
     assert_eq!(RetentionCfg::default().journal_days, 30);
     assert_eq!(RetentionCfg::default().journal_max_requests, 100_000);
 
+    // A ceiling of 0 means "no ceiling", not "delete everything".
+    let unlimited = RetentionCfg {
+        journal_max_requests: 0,
+        ..RetentionCfg::default()
+    };
+    let rep = prune(&store, &unlimited, now).await.unwrap();
+    assert_eq!(rep.journal_requests_by_size, 0);
+    assert_eq!(store.read(journal::count).unwrap(), 5);
+
     // Row ceiling: the newest N survive, attempts follow their requests.
     let cfg = RetentionCfg {
         journal_max_requests: 3,
@@ -629,4 +638,68 @@ async fn journal_views_serve_the_fixture() {
     assert_eq!(tl["events"].as_array().unwrap().len(), 1);
     let st = mgmt(addr, "GET", "/api/v1/stats", None).await.json();
     assert_eq!(st, fixture["journal"]["stats"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lookup_flushes_a_still_queued_row_and_favicon_is_not_an_error() {
+    let pool = Pool::new();
+    let booted = pool.boot(Boot::default()).await;
+    let addr = booted.addr;
+
+    // Browsers' favicon probe: answered, never journaled as an unknown path.
+    let fav = http_req(addr, "GET", "/favicon.ico", &[], b"").await;
+    assert_eq!(fav.status, 204);
+
+    // Keep the store writer busy so the next row waits in its queue.
+    booted
+        .app
+        .store
+        .submit(|_| {
+            std::thread::sleep(Duration::from_millis(400));
+            Ok(())
+        })
+        .unwrap();
+    let r = http_req(addr, "GET", "/v1/nope", &[], b"").await;
+    assert_eq!(r.status, 404);
+    let id = r.header(REQUEST_ID_HEADER).unwrap().to_string();
+    // One lookup, no polling: the server flushes the queue before answering 404.
+    let d = mgmt(addr, "GET", &format!("/api/v1/requests/{id}"), None).await;
+    assert_eq!(d.status, 200, "{}", d.text());
+    assert_eq!(d.json()["request"]["reason"], "unknown_path");
+
+    let all = mgmt(addr, "GET", "/api/v1/requests", None).await.json();
+    let paths: Vec<&str> = all["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["path"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(paths, ["/v1/nope"], "favicon must not be journaled");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_hangup_is_client_cancelled() {
+    let pool = Pool::new();
+    let booted = pool.boot(Boot::default()).await;
+    // Headers promise 1000 bytes; the client sends 10 and hangs up.
+    let head =
+        "POST /v1/messages HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\n\
+                content-length: 1000\r\n\r\n{\"model\":";
+    let client = raw_client(booted.addr, head.as_bytes()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.abort();
+    let mut row = Value::Null;
+    for _ in 0..100 {
+        let list = mgmt(booted.addr, "GET", "/api/v1/requests", None)
+            .await
+            .json();
+        if let Some(r) = list["requests"].as_array().unwrap().first() {
+            row = r.clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(row["outcome"], "client_cancelled", "{row}");
+    assert!(row["reason"].is_null(), "{row}");
+    assert!(row["status"].is_null(), "{row}");
 }

@@ -367,6 +367,8 @@ struct Draft {
     response_outcome: Option<&'static str>,
     /// End of the streamed body (wins over `response_outcome`).
     stream_outcome: Option<&'static str>,
+    /// The provider whose response reached the client (wins over the last attempt's).
+    served_provider: Option<String>,
 }
 
 struct Live {
@@ -406,7 +408,9 @@ impl Drop for Live {
         let mut row = std::mem::take(&mut d.row);
         row.outcome = outcome.to_string();
         row.total_ms = Some(total);
-        if let Some(last) = d.attempts.last() {
+        if let Some(p) = d.served_provider.take() {
+            row.provider = Some(p);
+        } else if let Some(last) = d.attempts.last() {
             row.provider = Some(last.provider.clone());
         }
         let attempts = std::mem::take(&mut d.attempts);
@@ -481,6 +485,12 @@ impl Journal {
         self.with(|d, _| d.row.provider = Some(provider.to_string()));
     }
 
+    /// The provider whose response is returned (with cross-provider fallback this can be the
+    /// first provider even though the last attempt ran on the other one).
+    pub fn set_served_provider(&self, provider: &str) {
+        self.with(|d, _| d.served_provider = Some(provider.to_string()));
+    }
+
     /// `metadata.user_id`, stored only as its hash.
     pub fn set_session(&self, user_id: &str) {
         self.with(|d, _| d.row.session_hash = Some(crate::logging::hash_session(user_id)));
@@ -514,6 +524,12 @@ impl Journal {
         self.with(|d, _| {
             let Some(open) = d.open.take() else { return };
             let n = d.attempts.len() as u32 + 1;
+            // A committed stream may already have ended (its guard ran first): the serving
+            // attempt takes the stream end, as `stream_end` would have given it.
+            let outcome = match d.stream_outcome {
+                Some(s) if outcome == "completed" => s,
+                _ => outcome,
+            };
             d.attempts.push(AttemptRow {
                 n,
                 account: open.account,
@@ -590,6 +606,26 @@ mod tests {
         assert_eq!(safe_upstream_id("has spaces"), None);
         assert_eq!(safe_upstream_id(""), None);
         assert_eq!(safe_upstream_id(&"x".repeat(129)), None);
+    }
+
+    #[tokio::test]
+    async fn stream_end_before_end_attempt_still_lands_on_the_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("pooltime.db")).unwrap());
+        let j = Journal::start(store.clone(), "req_race", OffsetDateTime::now_utc());
+        j.begin_attempt("a1", "anthropic");
+        // The pump's guard drops before the handler records the attempt.
+        j.stream_end("idle_timeout");
+        j.end_attempt("completed", None);
+        j.set_served_provider("openai");
+        j.respond(200, "completed", None);
+        drop(j);
+        store.exec(|_| Ok(())).await.unwrap();
+        let (r, a) = store.read(|c| get(c, "req_race")).unwrap().unwrap();
+        assert_eq!(r.outcome, "idle_timeout");
+        assert_eq!(a[0].outcome, "idle_timeout");
+        // The served provider wins over the last attempt's.
+        assert_eq!(r.provider.as_deref(), Some("openai"));
     }
 
     #[tokio::test]

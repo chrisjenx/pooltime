@@ -155,6 +155,11 @@ pub async fn read_json(headers: &HeaderMap, body: Body) -> Result<(Bytes, Value)
     read_json_limited(headers, body, BODY_LIMIT).await
 }
 
+/// Marks the error response of a request body that broke off mid-read (normally the client
+/// going away), so the inference handler journals it as `client_cancelled`.
+#[derive(Debug, Clone, Copy)]
+pub struct BodyReadAborted;
+
 /// [`read_json`] with an explicit byte limit (tests lower it). The limit is enforced here, while
 /// accumulating frames, so overflow is a plain comparison rather than an error to be recognised.
 #[allow(clippy::result_large_err)]
@@ -182,11 +187,13 @@ pub async fn read_json_limited(
     while let Some(chunk) = stream.next().await {
         // An error here is the client going away (or a malformed chunked body) mid-request.
         let chunk = chunk.map_err(|_| {
-            anthropic_error(
+            let mut r = anthropic_error(
                 400,
                 "invalid_request_error",
                 "pooltime: could not read request body",
-            )
+            );
+            r.extensions_mut().insert(BodyReadAborted);
+            r
         })?;
         if buf.len() + chunk.len() > limit {
             return Err(too_large());
