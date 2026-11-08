@@ -3,7 +3,7 @@
 pooltime is one binary for macOS (arm64, x86_64) and Linux (x86_64, arm64; static musl builds).
 There is no Windows build.
 
-> These docs describe the `main` branch, which becomes **v1.0.0**. v0.1.0 has the proxy, accounts,
+> These docs describe pooltime **v1.0.0** or later. v0.1.0 has the proxy, accounts,
 > profiles, import, service and dashboard, but not: the `expiring`/`erroring` states and
 > `pooltime accounts relogin`, the status line (`pooltime statusline`, `connect --statusline`),
 > desktop notifications, the request journal (`pooltime logs --request`, Requests/Events views),

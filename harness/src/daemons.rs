@@ -79,6 +79,11 @@ impl Daemon {
         self.child.id()
     }
 
+    /// pooltime's management key (`None` for bro, whose status API is unauthenticated).
+    pub fn mgmt_key(&self) -> Option<&str> {
+        self.mgmt_key.as_deref()
+    }
+
     /// True when the `security` shim was invoked (bro tried the Keychain).
     pub fn keychain_touched(&self) -> bool {
         self.sandbox.join("keychain-calls.log").exists()
@@ -334,7 +339,10 @@ pub async fn start_bro(
         .env("CODEX_API_BASE_URL", &o)
         .env("OPENAI_OAUTH_TOKEN_URL", format!("{o}{OAUTH_TOKEN}"))
         .env("CODEX_USAGE_URL", format!("{o}/wham/usage"))
-        .env("CLAUDE_USAGE_REFRESH", "0")
+        .env(
+            "CLAUDE_USAGE_REFRESH",
+            if scenario.usage_polling { "1" } else { "0" },
+        )
         .env("OVERLOAD_RETRY_MAX", OVERLOAD_RETRY_MAX.to_string())
         .env("OVERLOAD_RETRY_BASE_MS", OVERLOAD_BASE_MS.to_string())
         .env("OVERLOAD_RETRY_MAX_DELAY_MS", OVERLOAD_CAP_MS.to_string())
@@ -365,6 +373,7 @@ fn seed_pooltime(
 ) -> anyhow::Result<()> {
     let a = up.anthropic.url();
     let o = up.openai.url();
+    let usage_refresh = scenario.usage_polling;
     let config = format!(
         r#"host = "127.0.0.1"
 port = {port}
@@ -378,7 +387,7 @@ overload_retry_cap = "{OVERLOAD_CAP_MS}ms"
 api_base = "{a}"
 token_url = "{a}{TOKEN}"
 profile_url = "{a}/api/oauth/profile"
-usage_refresh = false
+usage_refresh = {usage_refresh}
 
 [openai]
 api_base = "{o}"

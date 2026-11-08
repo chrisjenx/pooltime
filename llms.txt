@@ -81,7 +81,9 @@ pooltime accounts login personal
 With a local browser this opens it and waits for the redirect. Headless / SSH (pooltime picks
 paste mode automatically when `SSH_TTY` is set, or on Linux without DISPLAY/WAYLAND_DISPLAY; force
 it with `--mode paste`): pooltime prints a URL; the human opens it in any browser, signs in, and
-pastes the `code#state` line the page shows at the `Code:` prompt on stdin.
+pastes the `code#state` line the page shows at the `Code:` prompt on stdin. Paste mode reads that
+line from an interactive terminal, so the user must run it in their own terminal, not through the
+`!` prefix (which has no stdin for the prompt) and not from your tool call:
 
 ```sh
 pooltime accounts login personal --mode paste
@@ -116,7 +118,8 @@ the same timeout advice).
 - `--import-bro`: import accounts/settings from bro-cli (when ~/.claude-max-pool or ~/.bro exists and
   pooltime has no accounts yet).
 - `--account NAME`: sign in a first Claude account (when pooltime has none and nothing is imported).
-  This is a sign-in: see step 4. Optional `--email EMAIL`, `--mode callback|paste`.
+  This is a sign-in: see step 4. Optional `--email EMAIL`, `--mode callback|paste` (paste: the
+  user runs it in their own terminal, see step 4).
 - `--service`: install the background service (launchd on macOS, systemd --user on Linux).
 - `--connect PROFILES`: comma-separated profile ids from step 3 (`default,claude-personal`).
 - `--yes` / `-y`: never ask; also binds a first sign-in to the account without asking.

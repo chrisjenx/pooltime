@@ -3,7 +3,7 @@
 //! Format (stable; scripts should use `--json`):
 //!
 //! ```text
-//! pooltime 0.1.0 on 127.0.0.1:3460
+//! pooltime 1.0.0 on 127.0.0.1:3460
 //! pool 2/3 ready · 7d 23% left
 //! this week: 1.4 subs used · on pace for ~2.6 of 3
 //!
