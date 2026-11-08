@@ -2,6 +2,8 @@
 //! implements, plus the shared entitlement-message classifier.
 //! Task 24 adds `fn signin(&self) -> &dyn signin::SignInFlow` to the trait.
 
+pub mod anthropic;
+
 use std::fmt;
 use std::str::FromStr;
 
