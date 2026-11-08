@@ -18,7 +18,9 @@ pooltime connect --all              # every ~/.claude* profile found
 pooltime connect ~/work/claude-dir  # any settings directory, by path (contains a /)
 ```
 
-A bare word is always a profile id, never a path relative to the current directory.
+A bare word is always a profile id, never a path relative to the current directory. A profile's
+id is its directory name without leading dots, so two directories with the same name (say
+`/a/.claude-x` and `/b/.claude-x`) cannot both be connected: `connect` refuses the second (`disconnect` still releases either).
 
 Options:
 
