@@ -58,10 +58,15 @@ pub(crate) fn keys_match(presented: &str, expected: &str) -> bool {
         == 0
 }
 
-/// Paths the Host/Origin guard covers: the dashboard (`/`, `/assets/*`) and the management API
-/// (`/api/*`).
+/// Paths the Host/Origin guard covers: the dashboard (`/`, `/assets/*`), the management API
+/// (`/api/*`) and the MCP endpoint (`/mcp`: the DNS-rebinding protection MCP's HTTP transport
+/// asks for).
 fn is_guarded(path: &str) -> bool {
-    path == "/" || path == "/api" || path.starts_with("/api/") || path.starts_with("/assets/")
+    path == "/"
+        || path == "/api"
+        || path.starts_with("/api/")
+        || path.starts_with("/assets/")
+        || path == "/mcp"
 }
 
 /// Reject requests to `/`, `/assets/*` and `/api/*` whose `Host` is not `127.0.0.1:<port>` / `localhost:<port>`
@@ -143,5 +148,6 @@ mod tests {
         assert!(is_guarded("/assets/app.js"));
         assert!(!is_guarded("/health"));
         assert!(!is_guarded("/v1/messages"));
+        assert!(is_guarded("/mcp"));
     }
 }

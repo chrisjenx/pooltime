@@ -584,20 +584,20 @@ async fn connect_disconnect_restores_original_statusline() {
     // With an original status line: wrapped, snapshotted, restored exactly.
     let p = fx.profile(".claude-work");
     set_statusline(&p, original.clone());
-    connect_with(fx.app(), std::slice::from_ref(&p), Some(&bin))
+    connect_with(fx.app(), std::slice::from_ref(&p), Some(&bin), false)
         .await
         .unwrap();
     assert_eq!(json_of(&p.settings_json)["statusLine"], wrapper);
     assert_eq!(snap_of("claude-work")["statusline_prior"], original);
     // Re-connecting changes nothing and never snapshots our own wrapper as the prior.
-    let again = connect_with(fx.app(), std::slice::from_ref(&p), Some(&bin))
+    let again = connect_with(fx.app(), std::slice::from_ref(&p), Some(&bin), false)
         .await
         .unwrap();
     assert_eq!(again, vec![(p.id.clone(), WriteOutcome::Unchanged)]);
     assert_eq!(snap_of("claude-work")["statusline_prior"], original);
     // Another binary path: the wrapper follows, the prior stays the user's.
     let moved = PathBuf::from("/usr/local/bin/pooltime");
-    connect_with(fx.app(), std::slice::from_ref(&p), Some(&moved))
+    connect_with(fx.app(), std::slice::from_ref(&p), Some(&moved), false)
         .await
         .unwrap();
     assert_eq!(
@@ -617,7 +617,7 @@ async fn connect_disconnect_restores_original_statusline() {
 
     // Without one: the key is removed again on disconnect.
     let q = fx.profile(".claude-other");
-    connect_with(fx.app(), std::slice::from_ref(&q), Some(&bin))
+    connect_with(fx.app(), std::slice::from_ref(&q), Some(&bin), false)
         .await
         .unwrap();
     assert_eq!(

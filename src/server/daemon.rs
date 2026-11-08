@@ -66,6 +66,7 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
     ]));
     let models = ModelTable::load(&paths)?;
     let mgmt_key = mgmt::ensure_mgmt_key(&paths)?;
+    let mcp_key = crate::mcp::ensure_mcp_key(&paths)?;
     let fixture_state = load_fixture_state()?;
     let upstream = Arc::new(Upstream::new());
 
@@ -131,6 +132,7 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
             mgmt_key,
         )
         .with_upstream(upstream)
+        .with_mcp_key(mcp_key)
         .with_fixture_state(fixture_state),
     );
 

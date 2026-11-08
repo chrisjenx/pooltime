@@ -1,9 +1,11 @@
 //! Claude Code integration: profile discovery and guarded patching of the
 //! JSON files Claude Code itself rewrites (`settings.json`, `.claude.json`),
-//! plus the reversible `settings.json` `env` override.
+//! plus the reversible `settings.json` `env` override and the pool's MCP registration in
+//! `.claude.json` ([`mcp`]).
 
 mod connect;
 mod fable_cache;
+pub mod mcp;
 mod pins;
 mod profile;
 mod safe_write;

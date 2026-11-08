@@ -8,6 +8,7 @@ pub mod fsutil;
 pub mod health;
 pub mod import;
 pub mod logging;
+pub mod mcp;
 pub mod models;
 pub mod providers;
 pub mod routing;
