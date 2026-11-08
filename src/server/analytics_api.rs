@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 use super::mgmt::{bad, blocking, internal, ok};
 use super::AppState;
 use crate::analytics::burn::{self, DEFAULT_WEEKS, MAX_WEEKS};
-use crate::analytics::local_offset;
+use crate::analytics::{local_offset, pool_of};
 
 fn weeks_of(q: &HashMap<String, String>) -> Result<u32, String> {
     match q.get("weeks").map(String::as_str) {
@@ -45,25 +45,18 @@ pub(super) async fn burn(
     let now = OffsetDateTime::now_utc();
     let a = app.clone();
     let res = blocking(move || {
-        let pool: Vec<(String, Option<String>)> = a
-            .registry
-            .list()
-            .into_iter()
-            .map(|m| {
-                let plan = a
-                    .registry
-                    .read_creds(&m.id)
-                    .ok()
-                    .flatten()
-                    .and_then(|c| c.plan);
-                (m.id.to_string(), plan)
-            })
-            .collect();
-        burn::report(&a.store, now, local_offset(now), weeks).map(|r| r.with_pool(&pool))
+        let pool = pool_of(&a.registry);
+        burn::report(&a.store, now, local_offset(now), weeks, &pool)
     })
     .await;
     match res {
-        Ok(Ok(r)) => ok(serde_json::to_value(r).unwrap_or_default()),
+        Ok(Ok(r)) => match serde_json::to_value(r) {
+            Ok(v) => ok(v),
+            Err(e) => {
+                tracing::error!(error = %e, "serializing the weekly burn failed");
+                internal("could not encode the weekly burn")
+            }
+        },
         Ok(Err(e)) => {
             tracing::warn!(error = %format!("{e:#}"), "computing the weekly burn failed");
             internal("could not read the usage history")

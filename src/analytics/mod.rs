@@ -9,6 +9,26 @@ pub mod sampler;
 
 use time::{OffsetDateTime, UtcOffset};
 
+use crate::accounts::Registry;
+
+/// The configured accounts as `(id, plan)` for [`burn::report`]. The plan is the one already
+/// stored with the account's credentials (from its OAuth profile); nothing is fetched. Blocking
+/// (reads account files).
+pub fn pool_of(registry: &Registry) -> Vec<(String, Option<String>)> {
+    registry
+        .list()
+        .into_iter()
+        .map(|m| {
+            let plan = registry
+                .read_creds(&m.id)
+                .ok()
+                .flatten()
+                .and_then(|c| c.plan);
+            (m.id.to_string(), plan)
+        })
+        .collect()
+}
+
 /// The machine's local UTC offset at `at` (weeks start Monday 00:00 local time), or UTC when it
 /// cannot be determined.
 pub fn local_offset(at: OffsetDateTime) -> UtcOffset {

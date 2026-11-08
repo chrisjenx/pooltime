@@ -287,6 +287,7 @@
       ? "On pace for ~" + subs(f.projected) + " of " + f.accounts + " subs this week"
       : "This week just started: no forecast yet";
     return h("div", { class: "panel" }, title,
+      ui.burnError ? h("p", { class: "msg err", text: "Stale: the last refresh failed (" + ui.burnError + ")" }) : null,
       h("p", { class: "sub" }, h("strong", { text: pace }), " · " + subs(f.subs_used_so_far) + " used so far (" + pct(f.elapsed_fraction || 0) + " of the week)"),
       burnChart(b),
       idle.length

@@ -1,12 +1,22 @@
 //! Weekly subscription burn (spec §5): per local ISO week, the sum over accounts of the 7-day
 //! window utilization consumed in that week (1 account = 1 sub).
 //!
-//! Per account, consumption is the sum of positive deltas between consecutive samples; a window
-//! reset starts a new segment whose value counts from 0 (see [`crate::store::usage_history`]). A
-//! delta whose two samples straddle a week boundary is split linearly by time. The current week
-//! is extrapolated linearly from its elapsed fraction (`projected = so_far / elapsed`), but only
-//! once an hour has passed (`null` before). Accounts that consumed less than [`IDLE_BELOW`] this
-//! week are "idle".
+//! Per account, consumption is the rise of the window's high-water mark between consecutive
+//! samples (dips never count); a window reset starts a new segment whose value counts from 0 (see
+//! [`crate::store::usage_history`]). A delta whose two samples straddle a week boundary is split
+//! linearly by time. The current week is extrapolated linearly from its elapsed fraction
+//! (`projected = so_far / elapsed`), but only once an hour has passed (`null` before). Accounts
+//! that consumed less than [`IDLE_BELOW`] this week are "idle".
+//!
+//! Accepted limitations:
+//! - An account's **first sample consumes nothing**: the utilization it already shows was used
+//!   at an unknown time before sampling began.
+//! - **DST**: weeks are cut at the machine's *current* UTC offset ([`super::local_offset`]), also
+//!   for historical weeks. Across a DST change a week boundary moves by an hour, so a delta near a
+//!   boundary may land in the neighbouring week; buckets are assigned by their midpoint, so a
+//!   downsampled bucket never changes week.
+//! - Use in the windows between two resets that both fall inside one gap between samples is
+//!   lost (unknowable).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -86,14 +96,7 @@ fn labels(start: i64, offset: UtcOffset) -> (String, String) {
     let date = OffsetDateTime::from_unix_timestamp(start)
         .map(|t| t.to_offset(offset).date())
         .unwrap_or(time::Date::MIN);
-    let (y, w) = (date.year(), date.iso_week());
-    let iso_year = if w >= 52 && date.month() == time::Month::January {
-        y - 1
-    } else if w == 1 && date.month() == time::Month::December {
-        y + 1
-    } else {
-        y
-    };
+    let (iso_year, w, _) = date.to_iso_week_date();
     (
         format!("{iso_year}-W{w:02}"),
         format!(
@@ -115,32 +118,39 @@ pub fn compute(rows: &[HistRow], now: i64, offset: UtcOffset, weeks: u32) -> Bur
 
     // account -> week start -> consumed
     let mut per: BTreeMap<String, HashMap<i64, f64>> = BTreeMap::new();
-    let mut prev: Option<(&str, usage_history::Point)> = None;
+    // (account, last reading, high-water mark after it)
+    let mut prev: Option<(&str, usage_history::Point, f64)> = None;
     for r in rows {
         let acc = per.entry(r.account.clone()).or_default();
         let mut add = |ws: i64, c: f64| *acc.entry(ws).or_default() += c;
-        if r.consumed > 0.0 {
-            add(week_start(r.anchor(), off), r.consumed);
-        }
-        if let Some((_, last)) = prev.filter(|(pa, _)| *pa == r.account) {
-            let (c, mut t0) = step(&last, &r.first);
-            let t1 = r.first.ts;
-            if c > 0.0 {
-                if t1 <= t0 {
-                    add(week_start(t1, off), c);
-                } else {
-                    // Split linearly by time across the week boundaries in [t0, t1].
-                    let span = (t1 - t0) as f64;
-                    while t0 < t1 {
-                        let ws = week_start(t0, off);
-                        let end = (ws + WEEK).min(t1);
-                        add(ws, c * (end - t0) as f64 / span);
-                        t0 = end;
+        let h = match prev.filter(|(pa, _, _)| *pa == r.account) {
+            Some((_, last, hw)) => {
+                let s = step(&last, hw, &r.first);
+                let (c, mut t0, t1) = (s.consumed, s.from, r.first.ts);
+                if c > 0.0 {
+                    if t1 <= t0 {
+                        add(week_start(t1, off), c);
+                    } else {
+                        // Split linearly by time across the week boundaries in [t0, t1].
+                        let span = (t1 - t0) as f64;
+                        while t0 < t1 {
+                            let ws = week_start(t0, off);
+                            let end = (ws + WEEK).min(t1);
+                            add(ws, c * (end - t0) as f64 / span);
+                            t0 = end;
+                        }
                     }
                 }
+                s.hw
             }
+            // The first reading of an account consumes nothing (when it was used is unknown).
+            None => r.first.util,
+        };
+        let (inner, end_hw) = r.inner(h);
+        if inner > 0.0 {
+            add(week_start(r.anchor(), off), inner);
         }
-        prev = Some((r.account.as_str(), r.last));
+        prev = Some((r.account.as_str(), r.last, end_hw));
     }
 
     let weeks: Vec<WeekBurn> = (0..i64::from(weeks))
@@ -193,19 +203,22 @@ pub fn compute(rows: &[HistRow], now: i64, offset: UtcOffset, weeks: u32) -> Bur
     }
 }
 
-/// [`compute`] over the store's 7-day history (a blocking read; call off the async threads).
+/// The burn report over the store's 7-day history, scoped to the configured accounts `pool`
+/// (`(id, plan)`, from [`super::pool_of`]; see [`BurnReport::with_pool`]). A blocking read: call
+/// off the async threads.
 pub fn report(
     store: &Store,
     now: OffsetDateTime,
     offset: UtcOffset,
     weeks: u32,
+    pool: &[(String, Option<String>)],
 ) -> anyhow::Result<BurnReport> {
     let weeks = weeks.clamp(1, MAX_WEEKS);
     let now = now.unix_timestamp();
     let off = i64::from(offset.whole_seconds());
     let since = week_start(now, off) - i64::from(weeks - 1) * WEEK;
     let rows = store.read(|c| usage_history::rows_since(c, WINDOW_7D, since))?;
-    Ok(compute(&rows, now, offset, weeks))
+    Ok(compute(&rows, now, offset, weeks).with_pool(pool))
 }
 
 impl BurnReport {
@@ -321,6 +334,67 @@ mod tests {
         assert!(close(of(cur, "b"), 0.24 * 7.0 / 24.0), "{cur:?}");
     }
 
+    fn this_week(rows: Vec<HistRow>, account: &str) -> f64 {
+        let r = compute(&sorted(rows), MON + 5 * DAY, UtcOffset::UTC, 1);
+        of(r.weeks.last().unwrap(), account)
+    }
+
+    #[test]
+    fn jitter_never_inflates_consumption() {
+        let r = MON + 6 * DAY;
+        // dip and recovery: 0.42 -> 0.41 -> 0.42 consumes nothing
+        let dip = vec![
+            raw("a", MON + H, 0.42, r),
+            raw("a", MON + 2 * H, 0.41, r),
+            raw("a", MON + 3 * H, 0.42, r),
+        ];
+        assert!(close(this_week(dip, "a"), 0.0));
+        // a 3-point drop with the same resets_at is not a reset (and lowers no baseline)
+        let drop = vec![
+            raw("a", MON + H, 0.82, r),
+            raw("a", MON + 2 * H, 0.79, r),
+            raw("a", MON + 3 * H, 0.83, r),
+        ];
+        assert!(close(this_week(drop, "a"), 0.01), "high-water 0.82 -> 0.83");
+        // without resets_at, a large drop still reads as a reset
+        let none = |ts, util| {
+            HistRow::raw(
+                "a",
+                WINDOW_7D,
+                Point {
+                    ts,
+                    util,
+                    reset: None,
+                },
+            )
+        };
+        let drop = vec![none(MON + H, 0.82), none(MON + 2 * H, 0.10)];
+        assert!(close(this_week(drop, "a"), 0.10));
+    }
+
+    #[test]
+    fn resets_at_move_without_drop_counts_from_zero() {
+        let rows = vec![
+            raw("a", MON + H, 0.3, MON + 2 * DAY),
+            raw("a", MON + 3 * DAY, 0.4, MON + 9 * DAY),
+        ];
+        assert!(close(this_week(rows, "a"), 0.4));
+    }
+
+    #[test]
+    fn two_resets_in_one_gap_accrue_only_in_the_last_window() {
+        // 0.5 two weeks back (resets at MON - 7d); next reading on Wednesday after two resets
+        // (resets_at now MON + 7d, so the current window started MON). The intermediate window's
+        // use is unknowable and lost; the 0.3 accrues from MON, not from two weeks back.
+        let rows = sorted(vec![
+            raw("a", MON - 10 * DAY, 0.5, MON - 7 * DAY),
+            raw("a", MON + 2 * DAY, 0.3, MON + 7 * DAY),
+        ]);
+        let r = compute(&rows, MON + 5 * DAY, UtcOffset::UTC, 3);
+        assert!(close(of(&r.weeks[2], "a"), 0.3), "{r:?}");
+        assert!(close(of(&r.weeks[1], "a"), 0.0), "{r:?}");
+    }
+
     #[test]
     fn forecast_linear_from_elapsed() {
         let rows = sorted(vec![
@@ -402,7 +476,7 @@ mod tests {
                     util = 0.0;
                 }
                 if r < 0.1 {
-                    util = (util - 0.005).max(0.0); // rounding dip
+                    util = (util - 0.015 * (1.0 + r * 10.0)).max(0.0); // jitter dip (0.015..0.03)
                 } else {
                     util = (util + r * 0.03).min(1.0);
                 }
@@ -411,7 +485,8 @@ mod tests {
                     Point {
                         ts,
                         util,
-                        reset: Some(reset),
+                        // now and then a reading without resets_at
+                        reset: (!seed.is_multiple_of(9)).then_some(reset),
                     },
                 ));
                 ts += 6 * H + (seed % 600) as i64;
@@ -440,7 +515,8 @@ mod tests {
             .await
             .unwrap();
         let weeks = 60;
-        let before = report(&store, now, offset, weeks).unwrap();
+        let pool = [("alpha".to_string(), None), ("beta".to_string(), None)];
+        let before = report(&store, now, offset, weeks, &pool).unwrap();
         assert!(before.weeks.iter().filter(|w| w.subs_used > 0.5).count() > 50);
 
         // Retention at the local offset: raw > 30 d -> daily, daily > 1 y -> weekly.
@@ -469,7 +545,7 @@ mod tests {
         let tier_names: Vec<&str> = tiers.iter().map(|t| t.0.as_str()).collect();
         assert_eq!(tier_names, ["daily", "hourly", "weekly"], "{tiers:?}");
 
-        let after = report(&store, now, offset, weeks).unwrap();
+        let after = report(&store, now, offset, weeks, &pool).unwrap();
         assert_eq!(before.weeks.len(), after.weeks.len());
         for (b, a) in before.weeks.iter().zip(&after.weeks) {
             assert_eq!(b.week, a.week);

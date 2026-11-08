@@ -85,16 +85,20 @@ ALTER TABLE journal_requests ADD COLUMN reason TEXT;
 ";
 
 /// Schema v4 (spec §5/§6, Task F5): downsampled `usage_samples` rows (`daily`, `weekly`) keep
-/// enough to total weekly burn exactly: `consumed` (summed positive deltas between the samples
+/// enough to total weekly burn exactly: `consumed` (high-water consumption between the samples
 /// inside the bucket, resets handled), the bucket's first sample (`first_ts`, `first_util`,
-/// `first_reset`) and the time of its last (`last_ts`; the last value is `utilization`/`reset`).
-/// Raw rows (`hourly`) leave them NULL.
+/// `first_reset`), the time of its last (`last_ts`; the last value is `utilization`/`reset`), and
+/// `seg_max`/`last_hw`/`resets` to re-base `consumed` on the carried-in high-water mark (see
+/// `usage_history`). Raw rows (`hourly`) leave them NULL.
 const V4: &str = "
 ALTER TABLE usage_samples ADD COLUMN consumed REAL;
 ALTER TABLE usage_samples ADD COLUMN first_ts INTEGER;
 ALTER TABLE usage_samples ADD COLUMN first_util REAL;
 ALTER TABLE usage_samples ADD COLUMN first_reset INTEGER;
 ALTER TABLE usage_samples ADD COLUMN last_ts INTEGER;
+ALTER TABLE usage_samples ADD COLUMN seg_max REAL;
+ALTER TABLE usage_samples ADD COLUMN last_hw REAL;
+ALTER TABLE usage_samples ADD COLUMN resets INTEGER;
 ";
 
 /// Bring the database to [`SCHEMA_VERSION`]. Each step runs in one transaction

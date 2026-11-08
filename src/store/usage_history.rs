@@ -6,15 +6,25 @@
 //! A **raw** row (`granularity = 'hourly'`, kept 30 days) is one sample: `ts`, `utilization`
 //! (0-1) and `reset` (the window's `resets_at`, unix seconds). A **bucket** row (`daily`, then
 //! `weekly`) stands for every sample of one account in one local day / ISO week: `ts` is the
-//! bucket start, `consumed` the consumption *between* those samples, `first_*` its first sample
-//! and `last_ts` + `utilization`/`reset` its last. Consumption between two rows is computed from
-//! the earlier row's last sample and the later row's first, so totals do not depend on which
-//! tier the history currently sits in.
+//! bucket start, `first_*` its first sample, `last_ts` + `utilization`/`reset` its last, and
+//! `consumed` the consumption *between* those samples assuming the high-water mark started at the
+//! bucket's first reading. `seg_max` (the highest reading before the first reset inside the
+//! bucket), `last_hw` (the high-water mark at its end) and `resets` (resets inside it) let a reader
+//! re-base `consumed` on the high-water mark actually carried in ([`HistRow::inner`]).
+//! Consumption between two rows is computed from the earlier row's last sample and the later
+//! row's first, so totals do not depend on which tier the history currently sits in.
 //!
 //! # Consumption
-//! Between consecutive samples `a -> b`: `max(0, b - a)`, unless the window reset in between
-//! (utilization dropped by more than [`RESET_DROP`], or `resets_at` moved forward by at least
-//! [`RESET_ADVANCE_SECS`]); then the post-reset value counted from 0, i.e. `b`.
+//! Per window segment (between resets) consumption is the rise of the high-water mark: a reading
+//! `b` after high-water `hw` consumes `max(0, b - hw)`, and a dip never lowers `hw`, so jitter
+//! (0.42 -> 0.41 -> 0.42) consumes nothing. A **reset** starts a new segment whose value counts
+//! from 0 (consumes `b`). When both readings carry `resets_at`, a reset is exactly `resets_at`
+//! moving forward by at least [`RESET_ADVANCE_SECS`]; only when either lacks it does a drop of
+//! more than [`RESET_DROP`] count as one.
+//!
+//! Post-reset consumption accrues from the old `resets_at` (when it falls between the readings)
+//! and never earlier than the new window's start (`new resets_at - 7 d`). When several resets fall
+//! inside one gap between readings, the use in the intermediate windows is unknowable and lost.
 
 use std::collections::HashMap;
 
@@ -23,8 +33,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 /// The `window` value of the account-wide 7-day window samples.
 pub const WINDOW_7D: &str = "7d";
-/// A utilization drop larger than this is a window reset (smaller dips are rounding noise between
-/// header and poll readings: whole percents vs fractions).
+/// Without `resets_at` on both readings, a utilization drop larger than this is a window reset
+/// (smaller dips are rounding noise between header and poll readings).
 pub const RESET_DROP: f64 = 0.02;
 /// `resets_at` moving forward by at least this is a window reset (it jitters by seconds otherwise).
 pub const RESET_ADVANCE_SECS: i64 = 3600;
@@ -70,7 +80,8 @@ impl Granularity {
     }
 }
 
-/// One `usage_samples` row (a raw sample has `first == last` and `consumed == 0`).
+/// One `usage_samples` row (a raw sample has `first == last`, `consumed == 0` and
+/// `seg_max == last_hw ==` its value).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistRow {
     pub account: String,
@@ -78,9 +89,16 @@ pub struct HistRow {
     pub gran: Granularity,
     /// Sample time (raw) or bucket start.
     pub ts: i64,
+    /// Consumption between the row's readings, high-water mark starting at `first.util`.
     pub consumed: f64,
     pub first: Point,
     pub last: Point,
+    /// Highest reading before the first reset inside the row (`>= first.util`).
+    pub seg_max: f64,
+    /// High-water mark after the last reading (high-water starting at `first.util`).
+    pub last_hw: f64,
+    /// Resets inside the row.
+    pub resets: u32,
 }
 
 impl HistRow {
@@ -93,6 +111,9 @@ impl HistRow {
             consumed: 0.0,
             first: p,
             last: p,
+            seg_max: p.util,
+            last_hw: p.util,
+            resets: 0,
         }
     }
 
@@ -100,35 +121,79 @@ impl HistRow {
     pub fn anchor(&self) -> i64 {
         self.first.ts + (self.last.ts - self.first.ts) / 2
     }
+
+    /// Consumption inside the row when the high-water mark after entering its first reading is
+    /// `h` (`>= first.util`), and the high-water mark after its last reading.
+    pub fn inner(&self, h: f64) -> (f64, f64) {
+        let consumed =
+            self.consumed - (self.seg_max - self.first.util) + (self.seg_max - h).max(0.0);
+        let end = if self.resets > 0 {
+            self.last_hw
+        } else {
+            h.max(self.seg_max)
+        };
+        (consumed, end)
+    }
 }
 
-/// Whether the window reset between `a` and the later reading `b`.
+/// Whether the window reset between `a` and the later reading `b` (see the module docs).
 pub fn is_reset(a: &Point, b: &Point) -> bool {
-    b.util < a.util - RESET_DROP
-        || matches!((a.reset, b.reset), (Some(ra), Some(rb)) if rb >= ra + RESET_ADVANCE_SECS)
+    match (a.reset, b.reset) {
+        (Some(ra), Some(rb)) => rb >= ra + RESET_ADVANCE_SECS,
+        _ => b.util < a.util - RESET_DROP,
+    }
 }
 
-/// Consumption between consecutive readings `a -> b`, and the time it started accruing: `a.ts`,
-/// or after a reset the old `resets_at` when that falls between the two readings.
-pub fn step(a: &Point, b: &Point) -> (f64, i64) {
+/// One transition between consecutive readings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Step {
+    pub consumed: f64,
+    /// When the consumption started accruing (it accrued linearly up to `b.ts`).
+    pub from: i64,
+    /// High-water mark after `b`.
+    pub hw: f64,
+    pub reset: bool,
+}
+
+/// The transition from reading `a` (with high-water mark `hw`) to the next reading `b`.
+pub fn step(a: &Point, hw: f64, b: &Point) -> Step {
     if is_reset(a, b) {
-        let from = a.reset.filter(|r| *r > a.ts && *r < b.ts).unwrap_or(a.ts);
-        (b.util.max(0.0), from)
+        let mut from = a.reset.filter(|r| *r > a.ts && *r < b.ts).unwrap_or(a.ts);
+        if let Some(rb) = b.reset {
+            from = from.max(rb - WEEK); // never before the new window opened
+        }
+        Step {
+            consumed: b.util.max(0.0),
+            from: from.min(b.ts),
+            hw: b.util,
+            reset: true,
+        }
     } else {
-        ((b.util - a.util).max(0.0), a.ts)
+        Step {
+            consumed: (b.util - hw).max(0.0),
+            from: a.ts,
+            hw: hw.max(b.util),
+            reset: false,
+        }
     }
 }
 
-/// Fold time-ordered rows of one account into one bucket's `(consumed, first, last)`.
-pub fn fold(rows: &[HistRow]) -> Option<(f64, Point, Point)> {
-    let first = rows.first()?;
-    let mut consumed = first.consumed;
-    let mut last = first.last;
+/// Fold time-ordered rows of one account into one bucket (`account`, `window`, `gran` and `ts`
+/// come from the first row; the caller sets the bucket's own).
+pub fn fold(rows: &[HistRow]) -> Option<HistRow> {
+    let mut acc = rows.first()?.clone();
     for r in &rows[1..] {
-        consumed += step(&last, &r.first).0 + r.consumed;
-        last = r.last;
+        let s = step(&acc.last, acc.last_hw, &r.first);
+        let (inner, end) = r.inner(s.hw);
+        acc.consumed += s.consumed + inner;
+        if acc.resets == 0 && !s.reset {
+            acc.seg_max = acc.seg_max.max(r.seg_max);
+        }
+        acc.resets += r.resets + u32::from(s.reset);
+        acc.last_hw = end;
+        acc.last = r.last;
     }
-    Some((consumed, first.first, last))
+    Some(acc)
 }
 
 /// Start (unix seconds) of the local day holding `ts`, at UTC offset `off` seconds.
@@ -143,7 +208,7 @@ pub fn week_start(ts: i64, off: i64) -> i64 {
     (day - (day + 3).rem_euclid(7)) * DAY - off
 }
 
-/// Queue-free insert of one raw sample (call on the store writer).
+/// Insert one raw sample (call on the store writer).
 pub fn insert_sample(
     c: &Connection,
     account: &str,
@@ -162,8 +227,9 @@ pub fn insert_sample(
 pub fn insert_bucket(c: &Connection, r: &HistRow) -> rusqlite::Result<()> {
     c.execute(
         "INSERT INTO usage_samples(ts, account, window, utilization, reset, granularity,
-                                   consumed, first_ts, first_util, first_reset, last_ts)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                   consumed, first_ts, first_util, first_reset, last_ts,
+                                   seg_max, last_hw, resets)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             r.ts,
             r.account,
@@ -175,17 +241,20 @@ pub fn insert_bucket(c: &Connection, r: &HistRow) -> rusqlite::Result<()> {
             r.first.ts,
             r.first.util,
             r.first.reset,
-            r.last.ts
+            r.last.ts,
+            r.seg_max,
+            r.last_hw,
+            r.resets
         ],
     )?;
     Ok(())
 }
 
 pub(crate) const COLUMNS: &str = "rowid, account, window, granularity, ts, utilization, reset, \
-     consumed, first_ts, first_util, first_reset, last_ts";
+     consumed, first_ts, first_util, first_reset, last_ts, seg_max, last_hw, resets";
 
 /// Parse a row selected with [`COLUMNS`] into `(rowid, row)`; `None` for an unknown granularity.
-/// Missing bucket columns (pre-v4 rows) fall back to the row's own `ts`/value.
+/// Missing bucket columns (a raw row) fall back to the row's own `ts`/value.
 pub(crate) fn from_row(r: &Row<'_>) -> rusqlite::Result<(i64, Option<HistRow>)> {
     let rowid: i64 = r.get(0)?;
     let gran: String = r.get(3)?;
@@ -208,6 +277,9 @@ pub(crate) fn from_row(r: &Row<'_>) -> rusqlite::Result<(i64, Option<HistRow>)> 
         },
         None => last,
     };
+    let seg_max = r
+        .get::<_, Option<f64>>(12)?
+        .unwrap_or(first.util.max(last.util));
     Ok((
         rowid,
         Some(HistRow {
@@ -218,8 +290,20 @@ pub(crate) fn from_row(r: &Row<'_>) -> rusqlite::Result<(i64, Option<HistRow>)> 
             consumed: r.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
             first,
             last,
+            seg_max,
+            last_hw: r.get::<_, Option<f64>>(13)?.unwrap_or(seg_max),
+            resets: r.get::<_, Option<u32>>(14)?.unwrap_or(0),
         }),
     ))
+}
+
+/// Accounts with `window` history.
+fn accounts(c: &Connection, window: &str) -> anyhow::Result<Vec<String>> {
+    let mut st = c.prepare("SELECT DISTINCT account FROM usage_samples WHERE window = ?1")?;
+    let out = st
+        .query_map([window], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(out)
 }
 
 /// Every `window` row an account needs to total burn from `since` on: the rows ending at or after
@@ -228,18 +312,21 @@ pub(crate) fn from_row(r: &Row<'_>) -> rusqlite::Result<(i64, Option<HistRow>)> 
 pub fn rows_since(c: &Connection, window: &str, since: i64) -> anyhow::Result<Vec<HistRow>> {
     // A bucket starts at most a week before its last sample.
     let from = since - WEEK;
+    // Per account, so both halves are ranges on the (account, window, ts) index.
     let sql = format!(
-        "SELECT {COLUMNS} FROM usage_samples u
-         WHERE window = ?1 AND (ts >= ?2 OR rowid = (
-             SELECT p.rowid FROM usage_samples p
-             WHERE p.window = ?1 AND p.account = u.account AND p.ts < ?2
-             ORDER BY p.ts DESC, p.rowid DESC LIMIT 1))"
+        "SELECT {COLUMNS} FROM usage_samples WHERE account = ?1 AND window = ?2 AND ts >= ?3
+         UNION ALL
+         SELECT * FROM (SELECT {COLUMNS} FROM usage_samples
+                        WHERE account = ?1 AND window = ?2 AND ts < ?3
+                        ORDER BY ts DESC LIMIT 1)"
     );
     let mut st = c.prepare(&sql).context("prepare usage history read")?;
-    let mut rows: Vec<HistRow> = st
-        .query_map(params![window, from], from_row)?
-        .filter_map(|r| r.map(|(_, row)| row).transpose())
-        .collect::<Result<_, _>>()?;
+    let mut rows: Vec<HistRow> = Vec::new();
+    for account in accounts(c, window)? {
+        for r in st.query_map(params![account, window, from], from_row)? {
+            rows.extend(r?.1);
+        }
+    }
     rows.sort_by(|a, b| {
         a.account
             .cmp(&b.account)
@@ -251,16 +338,12 @@ pub fn rows_since(c: &Connection, window: &str, since: i64) -> anyhow::Result<Ve
 
 /// The latest recorded reading of `window` per account (seeds the sampler after a restart).
 pub fn latest_points(c: &Connection, window: &str) -> anyhow::Result<HashMap<String, Point>> {
-    let mut st = c.prepare("SELECT DISTINCT account FROM usage_samples WHERE window = ?1")?;
-    let accounts: Vec<String> = st
-        .query_map([window], |r| r.get(0))?
-        .collect::<Result<_, _>>()?;
     let sql = format!(
         "SELECT {COLUMNS} FROM usage_samples WHERE window = ?1 AND account = ?2
          ORDER BY COALESCE(last_ts, ts) DESC, rowid DESC LIMIT 1"
     );
     let mut out = HashMap::new();
-    for a in accounts {
+    for a in accounts(c, window)? {
         let row = c
             .query_row(&sql, params![window, a], from_row)
             .optional()?
@@ -283,24 +366,69 @@ mod tests {
     #[test]
     fn step_rules() {
         // plain increase
-        assert_eq!(
-            step(&p(0, 0.2, Some(100)), &p(10, 0.5, Some(100))).0,
-            0.5 - 0.2
-        );
-        // rounding dip: no consumption, no reset
-        assert_eq!(step(&p(0, 0.42, None), &p(10, 0.41, None)), (0.0, 0));
-        // drop = reset: the new value counts from 0, from the old reset time when in between
-        assert_eq!(
-            step(&p(0, 0.9, Some(5)), &p(10, 0.1, Some(5 + WEEK))),
-            (0.1, 5)
-        );
+        let s = step(&p(0, 0.2, Some(100)), 0.2, &p(10, 0.5, Some(100)));
+        assert_eq!(s.consumed, 0.5 - 0.2);
+        // dip then recovery: nothing consumed, the high-water mark holds
+        let s = step(&p(0, 0.42, None), 0.42, &p(10, 0.41, None));
+        assert_eq!((s.consumed, s.hw, s.reset), (0.0, 0.42, false));
+        let s = step(&p(10, 0.41, None), s.hw, &p(20, 0.42, None));
+        assert_eq!(s.consumed, 0.0);
+        // a drop with the same resets_at is never a reset
+        let s = step(&p(0, 0.82, Some(9)), 0.82, &p(10, 0.79, Some(9)));
+        assert_eq!((s.consumed, s.reset), (0.0, false));
+        // reset: the new value counts from 0, from the old reset time when in between
+        let s = step(&p(0, 0.9, Some(5)), 0.9, &p(10, 0.1, Some(5 + WEEK)));
+        assert_eq!((s.consumed, s.from, s.hw, s.reset), (0.1, 5, 0.1, true));
         // reset moved forward while utilization rose
-        assert_eq!(
-            step(&p(0, 0.3, Some(50)), &p(100, 0.4, Some(50 + WEEK))),
-            (0.4, 50)
+        let s = step(&p(0, 0.3, Some(50)), 0.3, &p(100, 0.4, Some(50 + WEEK)));
+        assert_eq!((s.consumed, s.from), (0.4, 50));
+        // accrual never starts before the new window opened (two resets in one gap)
+        let s = step(
+            &p(0, 0.5, Some(50)),
+            0.5,
+            &p(3 * WEEK, 0.2, Some(50 + 3 * WEEK)),
         );
-        // reset jitter is not a reset
+        assert_eq!((s.consumed, s.from), (0.2, 50 + 2 * WEEK));
+        // reset jitter is not a reset; without resets_at on both a big drop is
         assert!(!is_reset(&p(0, 0.3, Some(50)), &p(100, 0.4, Some(80))));
+        assert!(is_reset(&p(0, 0.3, None), &p(100, 0.1, Some(80))));
+    }
+
+    /// Folding any split of a reading sequence gives the same result as folding it whole.
+    #[test]
+    fn fold_is_split_invariant() {
+        let (r1, r2) = (Some(1000), Some(1000 + WEEK));
+        let seq = [
+            p(1, 0.42, r1),
+            p(2, 0.41, r1),
+            p(3, 0.45, r1),
+            p(4, 0.44, r1),
+            p(5, 0.30, r2),
+            p(6, 0.29, r2),
+            p(7, 0.33, r2),
+        ];
+        let raws: Vec<HistRow> = seq
+            .iter()
+            .map(|x| HistRow::raw("a", WINDOW_7D, *x))
+            .collect();
+        let whole = fold(&raws).unwrap();
+        assert!(
+            (whole.consumed - (0.03 + 0.30 + 0.03)).abs() < 1e-12,
+            "{whole:?}"
+        );
+        for cut in 1..raws.len() {
+            let both = fold(&[fold(&raws[..cut]).unwrap(), fold(&raws[cut..]).unwrap()]).unwrap();
+            assert!((both.consumed - whole.consumed).abs() < 1e-12, "cut {cut}");
+            assert!((both.last_hw - whole.last_hw).abs() < 1e-12, "cut {cut}");
+            assert_eq!(both.resets, whole.resets);
+            // re-based on a higher carried-in high-water mark, too
+            let (a, ea) = whole.inner(0.44);
+            let (b, eb) = both.inner(0.44);
+            assert!(
+                (a - b).abs() < 1e-12 && (ea - eb).abs() < 1e-12,
+                "cut {cut}"
+            );
+        }
     }
 
     #[test]
