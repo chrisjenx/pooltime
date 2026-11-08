@@ -2228,7 +2228,7 @@ mod mgmt {
             "{set}"
         );
         assert!(
-            set.contains("HttpOnly") && set.contains("SameSite=Strict"),
+            set.contains("HttpOnly") && set.contains("SameSite=Strict") && set.contains("Path=/"),
             "{set}"
         );
         assert!(!set.contains(KEY), "{set}");
@@ -2303,17 +2303,49 @@ mod mgmt {
     }
 
     #[tokio::test]
-    async fn status_reports_profiles_and_storage() {
+    async fn status_reports_profiles_and_storage_only_when_authorized() {
         let pool = Pool::new();
         let srv = pool.boot(Boot::default()).await;
+        // Unauthenticated reads keep the pool view but not the local paths.
         let v = http_get(srv.addr, "/api/v1/status", &[]).await.json();
-        assert_eq!(v["profiles"], json!([]));
-        assert_eq!(
-            v["storage"]["home"].as_str(),
-            Some(pool.dir.path().to_str().unwrap())
-        );
-        assert!(v["storage"]["db_bytes"].as_u64().unwrap() > 0, "{v}");
-        assert!(v["storage"]["logs_bytes"].as_u64().is_some(), "{v}");
+        assert!(v.get("storage").is_none(), "{v}");
+        assert!(v.get("profiles").is_none(), "{v}");
+        assert!(v["accounts"].is_array(), "{v}");
+        let bearer = format!("Bearer {KEY}");
+        let cookie = format!("{SESSION_COOKIE}={}", session_token(KEY));
+        for hdr in [("authorization", bearer), ("cookie", cookie)] {
+            let v = http_get(srv.addr, "/api/v1/status", &[(hdr.0, &hdr.1)])
+                .await
+                .json();
+            assert_eq!(v["profiles"], json!([]), "{}", hdr.0);
+            assert_eq!(
+                v["storage"]["home"].as_str(),
+                Some(pool.dir.path().to_str().unwrap())
+            );
+            assert!(v["storage"]["db_bytes"].as_u64().unwrap() > 0, "{v}");
+            assert!(v["storage"]["logs_bytes"].as_u64().is_some(), "{v}");
+        }
+    }
+
+    #[tokio::test]
+    async fn status_profiles_null_when_config_unreadable() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        std::fs::write(
+            Paths::under(pool.dir.path()).config,
+            "this is = not [valid toml",
+        )
+        .unwrap();
+        let v = http_get(
+            srv.addr,
+            "/api/v1/status",
+            &[("authorization", &format!("Bearer {KEY}"))],
+        )
+        .await
+        .json();
+        assert!(v["profiles"].is_null(), "{v}");
+        assert!(v.get("profiles").is_some(), "{v}");
+        assert!(v["storage"].is_object(), "{v}");
     }
 
     #[tokio::test]

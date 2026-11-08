@@ -417,6 +417,7 @@
     },
 
     settings(d) {
+      // Absent without a session (local paths are for the key holder); null = config unreadable.
       const profiles = d.profiles || [];
       const st = d.storage || {};
       const pk = "profiles";
@@ -429,7 +430,8 @@
               h("td", { class: "nowrap" }, manage
                 ? h("button", { type: "button", class: "small ghost", onclick: () => profileAction("disconnect", [p.id]) }, "Disconnect")
                 : null)))))
-          : h("p", { class: "empty", text: "No profiles connected." }),
+          : h("p", { class: "empty", text: d.profiles === undefined ? "Not shown in the read-only view."
+              : d.profiles === null ? "Profiles unavailable (config.toml could not be read)." : "No profiles connected." }),
         manage ? h("div", { class: "inline card-actions" },
           h("input", { placeholder: "profile id or settings dir", value: ui.drafts[pk] ?? "", "aria-label": "profile to connect",
             oninput: (ev) => { ui.drafts[pk] = ev.target.value; } }),
@@ -601,6 +603,8 @@
 
     current() { return this.queue[this.index]; },
 
+    hasMore() { return this.index + 1 < this.queue.length; },
+
     show(opts) {
       $("relogin-title").textContent = "Re-login: " + this.current();
       $("relogin-step").textContent = this.queue.length > 1 ? "Account " + (this.index + 1) + " of " + this.queue.length : "";
@@ -611,7 +615,8 @@
       $("relogin-code").hidden = !opts.code;
       $("relogin-bind").hidden = !opts.bind;
       $("relogin-retry").hidden = !opts.retry;
-      $("relogin-next").hidden = !opts.next;
+      // Every settled-but-unsaved state (retry offered) can also skip ahead while accounts remain.
+      $("relogin-next").hidden = !((opts.next || opts.retry) && this.hasMore());
     },
 
     async begin() {
@@ -667,8 +672,7 @@
     },
 
     done(text) {
-      const more = this.index + 1 < this.queue.length;
-      this.show({ status: text, next: more });
+      this.show({ status: text, next: true });
       refresh();
     },
 

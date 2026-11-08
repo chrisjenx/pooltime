@@ -26,7 +26,7 @@
 
 <div class="ro-only hint" id="readonly-hint">
   <p><strong>Read-only view.</strong> To manage accounts, run <code>pooltime open</code> in a terminal,
-    or paste the management key (<code>~/.pooltime/run/mgmt.key</code>):</p>
+    or paste the management key (the <code>run/mgmt.key</code> file in the pooltime data directory):</p>
   <form id="key-form" class="inline">
     <input type="password" id="key-input" autocomplete="off" spellcheck="false" placeholder="management key" aria-label="Management key">
     <button type="submit">Unlock</button>
@@ -50,8 +50,8 @@
   <p id="relogin-status" class="status-line"></p>
   <p id="relogin-link-row" hidden>If no tab opened: <a id="relogin-link" target="_blank" rel="noopener noreferrer">open the sign-in page</a>.</p>
   <form id="relogin-code" class="inline" hidden>
-    <label for="relogin-code-input">Browser on another machine? Paste the code shown after sign-in:</label>
-    <input id="relogin-code-input" autocomplete="off" spellcheck="false" placeholder="code#state">
+    <label for="relogin-code-input">Browser on another machine? Paste the <code>code#state</code> line shown after sign-in, or the full redirect URL from the address bar:</label>
+    <input id="relogin-code-input" autocomplete="off" spellcheck="false" placeholder="code#state or the full redirect URL">
     <button type="submit">Submit code</button>
   </form>
   <div class="dialog-actions">

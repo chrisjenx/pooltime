@@ -16,9 +16,9 @@
 //! (`ready | needs_login | rate_limited | billing | access_denied`).
 //!
 //! [`build_status`] is a pure function of [`StatusInputs`] and a clock, which is what makes the
-//! status shape snapshot-testable; [`gather`] does the I/O. The HTTP handler adds `profiles`
-//! (connected Claude Code profiles from `config.toml`) and `storage` (data dir, database and log
-//! bytes) for the dashboard's Settings view. With `POOLTIME_FIXTURE_STATE` set (dev/screenshots
+//! status shape snapshot-testable; [`gather`] does the I/O. For authorized requests (bearer or session cookie) the HTTP
+//! handler adds `profiles` (connected Claude Code profiles from `config.toml`; `null` if the file
+//! is unreadable) and `storage` (data dir, database and log bytes) for the Settings view. With `POOLTIME_FIXTURE_STATE` set (dev/screenshots
 //! only, see [`super::daemon`]) the handler serves that document verbatim instead.
 
 #![allow(clippy::result_large_err)]
@@ -527,7 +527,7 @@ pub async fn gather(app: &Arc<AppState>, now: OffsetDateTime) -> Result<StatusIn
     })
 }
 
-async fn status(State(app): State<Arc<AppState>>) -> Response {
+async fn status(State(app): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(fixture) = &app.fixture_state {
         return ok(fixture.clone());
     }
@@ -537,34 +537,38 @@ async fn status(State(app): State<Arc<AppState>>) -> Response {
         Err(r) => return r,
     };
     let mut v = build_status(&inputs, now);
-    let paths = app.paths.clone();
-    let (profiles, storage) =
-        match blocking(move || (profiles_on_file(&paths), storage_json(&paths))).await {
-            Ok(x) => x,
-            Err(r) => return r,
-        };
-    if let Value::Object(o) = &mut v {
-        o.insert("profiles".into(), profiles);
-        o.insert("storage".into(), storage);
+    // Local paths (data dir, profile dirs) are for the key holder only; the pool view stays open.
+    if authorized(&headers, &app.mgmt_key) {
+        let paths = app.paths.clone();
+        let (profiles, storage) =
+            match blocking(move || (profiles_on_file(&paths), storage_json(&paths))).await {
+                Ok(x) => x,
+                Err(r) => return r,
+            };
+        if let Value::Object(o) = &mut v {
+            o.insert("profiles".into(), profiles);
+            o.insert("storage".into(), storage);
+        }
     }
     ok(v)
 }
 
 /// The connected Claude Code profiles as recorded in `config.toml` (`connect` keeps it current;
-/// the startup copy in `AppState::cfg` would go stale). Unreadable config = empty list.
+/// the startup copy in `AppState::cfg` would go stale). An unreadable config is `null` (unknown),
+/// distinct from `[]` (none connected). Only the path is logged: parse errors quote file content.
 fn profiles_on_file(paths: &Paths) -> Value {
-    let profiles = Config::load_file(paths)
-        .map(|c| c.profiles)
-        .unwrap_or_else(|e| {
-            tracing::debug!(error = %format!("{e:#}"), "could not read config.toml for status");
-            Vec::new()
-        });
-    Value::Array(
-        profiles
-            .iter()
-            .map(|p| json!({ "id": p.id, "settings_dir": p.settings_dir.to_string_lossy() }))
-            .collect(),
-    )
+    match Config::load_file(paths) {
+        Ok(c) => Value::Array(
+            c.profiles
+                .iter()
+                .map(|p| json!({ "id": p.id, "settings_dir": p.settings_dir.to_string_lossy() }))
+                .collect(),
+        ),
+        Err(_) => {
+            tracing::warn!(path = %paths.config.display(), "could not read config.toml for status");
+            Value::Null
+        }
+    }
 }
 
 /// Data dir and the bytes held by the database (with its WAL/SHM files) and the logs.
