@@ -491,6 +491,20 @@ impl StateBook {
         fams
     }
 
+    /// Earliest future reset among the account-wide windows the stored snapshot reports spent,
+    /// with its key (bro `blockingWindowReset`).
+    pub fn blocking_window(
+        &self,
+        id: &AccountId,
+        now: OffsetDateTime,
+    ) -> Option<(OffsetDateTime, String)> {
+        let map = self.lock();
+        let snap = map.get(id)?.state.snapshot.as_ref()?;
+        spent_account_windows(snap, now)
+            .min_by_key(|(r, _)| *r)
+            .map(|(r, key)| (r, key.to_string()))
+    }
+
     /// Copy of the account's state (default for unknown accounts); an elapsed rolling
     /// counter window reads as empty.
     pub fn state(&self, id: &AccountId, now: OffsetDateTime) -> AccountState {

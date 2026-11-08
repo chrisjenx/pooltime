@@ -23,6 +23,7 @@ mod stream;
 pub mod strip;
 mod usage;
 
+pub use crate::providers::stream_guard::{StreamGuard, StreamOutcome};
 pub use catalog::{ANTHROPIC_OWNER, MODELS_CACHE_TTL};
 pub use oauth::expiry_after_refresh;
 pub use overload::{explicit_reset, retry_after_at, OverloadPolicy, Sleeper, TokioSleeper};
@@ -31,7 +32,7 @@ pub use proxy::{
     UPSTREAM_REJECTED_HEADER,
 };
 pub use ratelimit::{has_quota_signal, has_rate_limit_wording, parse_unified_headers};
-pub use stream::{StreamGuard, StreamOutcome, PREFIX_CAP};
+pub use stream::PREFIX_CAP;
 pub use strip::{
     codex_stash_signature, is_codex_stash_signature, prepare_body, CODEX_STASH_PREFIX,
 };

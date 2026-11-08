@@ -4,6 +4,7 @@
 
 pub mod anthropic;
 pub mod openai;
+pub mod stream_guard;
 
 use std::fmt;
 use std::str::FromStr;
@@ -33,6 +34,9 @@ pub struct InboundRequest {
     pub model: String,
     pub stream: bool,
     pub session_user_id: Option<String>,
+    /// Session affinity applies (sticky pins, Codex context carry). `false` for classifier-routed
+    /// requests, which never read or write per-session state.
+    pub affinity: bool,
     pub request_id: String,
 }
 

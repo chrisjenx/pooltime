@@ -89,12 +89,13 @@ pub async fn messages(State(app): State<Arc<AppState>>, req: Request) -> Respons
         model,
         stream,
         session_user_id,
+        affinity: true,
         request_id,
     };
-    handle(&app, &req).await
+    handle(&app, req).await
 }
 
-async fn handle(app: &Arc<AppState>, req: &InboundRequest) -> Response {
+async fn handle(app: &Arc<AppState>, mut req: InboundRequest) -> Response {
     let (route, mapped) = {
         let table = app.models.read().unwrap_or_else(|e| e.into_inner());
         let tier = derive_effort_tier(&req.json);
@@ -114,7 +115,7 @@ async fn handle(app: &Arc<AppState>, req: &InboundRequest) -> Response {
     let budget = WaitBudget::new(app.cfg.timeouts.inflight_wait);
 
     if route.def.provider == ProviderId::OpenAi {
-        return serve_provider(app, ProviderId::OpenAi, &route, req, true, &budget)
+        return serve_provider(app, ProviderId::OpenAi, &route, &req, &budget)
             .await
             .response;
     }
@@ -133,8 +134,10 @@ async fn handle(app: &Arc<AppState>, req: &InboundRequest) -> Response {
     } else if mapped.is_none() {
         (Some(ProviderId::Anthropic), false, true)
     } else {
-        (choose_mapped_provider(app, req).await, true, true)
+        (choose_mapped_provider(app, &req).await, true, true)
     };
+    req.affinity = affinity;
+    let req = &req;
 
     let route_for = |svc: ProviderId| match (svc, mapped.as_ref()) {
         (ProviderId::OpenAi, Some(m)) => m,
@@ -142,14 +145,14 @@ async fn handle(app: &Arc<AppState>, req: &InboundRequest) -> Response {
     };
     let served = match first {
         // Neither provider has a usable account: let the Anthropic path produce its 503.
-        None => serve_provider(app, ProviderId::Anthropic, &route, req, affinity, &budget).await,
+        None => serve_provider(app, ProviderId::Anthropic, &route, req, &budget).await,
         Some(first) if use_fallback => {
             fallback::serve_with_cross_provider_fallback(first, &req.request_id, |svc| {
-                serve_provider(app, svc, route_for(svc), req, affinity, &budget)
+                serve_provider(app, svc, route_for(svc), req, &budget)
             })
             .await
         }
-        Some(first) => serve_provider(app, first, route_for(first), req, affinity, &budget).await,
+        Some(first) => serve_provider(app, first, route_for(first), req, &budget).await,
     };
     let mut resp = served.response;
     if is_classifier {
@@ -314,7 +317,6 @@ async fn serve_provider(
     pid: ProviderId,
     route: &Route,
     req: &InboundRequest,
-    affinity: bool,
     budget: &WaitBudget,
 ) -> Served {
     let rid = req.request_id.as_str();
@@ -330,7 +332,7 @@ async fn serve_provider(
         };
     };
     let family = family_for(pid, &req.model);
-    let user = if affinity {
+    let user = if req.affinity {
         req.session_user_id.as_deref()
     } else {
         None
