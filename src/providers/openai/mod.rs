@@ -26,7 +26,7 @@ pub use oauth::{
 };
 pub(crate) use oauth::{token_expiry, TokenResponse};
 pub use translate_req::{clamp_effort, derive_effort_tier, to_codex_request};
-pub use translate_stream::{CodexToAnthropic, StreamError};
+pub use translate_stream::{anthropic_error_type, CodexToAnthropic, Finished, StreamError};
 
 pub struct OpenAiProvider {
     cfg: OpenAiCfg,

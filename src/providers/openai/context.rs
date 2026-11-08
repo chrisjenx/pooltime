@@ -4,7 +4,7 @@
 //!
 //! Ported from bro `openai-codex.ts` (`ContextUsageCache`). An LRU of [`ContextCarry::CAPACITY`]
 //! entries keyed by `(session hash, route id)`. The session is the request's
-//! `metadata.user_id`; it is hashed on the way in (`hash_session("openai:<user_id>")`, the same
+//! `metadata.user_id`; it is hashed on the way in (`routing::sessions::session_key`, the same
 //! scheme as sticky sessions) so raw user ids are never held. No session (absent or empty) never
 //! carries. The value is `input + cached + output` of the last *successful* turn with terminal
 //! input usage ([`CodexToAnthropic::context_tokens`]); `completed` and `incomplete` terminals
@@ -17,7 +17,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::logging::hash_session;
+use crate::providers::ProviderId;
+use crate::routing::sessions::session_key;
 
 type Key = (String, String);
 
@@ -116,7 +117,7 @@ impl ContextCarry {
 fn key(user_id: Option<&str>, route_id: &str) -> Option<Key> {
     let user_id = user_id.filter(|u| !u.is_empty())?;
     Some((
-        hash_session(&format!("openai:{user_id}")),
+        session_key(ProviderId::OpenAi, user_id),
         route_id.to_string(),
     ))
 }
@@ -124,6 +125,7 @@ fn key(user_id: Option<&str>, route_id: &str) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::hash_session;
 
     #[test]
     fn keys_hold_the_session_hash_never_the_raw_user_id() {

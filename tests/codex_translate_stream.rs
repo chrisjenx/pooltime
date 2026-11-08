@@ -8,7 +8,9 @@ use bytes::Bytes;
 use pooltime::accounts::TokenUsage;
 use pooltime::models::RouteDef;
 use pooltime::providers::anthropic::codex_stash_signature;
-use pooltime::providers::openai::{to_codex_request, CodexToAnthropic, ContextCarry, StreamError};
+use pooltime::providers::openai::{
+    anthropic_error_type, to_codex_request, CodexToAnthropic, ContextCarry, Finished, StreamError,
+};
 use pooltime::providers::ProviderId;
 use pooltime::sse::{SseEvent, SseParser};
 use serde_json::{json, Value};
@@ -140,7 +142,7 @@ fn completion_without_usage_closes_cleanly_and_ignores_trailing_events() {
     assert!(s.on_event(&added_message()).is_empty());
     assert_eq!(s.context_tokens(), None, "no terminal usage");
     assert_eq!(
-        types(&s.finish().unwrap()),
+        types(&s.finish().unwrap().frames),
         ["message_delta", "message_stop"]
     );
 }
@@ -160,7 +162,7 @@ fn text_turn_produces_well_formed_anthropic_sse_sequence() {
         ],
     );
     assert_eq!(s.stop_reason(), Some("end_turn"));
-    frames.extend(s.finish().unwrap());
+    frames.extend(s.finish().unwrap().frames);
     assert_eq!(
         types(&frames),
         [
@@ -251,7 +253,7 @@ fn missing_terminal_input_usage_is_not_authoritative() {
     assert_eq!(s.usage().input_tokens, 0);
     assert_eq!(s.usage().output_tokens, 5);
     // Client view keeps the seeded baseline.
-    let frames = s.finish().unwrap();
+    let frames = s.finish().unwrap().frames;
     assert_eq!(
         parse(&frames[0]).1["usage"],
         json!({"input_tokens": 42, "output_tokens": 5})
@@ -273,7 +275,7 @@ fn function_call_maps_to_tool_use_block_and_stop_reason_tool_use() {
         ],
     );
     assert_eq!(s.stop_reason(), Some("tool_use"));
-    frames.extend(s.finish().unwrap());
+    frames.extend(s.finish().unwrap().frames);
     let d = datas(&frames);
     let start = d
         .iter()
@@ -368,7 +370,7 @@ fn force_message_start_emits_an_envelope_and_the_later_response_created_is_a_no_
             ev(json!({"type": "response.completed", "response": {"status": "completed"}})),
         ],
     );
-    rest.extend(s.finish().unwrap());
+    rest.extend(s.finish().unwrap().frames);
     assert_eq!(
         types(&rest),
         [
@@ -411,7 +413,7 @@ fn reasoning_item_becomes_a_thinking_block_carrying_encrypted_content_in_its_sig
         ],
     );
     // The translator is Clone: finish one copy for the stream, fold the other.
-    frames.extend(s.clone().finish().unwrap());
+    frames.extend(s.clone().finish().unwrap().frames);
     let d = datas(&frames);
     let start = d
         .iter()
@@ -501,7 +503,7 @@ fn incomplete_response_due_to_max_output_tokens_maps_to_stop_reason_max_tokens()
         ],
     );
     assert_eq!(s.stop_reason(), Some("max_tokens"));
-    frames.extend(s.finish().unwrap());
+    frames.extend(s.finish().unwrap().frames);
     let d = datas(&frames);
     // The still-open text block is closed before the message_delta.
     assert_eq!(
@@ -582,7 +584,7 @@ fn cached_input_tokens_surface_as_cache_read_input_tokens() {
     let client = json!({"input_tokens": 20, "output_tokens": 5, "cache_read_input_tokens": 80});
     assert_eq!(s.context_tokens(), Some(105));
     let msg_view = s.clone().into_message().unwrap();
-    frames.extend(s.finish().unwrap());
+    frames.extend(s.finish().unwrap().frames);
     let d = datas(&frames);
     let delta = d.iter().find(|d| d["type"] == "message_delta").unwrap();
     assert_eq!(delta["usage"], client);
@@ -637,9 +639,10 @@ fn no_events_are_translated_after_an_upstream_error() {
             message: "backend broke".into()
         }
     );
+    // The frame carries the Anthropic error type (an unknown code is `api_error`).
     assert_eq!(
         parse(&err.to_frame()).1,
-        json!({"type": "error", "error": {"type": "boom", "message": "backend broke"}})
+        json!({"type": "error", "error": {"type": "api_error", "message": "backend broke"}})
     );
 }
 
@@ -675,7 +678,7 @@ fn args_truncated_by_max_output_tokens_fold_to_empty_with_stop_reason_max_tokens
         ],
     );
     assert_eq!(s.stop_reason(), Some("max_tokens"));
-    let frames = s.finish().unwrap();
+    let frames = s.finish().unwrap().frames;
     assert_eq!(types(&frames), ["message_delta", "message_stop"]);
 }
 
@@ -695,7 +698,7 @@ fn args_still_open_at_a_token_cap_terminal_are_not_an_error() {
             ),
         ],
     );
-    let frames = s.finish().unwrap();
+    let frames = s.finish().unwrap().frames;
     assert_eq!(
         types(&frames),
         ["content_block_stop", "message_delta", "message_stop"]
@@ -752,7 +755,7 @@ fn content_filter_incompleteness_maps_to_stop_reason_refusal_not_a_clean_finish(
         ],
     );
     assert_eq!(s.stop_reason(), Some("refusal"));
-    let frames = s.finish().unwrap();
+    let frames = s.finish().unwrap().frames;
     assert_eq!(parse(&frames[0]).1["delta"]["stop_reason"], "refusal");
 }
 
@@ -860,7 +863,7 @@ fn dropped_reasoning_events_become_pings_after_message_start() {
         .is_empty());
     assert!(s.on_event(&junk).is_empty());
     assert_eq!(
-        types(&s.finish().unwrap()),
+        types(&s.finish().unwrap().frames),
         ["message_delta", "message_stop"]
     );
 }
@@ -895,7 +898,7 @@ fn cached_terminal_input_remains_split_for_clients_but_records_the_full_codex_in
             cache_write: 0
         }
     );
-    let frames = s.finish().unwrap();
+    let frames = s.finish().unwrap().frames;
     assert_eq!(
         parse(&frames[0]).1["usage"],
         json!({"input_tokens": 20, "output_tokens": 5, "cache_read_input_tokens": 80})
@@ -966,8 +969,9 @@ fn turn(carry: &ContextCarry, user: Option<&str>, route: &str, events: &[SseEven
     let mut s = CodexToAnthropic::new(route, carry.seed(user, route));
     let frames = feed(&mut s, events);
     let ctx = s.context_tokens();
-    if s.finish().is_ok() {
-        if let Some(tokens) = ctx {
+    if let Ok(Finished { context_tokens, .. }) = s.finish() {
+        assert_eq!(context_tokens, ctx, "finish reports the same context");
+        if let Some(tokens) = context_tokens {
             carry.record(user, route, tokens);
         }
     }
@@ -1107,4 +1111,105 @@ fn context_carry_evicts_the_least_recently_used_entry_at_capacity() {
     carry.record(Some("a"), "r", 10);
     assert_eq!(carry.len(), 2);
     assert_eq!(carry.seed(Some("a"), "r"), Some(10));
+}
+
+// ---- Task 38 adjustments --------------------------------------------------------
+
+#[test]
+fn finish_reports_frames_usage_and_context() {
+    let mut s = CodexToAnthropic::new("gpt", None);
+    feed(
+        &mut s,
+        &[
+            created("r1"),
+            added_message(),
+            text_delta("Hi"),
+            done("message"),
+            completed(json!({
+                "input_tokens": 10, "output_tokens": 2,
+                "input_tokens_details": {"cached_tokens": 4}
+            })),
+        ],
+    );
+    let usage = s.usage();
+    let f = s.finish().unwrap();
+    assert_eq!(types(&f.frames), ["message_delta", "message_stop"]);
+    assert_eq!(f.usage, usage);
+    assert_eq!(f.usage.input_tokens, 10);
+    assert_eq!(f.usage.cache_read, 4);
+    assert_eq!(f.context_tokens, Some(12));
+}
+
+#[test]
+fn debug_never_shows_upstream_text_or_content() {
+    let mut s = CodexToAnthropic::new("gpt", None);
+    feed(
+        &mut s,
+        &[
+            created("r1"),
+            added_message(),
+            text_delta("SECRET-ANSWER"),
+            ev(json!({"type": "error", "error": {"code": "boom", "message": "SECRET-UPSTREAM"}})),
+        ],
+    );
+    let shown = format!("{s:?}");
+    assert!(!shown.contains("SECRET"), "{shown}");
+    let err = s.finish().unwrap_err();
+    let shown = format!("{err:?}");
+    assert!(
+        shown.contains("boom") && !shown.contains("SECRET"),
+        "{shown}"
+    );
+    // The client frame still carries the message.
+    assert!(String::from_utf8_lossy(&err.to_frame()).contains("SECRET-UPSTREAM"));
+}
+
+#[test]
+fn error_frames_use_anthropic_error_types() {
+    for (code, message, want) in [
+        ("rate_limit_exceeded", "slow down", "rate_limit_error"),
+        ("usage_limit_reached", "x", "rate_limit_error"),
+        ("boom", "You have hit your usage limit", "rate_limit_error"),
+        ("insufficient_quota", "x", "rate_limit_error"),
+        ("server_is_overloaded", "x", "overloaded_error"),
+        ("server_error", "x", "api_error"),
+        ("context_length_exceeded", "x", "invalid_request_error"),
+        ("invalid_prompt", "x", "invalid_request_error"),
+        ("authentication_error", "x", "authentication_error"),
+        ("permission_denied", "x", "permission_error"),
+        ("boom", "x", "api_error"),
+    ] {
+        assert_eq!(anthropic_error_type(code, message), want, "{code}");
+        let mut s = CodexToAnthropic::new("gpt", None);
+        s.on_event(&ev(json!({
+            "type": "response.failed",
+            "response": {"error": {"code": code, "message": message}}
+        })));
+        let err = s.finish().unwrap_err();
+        assert_eq!(err.error_type(), code, "raw code kept for classification");
+        assert_eq!(parse(&err.to_frame()).1["error"]["type"], want, "{code}");
+    }
+}
+
+#[test]
+fn malformed_tool_args_are_excused_only_by_a_token_cap() {
+    let events = |reason: &str| {
+        vec![
+            created("r1"),
+            added_call("c1", "write_file"),
+            args_delta(r#"{"path":"#),
+            ev(json!({
+                "type": "response.incomplete",
+                "response": {"status": "incomplete", "incomplete_details": {"reason": reason}, "usage": {}}
+            })),
+        ]
+    };
+    let mut s = CodexToAnthropic::new("gpt", None);
+    feed(&mut s, &events("max_output_tokens"));
+    assert!(s.finish().is_ok());
+
+    let mut s = CodexToAnthropic::new("gpt", None);
+    feed(&mut s, &events("content_filter"));
+    assert_eq!(s.stop_reason(), Some("refusal"));
+    assert_eq!(s.finish().unwrap_err(), StreamError::MalformedToolArgs);
 }
