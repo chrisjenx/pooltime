@@ -23,7 +23,9 @@ pub fn snapshot_path(snaps: &Paths, p: &Profile) -> PathBuf {
     snaps.run.join("profiles").join(format!("{}.json", p.id))
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// `Debug` is hand-written: `prior` may hold the user's real
+/// `ANTHROPIC_AUTH_TOKEN`, so only key names are ever shown.
+#[derive(Clone, PartialEq)]
 pub(crate) struct Snapshot {
     pub managed: bool,
     /// Managed key -> the user's value before us (`null` = was absent).
@@ -33,6 +35,17 @@ pub(crate) struct Snapshot {
     pub statusline_prior: Value,
     /// Any other top-level fields, kept verbatim.
     extra: Map<String, Value>,
+}
+
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("managed", &self.managed)
+            .field("prior_keys", &self.prior.keys().collect::<Vec<_>>())
+            .field("has_statusline_prior", &!self.statusline_prior.is_null())
+            .field("extra_keys", &self.extra.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl Snapshot {
@@ -114,5 +127,28 @@ pub(crate) fn remove(path: &Path) -> io::Result<()> {
     match fs::remove_file(path) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_shows_keys_never_values() {
+        let mut prior = Map::new();
+        prior.insert(
+            "ANTHROPIC_AUTH_TOKEN".into(),
+            Value::String("sk-real".into()),
+        );
+        let mut snap = Snapshot::new(prior);
+        snap.statusline_prior = Value::String("sk-status".into());
+        let shown = format!(
+            "{:?} {:?}",
+            snap,
+            SnapshotState::Present(Box::new(snap.clone()))
+        );
+        assert!(shown.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!shown.contains("sk-real") && !shown.contains("sk-status"));
     }
 }
