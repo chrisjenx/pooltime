@@ -227,6 +227,41 @@ async fn connect_enforces_the_new_key_without_restart() {
 }
 
 #[tokio::test]
+async fn unchanged_claude_json_is_not_reread() {
+    let fx = Fix::new().await;
+    let p = fx.profile(".claude-memo");
+    connect(fx.app(), std::slice::from_ref(&p)).await.unwrap();
+    assert_eq!(fable_row(&p)["value"], "claude-fable-5[1m]");
+    let mtime =
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&p.claude_json).unwrap());
+
+    // Same size, same mtime, different content: a pass that reads the file would fix the row.
+    let text = fs::read_to_string(&p.claude_json).unwrap();
+    let stale = text.replace("claude-fable-5[1m]", "claude-fable-4[1m]");
+    assert_eq!(stale.len(), text.len());
+    fs::write(&p.claude_json, &stale).unwrap();
+    filetime::set_file_mtime(&p.claude_json, mtime).unwrap();
+    let out = sync_once(fx.app()).await.unwrap();
+    assert_eq!(out, vec![(p.id.clone(), WriteOutcome::Unchanged)]);
+    assert_eq!(
+        fs::read_to_string(&p.claude_json).unwrap(),
+        stale,
+        "unchanged file and catalog: not read"
+    );
+
+    // The file changes (mtime): the next pass reads and patches it again.
+    let later = filetime::FileTime::from_unix_time(mtime.unix_seconds() + 10, 0);
+    filetime::set_file_mtime(&p.claude_json, later).unwrap();
+    sync_once(fx.app()).await.unwrap();
+    assert_eq!(fable_row(&p)["value"], "claude-fable-5[1m]");
+
+    // So does a catalog change, with the file untouched.
+    fx.newer.store(true, Ordering::SeqCst);
+    sync_once(fx.app()).await.unwrap();
+    assert_eq!(fable_row(&p)["value"], "claude-fable-5-1[1m]");
+}
+
+#[tokio::test]
 async fn connect_refuses_when_pool_unhealthy() {
     // Nothing listens on the configured port.
     let free = std::net::TcpListener::bind("127.0.0.1:0")
