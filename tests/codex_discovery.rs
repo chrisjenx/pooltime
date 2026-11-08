@@ -705,6 +705,7 @@ fn header_snapshot(now: OffsetDateTime) -> RateLimitSnapshot {
     RateLimitSnapshot {
         unified_status: Some("allowed".into()),
         windows: vec![Window {
+            reset_synthetic: false,
             key: "5h".into(),
             model: None,
             status: WindowStatus::Allowed,

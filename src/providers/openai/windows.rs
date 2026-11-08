@@ -91,6 +91,7 @@ pub fn parse_codex_rate_limits(
             WindowStatus::Allowed
         };
         windows.push(Window {
+            reset_synthetic: false,
             key: key.to_string(),
             model: None,
             status,

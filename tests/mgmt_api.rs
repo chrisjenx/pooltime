@@ -655,6 +655,7 @@ mod mgmt {
 
     fn window(key: &str, model: Option<&str>, util: f64, reset: Option<OffsetDateTime>) -> Window {
         Window {
+            reset_synthetic: false,
             key: key.into(),
             model: model.map(str::to_string),
             status: WindowStatus::Allowed,

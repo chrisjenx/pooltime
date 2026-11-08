@@ -25,6 +25,7 @@ fn win(
     reset: Option<OffsetDateTime>,
 ) -> Window {
     Window {
+        reset_synthetic: false,
         key: key.to_string(),
         model: model.map(str::to_string),
         status,

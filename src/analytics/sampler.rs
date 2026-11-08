@@ -120,7 +120,11 @@ fn seven_day_point(state: &crate::accounts::AccountState) -> Option<Point> {
     Some(Point {
         ts: snap.updated_at.unix_timestamp(),
         util: w.utilization.clamp(0.0, 1.0),
-        reset: w.reset.map(OffsetDateTime::unix_timestamp),
+        // A reset pooltime made up (not upstream's) moves on every poll: never treat it as one.
+        reset: w
+            .reset
+            .filter(|_| !w.reset_synthetic)
+            .map(OffsetDateTime::unix_timestamp),
     })
 }
 
@@ -210,6 +214,53 @@ mod tests {
             util,
             reset: Some(reset),
         }
+    }
+
+    /// A spent 7-day window the poll reported without a reset gets a synthetic one that moves
+    /// with every poll; two readings 3 h apart at the same utilization consume nothing.
+    #[test]
+    fn synthetic_reset_is_not_a_window_reset() {
+        use crate::accounts::{RateLimitSnapshot, Window, WindowStatus};
+        use crate::analytics::burn::compute;
+        use crate::store::usage_history::HistRow;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("pooltime.db")).unwrap());
+        let book = StateBook::load(store).unwrap();
+        let id: crate::accounts::AccountId = "a".parse().unwrap();
+        // Monday 2026-11-09 12:00 UTC
+        let t0 = OffsetDateTime::from_unix_timestamp(1_794_182_400 + 12 * 3600).unwrap();
+        let mut sampler = Sampler::default();
+        let (mut rows, mut recorded) = (Vec::new(), Vec::new());
+        for t in [t0, t0 + time::Duration::hours(3)] {
+            let snap = RateLimitSnapshot {
+                unified_status: None,
+                windows: vec![Window {
+                    key: "7d".into(),
+                    model: None,
+                    status: WindowStatus::Rejected,
+                    utilization: 1.0,
+                    reset: None,
+                    reset_synthetic: false,
+                }],
+                updated_at: t,
+            };
+            book.replace_poll_snapshot(&id, snap, t);
+            let st = book.state(&id, t);
+            // the synthetic reset still blocks routing / shows in the state
+            let w = &st.snapshot.as_ref().unwrap().windows[0];
+            assert!(w.reset.is_some() && w.reset_synthetic);
+            let p = seven_day_point(&st).unwrap();
+            assert_eq!(p.reset, None, "synthetic resets are not recorded");
+            // Same utilization, no upstream reset: unchanged, so the sampler writes it once.
+            recorded.extend(sampler.observe(id.as_str(), p));
+            // Both readings as recorded rows (e.g. written across a daemon restart).
+            rows.push(HistRow::raw("a", WINDOW_7D, p));
+        }
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        let now = (t0 + time::Duration::hours(4)).unix_timestamp();
+        let r = compute(&rows, now, time::UtcOffset::UTC, 1);
+        assert_eq!(r.weeks[0].subs_used, 0.0, "{r:?}");
     }
 
     #[test]

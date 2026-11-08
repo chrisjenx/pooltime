@@ -52,6 +52,7 @@ fn meta(id: &str) -> AccountMeta {
 
 fn win(key: &str, utilization: f64, reset: Option<Duration>) -> Window {
     Window {
+        reset_synthetic: false,
         key: key.to_string(),
         model: None,
         status: WindowStatus::Allowed,

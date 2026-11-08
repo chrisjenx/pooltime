@@ -79,6 +79,7 @@ pub fn map_codex_usage(json: &Value, now: OffsetDateTime) -> Option<RateLimitSna
             (None, None) => None,
         };
         windows.push(Window {
+            reset_synthetic: false,
             key: key.to_string(),
             model: None,
             status: if limited && used >= 100.0 {
