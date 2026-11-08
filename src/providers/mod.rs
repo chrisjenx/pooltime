@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 use crate::accounts::{AccountMeta, RateLimitSnapshot, StateBook, TokenUsage};
 use crate::errors::{FailReason, RefreshErrorKind, TransportKind};
 use crate::models::{Route, RouteDef};
+use crate::routing::reserve::Reservation;
 use crate::upstream::{Limits, Upstream};
 
 /// Resolves once the response stream ends, with the final token usage. The
@@ -41,6 +42,11 @@ pub struct AttemptCtx<'a> {
     pub route: &'a Route,
     pub limits: Limits,
     pub upstream: &'a Upstream,
+    /// The caller's in-flight slot for `account`. A committed streaming response moves it into
+    /// the task that pumps the body, so the slot is held until the stream ends (completion,
+    /// upstream failure or client disconnect) and released by `Drop`. For every other outcome it
+    /// is dropped when the attempt returns. `None` = no slot to hold (tests, unreserved callers).
+    pub reservation: Option<Reservation>,
 }
 
 /// Result of one upstream attempt.
