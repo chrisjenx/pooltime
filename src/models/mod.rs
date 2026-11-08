@@ -68,5 +68,9 @@ pub struct Route {
     pub requested: String,
     /// Resolved row; for Anthropic passthrough `upstream_model` is `requested` minus `[1m]`.
     pub def: RouteDef,
+    /// Codex effort resolved for this request (OpenAI routes): the inference handler sets it to
+    /// [`effective_effort`] of the request's source tier (a mapping row's overrides, else the
+    /// route's `effort_map`); `None` = no override (the tier passes through). Clamped later by
+    /// the request translation.
     pub effort: Option<String>,
 }

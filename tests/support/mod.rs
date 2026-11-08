@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub mod fake_anthropic;
+pub mod fake_openai;
 pub mod fake_provider;
 pub mod procs;
 pub mod sockets;

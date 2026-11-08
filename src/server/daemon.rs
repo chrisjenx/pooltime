@@ -22,6 +22,7 @@ use crate::models::ModelTable;
 use crate::providers::anthropic::{
     spawn_usage_sweeper, AnthropicProvider, OverloadPolicy, SWEEP_INTERVAL,
 };
+use crate::providers::openai::OpenAiProvider;
 use crate::providers::{Provider, ProviderId};
 use crate::routing::reserve::Reservations;
 use crate::routing::sessions::Sessions;
@@ -69,6 +70,12 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
     let upstream = Arc::new(Upstream::new());
 
     let t = &cfg.timeouts;
+    let overload = OverloadPolicy {
+        max_retries: t.overload_retry_max,
+        base: t.overload_retry_base,
+        cap: t.overload_retry_cap,
+        ..OverloadPolicy::default()
+    };
     let anthropic = Arc::new(
         AnthropicProvider::new(
             cfg.anthropic.clone(),
@@ -78,17 +85,29 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
         )
         .with_refresh_timing(t.token_refresh_skew, t.token_refresh_timeout)
         .with_rate_limit_cooldown(t.rate_limit_cooldown)
-        .with_overload_policy(OverloadPolicy {
-            max_retries: t.overload_retry_max,
-            base: t.overload_retry_base,
-            cap: t.overload_retry_cap,
-            ..OverloadPolicy::default()
-        }),
+        .with_overload_policy(overload.clone()),
     );
-    let providers: HashMap<ProviderId, Arc<dyn Provider>> = HashMap::from([(
-        ProviderId::Anthropic,
-        anthropic.clone() as Arc<dyn Provider>,
-    )]);
+    // Codex: same refresh timing, cooldown and backoff as Anthropic (5xx terminal after the
+    // same-account backoff, docs/parity.md); keep-alive from `timeouts.stream_keepalive`.
+    let openai = Arc::new(
+        OpenAiProvider::new(
+            cfg.openai.clone(),
+            registry.clone(),
+            state.clone(),
+            upstream.clone(),
+        )
+        .with_refresh_timing(t.token_refresh_skew, t.token_refresh_timeout)
+        .with_rate_limit_cooldown(t.rate_limit_cooldown)
+        .with_overload_policy(overload)
+        .with_keepalive(t.stream_keepalive),
+    );
+    let providers: HashMap<ProviderId, Arc<dyn Provider>> = HashMap::from([
+        (
+            ProviderId::Anthropic,
+            anthropic.clone() as Arc<dyn Provider>,
+        ),
+        (ProviderId::OpenAi, openai as Arc<dyn Provider>),
+    ]);
 
     let retention_cfg = cfg.retention.clone();
     let (host, port) = (cfg.host, cfg.port);

@@ -33,10 +33,11 @@ use super::AppState;
 use crate::accounts::{AccountId, AccountMeta, AccountStatus, RateLimitSnapshot};
 use crate::errors::{FailReason, RefreshErrorKind};
 use crate::logging::new_request_id;
-use crate::models::{family_of, Route};
+use crate::models::{effective_effort, family_of, Route};
 use crate::providers::anthropic::{
     anthropic_error, refresh_failure_outcome, POOL_ACCOUNT_HEADER, RETRYABLE_TRANSPORT_HEADER,
 };
+use crate::providers::openai::derive_effort_tier;
 use crate::providers::{AttemptCtx, AttemptOutcome, InboundRequest, ProviderId};
 use crate::routing::reserve::WaitBudget;
 use crate::routing::{choose, usable, Candidate, Tuning};
@@ -96,7 +97,18 @@ pub async fn messages(State(app): State<Arc<AppState>>, req: Request) -> Respons
 async fn handle(app: &Arc<AppState>, req: &InboundRequest) -> Response {
     let (route, mapped) = {
         let table = app.models.read().unwrap_or_else(|e| e.into_inner());
-        (table.resolve(&req.model), table.mapped_route(&req.model))
+        let tier = derive_effort_tier(&req.json);
+        let mut route = table.resolve(&req.model);
+        if route.def.provider == ProviderId::OpenAi {
+            route.effort = effective_effort(&route.def, None, tier);
+        }
+        // A mapping row's effort overrides replace the target route's own map (bro parity).
+        let mapped = table.mapped_route(&req.model).map(|mut m| {
+            let row = family_of(&req.model).and_then(|f| table.mapping_for(f));
+            m.effort = effective_effort(&m.def, row, tier);
+            m
+        });
+        (route, mapped)
     };
     // One slot-wait budget for the whole request, across retries and providers.
     let budget = WaitBudget::new(app.cfg.timeouts.inflight_wait);
