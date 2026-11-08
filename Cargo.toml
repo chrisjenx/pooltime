@@ -12,10 +12,14 @@ repository = "https://github.com/chrisjenx/pooltime"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+humantime-serde = "1.1.1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.2.1"
 
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+tempfile = "3.27.0"
 
 [profile.release]
 lto = "thin"
