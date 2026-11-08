@@ -8,6 +8,11 @@ cargo build --release -p pooltime --bin pooltime
 cargo run -p harness -- bench --bro <bro-cli checkout> --pooltime target/release/pooltime
 ```
 
+`<bro-cli checkout>` must be the `chrisjenx/bro-cli` fork on branch `feat/codex-env-overrides`
+(it adds the Codex URL overrides the sandbox needs), with `bun install` run once in its `pool/`.
+`bun` must be on `PATH` or passed with `--bun`. See [`harness/README.md`](../harness/README.md)
+("Requirements").
+
 Leave out `--pooltime` and the bench runs `cargo build --release` itself. Defaults: 60 s idle,
 50 streams × 5 s, 15 timed boots of each kind, 300 TTFB requests per side at concurrency 4. A run
 takes a few minutes. `--only bro|pooltime` measures one daemon.
@@ -63,9 +68,13 @@ Pooled: first boot **32.0 ms vs 32.1 ms, a tie**; restart 12.5 ms vs 29.5 ms.
 In runs 1–2, the first boot of pooltime wrote its management key (`run/mgmt.key`) with the
 crash-safe atomic write that every persisted file gets: temp file, `fsync`, rename,
 parent-directory `fsync` (plan Global Constraints). On macOS, Rust's `File::sync_all` is
-`F_FULLFSYNC`, which also flushes the drive's cache. Booting with parts of the state pre-created
-(Python timer, 0.5 ms `/health` polling, 15 boots each, release binary at `e954da7`, no accounts)
-showed where the time went:
+`F_FULLFSYNC`, which also flushes the drive's cache.
+
+To find where the time went, Task 42 ran **one-off profiling** outside `harness bench` (a throwaway
+script, not kept, so these numbers cannot be re-run with a command in this repo). It booted the
+release binary at `e954da7` with parts of the state copied in from an earlier boot: no accounts,
+cleared environment, temp `POOLTIME_HOME`, a Python `perf_counter` timer, `/health` polled every
+0.5 ms, 15 boots of each variant, run alternately:
 
 | State present at boot | Median | Min | Max |
 |---|---|---|---|
@@ -138,6 +147,9 @@ still 0600, but it calls plain `fsync(2)` instead of `F_FULLFSYNC`. Every other 
   depend on history; bro was measured fresh, so a long-running bro is likely larger (the user's
   live bro showed ~245 MiB in `ps` during these runs, under real traffic).
 - Cold start includes the harness's sandbox seeding (both daemons: a handful of small file
-  writes) and up to 5 ms of polling granularity; the Python numbers in [first boot](#first-boot)
-  use 0.5 ms polling and no seeding, hence lower.
+  writes), building a fresh `reqwest` client for the `/health` polls on every timed boot, and up
+  to 5 ms of polling granularity. These costs are the same for both daemons. The one-off numbers
+  in [first boot](#first-boot) use 0.5 ms polling and no seeding, hence lower.
+- Idle RSS is a single sample per run (taken after 60 s); the "RSS right after boot" sample in
+  the bench output agreed with it to within 0.1 MiB in every run, but there is no averaging.
 - The bench is not part of `cargo test` (it needs bun, a bro checkout and minutes of wall clock).

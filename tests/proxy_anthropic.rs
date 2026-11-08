@@ -499,6 +499,13 @@ async fn unauthorized_forces_refresh_then_retries_once() {
     assert_eq!(fake.requests_to(TOKEN).len(), 1);
     let st = pool.state.state(&pool.meta.id, OffsetDateTime::now_utc());
     assert_eq!(st.last_error.unwrap().reason, FailReason::Status(401));
+    // bro parity (INV §1): the persistent 401 changes no status; the account stays ready
+    // (an `erroring` state comes later, spec §16; open item in docs/parity.md §10.3).
+    assert_eq!(
+        pool.state
+            .status(&pool.meta.id, true, OffsetDateTime::now_utc()),
+        AccountStatus::Ready
+    );
 
     // Refresh fails: 401 authentication_error fallback, fail over.
     let fake = FakeAnthropic::start().await;
