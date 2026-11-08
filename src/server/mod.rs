@@ -1,7 +1,7 @@
 //! The local HTTP server: shared state, routing, auth, health and graceful drain.
 //!
 //! Layout: [`router`] builds the route table and middleware, [`auth`] guards inference and
-//! management traffic, [`models_route`] serves `/v1/models`, [`health`] serves `/health` and the startup preflight, [`shutdown`] owns
+//! management traffic, [`mgmt`] is the `/api/v1/*` management API, [`models_route`] serves `/v1/models`, [`health`] serves `/health` and the startup preflight, [`shutdown`] owns
 //! signal handling and the drain sequence.
 
 pub mod auth;
@@ -9,6 +9,7 @@ pub mod classifier;
 pub mod fallback;
 pub mod health;
 pub mod inference;
+pub mod mgmt;
 pub mod models_route;
 pub mod router;
 pub mod shutdown;
@@ -23,6 +24,7 @@ use crate::models::ModelTable;
 use crate::providers::{Provider, ProviderId};
 use crate::routing::reserve::Reservations;
 use crate::routing::sessions::Sessions;
+use crate::routing::Tuning;
 use crate::store::Store;
 use crate::upstream::Upstream;
 
@@ -49,6 +51,10 @@ pub struct AppState {
     pub drift: classifier::DriftWarner,
     /// Round-robin cursor for exact score ties (shared by every pick, like bro's).
     pub cursor: AtomicUsize,
+    /// Live routing knobs (seeded from `cfg.routing`, edited by `POST /api/v1/tuning`).
+    tuning: RwLock<Tuning>,
+    /// In-flight and finished sign-in flows, addressable by id (management API).
+    pub signins: mgmt::SignIns,
 }
 
 impl AppState {
@@ -65,6 +71,7 @@ impl AppState {
         store: Arc<Store>,
         mgmt_key: String,
     ) -> AppState {
+        let tuning = RwLock::new(Tuning::from(&cfg.routing));
         AppState {
             cfg,
             paths,
@@ -80,7 +87,14 @@ impl AppState {
             upstream: Arc::new(Upstream::new()),
             drift: classifier::DriftWarner::default(),
             cursor: AtomicUsize::new(0),
+            tuning,
+            signins: mgmt::SignIns::default(),
         }
+    }
+
+    /// The routing knobs in effect now.
+    pub fn tuning(&self) -> Tuning {
+        *self.tuning.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Use this upstream client (the daemon shares one with the providers).

@@ -22,7 +22,7 @@ use http_body::Frame;
 use serde_json::Value;
 
 use super::inference::{self, RequestId, REQUEST_ID_HEADER};
-use super::{auth, health, models_route, AppState, PendingGuard};
+use super::{auth, health, mgmt, models_route, AppState, PendingGuard};
 use crate::logging::new_request_id;
 use crate::providers::anthropic::anthropic_error;
 
@@ -51,6 +51,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
             "/v1/models",
             get(models_route::models).fallback(|| async { method_not_allowed("GET") }),
         )
+        .merge(mgmt::routes(state.clone()))
         .fallback(not_found)
         .with_state(state)
 }
@@ -88,7 +89,7 @@ async fn not_found(method: Method, uri: Uri) -> Response {
     )
 }
 
-fn method_not_allowed(allow: &'static str) -> Response {
+pub(super) fn method_not_allowed(allow: &'static str) -> Response {
     let mut r = anthropic_error(405, "invalid_request_error", "pooltime: method not allowed");
     r.headers_mut()
         .insert(ALLOW, HeaderValue::from_static(allow));

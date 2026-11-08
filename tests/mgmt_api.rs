@@ -575,3 +575,1315 @@ async fn empty_proxy_key_means_open() {
     .await;
     assert_ne!(r.status, 401);
 }
+
+/// Task 25: the management API (`/api/v1/*`).
+mod mgmt {
+    use std::net::SocketAddr;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use pooltime::accounts::{
+        AccountId, AccountMeta, AccountState, AccountStatus, ErrorRecord, Identity,
+        RateLimitSnapshot, StateBook, TimedOverride, Window, WindowStatus,
+    };
+    use pooltime::config::{Config, Paths};
+    use pooltime::errors::{FailReason, RefreshErrorKind};
+    use pooltime::models::{ModelTable, RouteDef};
+    use pooltime::providers::{
+        AttemptCtx, AttemptOutcome, InboundRequest, Provider, ProviderId, UsageError,
+    };
+    use pooltime::routing::Tuning;
+    use pooltime::server::mgmt::{
+        build_status, ensure_mgmt_key, mgmt_key_path, session_token, AccountView, CredsInfo,
+        StatusInputs, SESSION_COOKIE,
+    };
+    use serde_json::{json, Value};
+    use time::macros::datetime;
+    use time::OffsetDateTime;
+
+    use super::support::fake_anthropic::{FakeAnthropic, Reply, TOKEN};
+    use super::support::sockets::{http_get, http_req, HttpResp};
+    use super::support::{Boot, Booted, Pool};
+
+    const KEY: &str = "mgmt-test-key";
+    const UUID: &str = "aaaaaaaa-0000-0000-0000-000000000001";
+    const ORG: &str = "cccccccc-0000-0000-0000-000000000003";
+
+    fn id(s: &str) -> AccountId {
+        s.parse().unwrap()
+    }
+
+    fn rfc3339(t: OffsetDateTime) -> String {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+
+    /// One management call with the mgmt key as a bearer token.
+    async fn call(srv: &Booted, method: &str, path: &str, body: Option<Value>) -> HttpResp {
+        raw(
+            srv.addr,
+            method,
+            path,
+            body,
+            &[("authorization", &format!("Bearer {KEY}"))],
+        )
+        .await
+    }
+
+    async fn raw(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> HttpResp {
+        let bytes = body.map(|b| b.to_string().into_bytes()).unwrap_or_default();
+        let mut h = vec![("content-type", "application/json")];
+        h.extend_from_slice(headers);
+        http_req(addr, method, path, &h, &bytes).await
+    }
+
+    fn message(r: &HttpResp) -> String {
+        r.json()["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no error message in {}", r.text()))
+            .to_string()
+    }
+
+    fn window(key: &str, model: Option<&str>, util: f64, reset: Option<OffsetDateTime>) -> Window {
+        Window {
+            key: key.into(),
+            model: model.map(str::to_string),
+            status: WindowStatus::Allowed,
+            utilization: util,
+            reset,
+        }
+    }
+
+    fn snapshot(windows: Vec<Window>, at: OffsetDateTime) -> RateLimitSnapshot {
+        RateLimitSnapshot {
+            unified_status: Some("allowed".into()),
+            windows,
+            updated_at: at,
+        }
+    }
+
+    // ---- status ----
+
+    fn view(name: &str, status: AccountStatus, state: AccountState) -> AccountView {
+        AccountView {
+            meta: AccountMeta::new(id(name), ProviderId::Anthropic),
+            status,
+            status_since: None,
+            state,
+            creds: CredsInfo::Present {
+                expires_at: Some(datetime!(2026-11-07 18:00 UTC)),
+                refresh_expires_at: Some(datetime!(2026-12-01 00:00 UTC)),
+            },
+            in_flight: 0,
+            sessions: 0,
+        }
+    }
+
+    #[test]
+    fn status_shape_snapshot() {
+        let now = datetime!(2026-11-07 12:00 UTC);
+        let reset5 = datetime!(2026-11-07 15:00 UTC);
+        let reset7 = datetime!(2026-11-12 09:00 UTC);
+
+        // ready: both windows plus a model-scoped one, in flight, a session, an override.
+        let mut ready = view(
+            "alpha",
+            AccountStatus::Ready,
+            AccountState {
+                snapshot: Some(snapshot(
+                    vec![
+                        window("5h", None, 0.25, Some(reset5)),
+                        window("7d", None, 0.37, Some(reset7)),
+                        window("7d-fable", Some("fable"), 0.9, Some(reset7)),
+                    ],
+                    now,
+                )),
+                ..AccountState::default()
+            },
+        );
+        ready.meta.priority = 10;
+        ready.meta.weight = 2.0;
+        ready.meta.identity = Identity {
+            email: Some("alpha@example.com".into()),
+            ..Identity::default()
+        };
+        ready.meta.weight_override = Some(TimedOverride {
+            weight: 5.0,
+            until: datetime!(2026-11-08 00:00 UTC),
+        });
+        ready.in_flight = 2;
+        ready.sessions = 3;
+        ready.status_since = Some(datetime!(2026-11-05 08:30 UTC));
+
+        // rate limited by the 5h window; last error recorded.
+        let mut limited = view(
+            "bravo",
+            AccountStatus::RateLimited {
+                until: reset5,
+                window: Some("5h".into()),
+            },
+            AccountState {
+                snapshot: Some(snapshot(
+                    vec![
+                        window("5h", None, 1.0, Some(reset5)),
+                        window("7d", None, 0.9, Some(reset7)),
+                    ],
+                    now,
+                )),
+                last_error: Some(ErrorRecord {
+                    at: datetime!(2026-11-07 11:58 UTC),
+                    reason: FailReason::Quota {
+                        reset: Some(reset5),
+                    },
+                    upstream_request_id: Some("req_abc".into()),
+                }),
+                ..AccountState::default()
+            },
+        );
+        limited.status_since = Some(datetime!(2026-11-07 11:58 UTC));
+
+        // dead account with a stale, healthy-looking snapshot: no windows, no headroom.
+        let mut dead = view(
+            "charlie",
+            AccountStatus::NeedsLogin,
+            AccountState {
+                snapshot: Some(snapshot(vec![window("7d", None, 0.0, Some(reset7))], now)),
+                dead_refresh_fp: Some("fp".into()),
+                ..AccountState::default()
+            },
+        );
+        dead.status_since = Some(datetime!(2026-11-06 00:00 UTC));
+
+        let mut billing = view("delta", AccountStatus::Billing, AccountState::default());
+        billing.creds = CredsInfo::Present {
+            expires_at: None,
+            refresh_expires_at: None,
+        };
+
+        let table = ModelTable::defaults();
+        let inputs = StatusInputs {
+            accounts: vec![ready, limited, dead, billing],
+            tuning: Tuning::default(),
+            mapping_enabled: table.mapping_enabled(),
+            mappings: table.mappings().to_vec(),
+        };
+        let v = build_status(&inputs, now);
+        insta::assert_snapshot!(serde_json::to_string_pretty(&v).unwrap());
+
+        // The headline numbers, independent of the snapshot file.
+        assert_eq!(v["pool"]["accounts"], 4);
+        assert_eq!(v["pool"]["available"], 1);
+        assert_eq!(v["pool"]["seven_day_left_total"].as_f64(), Some(0.73));
+        assert_eq!(v["accounts"][2]["seven_day_left"], Value::Null);
+        assert_eq!(v["accounts"][2]["windows"], json!([]));
+    }
+
+    #[test]
+    fn expired_override_is_not_reported() {
+        let now = datetime!(2026-11-07 12:00 UTC);
+        let mut a = view("alpha", AccountStatus::Ready, AccountState::default());
+        a.meta.weight_override = Some(TimedOverride {
+            weight: 5.0,
+            until: now + time::Duration::hours(1),
+        });
+        let inputs = StatusInputs {
+            accounts: vec![a],
+            tuning: Tuning::default(),
+            mapping_enabled: false,
+            mappings: vec![],
+        };
+        let live = build_status(&inputs, now);
+        assert_eq!(live["accounts"][0]["weight_override"]["weight"], 5.0);
+        assert_eq!(live["accounts"][0]["effective_weight"], 5.0);
+        let later = build_status(&inputs, now + time::Duration::hours(2));
+        assert_eq!(later["accounts"][0]["weight_override"], Value::Null);
+        assert_eq!(later["accounts"][0]["effective_weight"], 1.0);
+        assert_eq!(later["accounts"][0]["weight"], 1.0);
+    }
+
+    #[tokio::test]
+    async fn status_over_http_is_unauthenticated_and_live() {
+        let pool = Pool::new();
+        let now = OffsetDateTime::now_utc();
+        pool.state.merge_header_snapshot(
+            &pool.meta.id,
+            snapshot(
+                vec![
+                    window("5h", None, 0.25, Some(now + time::Duration::hours(2))),
+                    window("7d", None, 0.5, Some(now + time::Duration::days(3))),
+                ],
+                now,
+            ),
+        );
+        // No credentials at all: needs login, and its stale snapshot must not read as headroom.
+        let dead = AccountMeta::new(id("dead"), ProviderId::Anthropic);
+        pool.reg.upsert(dead.clone()).unwrap();
+        pool.state
+            .merge_header_snapshot(&dead.id, snapshot(vec![window("7d", None, 0.0, None)], now));
+        let srv = pool.boot(Boot::default()).await;
+
+        let r = http_get(srv.addr, "/api/v1/status", &[]).await;
+        assert_eq!(r.status, 200);
+        let v = r.json();
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert!(v["now"].as_str().is_some());
+        assert_eq!(v["pool"]["accounts"], 2);
+        assert_eq!(v["pool"]["available"], 1);
+        assert_eq!(v["pool"]["seven_day_left_total"].as_f64(), Some(0.5));
+        assert_eq!(v["tuning"]["five_hour_exp"], 1.0);
+        assert_eq!(v["mapping"]["enabled"], false);
+
+        let accounts = v["accounts"].as_array().unwrap();
+        let dead_v = accounts.iter().find(|a| a["id"] == "dead").unwrap();
+        assert_eq!(dead_v["status"], "needs_login");
+        assert_eq!(dead_v["reason"], "never_logged_in");
+        assert_eq!(dead_v["seven_day_left"], Value::Null);
+        assert_eq!(dead_v["windows"], json!([]));
+        assert!(dead_v["status_since"].as_str().is_some(), "{dead_v}");
+        assert!(dead_v["expires_at"].is_null());
+
+        let work = accounts.iter().find(|a| a["id"] == "work").unwrap();
+        assert_eq!(work["status"], "ready");
+        assert_eq!(work["provider"], "anthropic");
+        assert_eq!(work["seven_day_left"].as_f64(), Some(0.5));
+        assert_eq!(work["windows"].as_array().unwrap().len(), 2);
+        assert!(work["expires_at"].as_str().is_some());
+        assert_eq!(work["priority"], 100);
+        assert_eq!(work["in_flight"], 0);
+        assert!(work["last_error"].is_null());
+        // No credential material anywhere in the response.
+        let text = r.text();
+        for secret in [super::support::ACCESS, super::support::REFRESH] {
+            assert!(!text.contains(secret));
+        }
+    }
+
+    // ---- auth ----
+
+    #[tokio::test]
+    async fn mutations_require_key_or_cookie() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        let cookie = format!("{SESSION_COOKIE}={}", session_token(KEY));
+        let mutations: Vec<(&str, &str, Value)> = vec![
+            (
+                "POST",
+                "/api/v1/accounts",
+                json!({"id": "x", "provider": "anthropic"}),
+            ),
+            ("DELETE", "/api/v1/accounts/work", json!({})),
+            (
+                "POST",
+                "/api/v1/accounts/work/login",
+                json!({"mode": "paste"}),
+            ),
+            (
+                "POST",
+                "/api/v1/accounts/work/routing",
+                json!({"priority": 5}),
+            ),
+            ("POST", "/api/v1/accounts/work/recheck", json!({})),
+            ("POST", "/api/v1/signin/nope/code", json!({"code": "a#b"})),
+            ("POST", "/api/v1/signin/nope/bind", json!({})),
+            ("POST", "/api/v1/tuning", json!({"five_hour_exp": 2})),
+            ("POST", "/api/v1/mappings", json!({"enabled": false})),
+        ];
+        for (method, path, body) in &mutations {
+            let anon = raw(srv.addr, method, path, Some(body.clone()), &[]).await;
+            assert_eq!(anon.status, 401, "anonymous {method} {path}");
+            assert_eq!(anon.json()["error"]["type"], "authentication_error");
+
+            for bad in [
+                "Bearer wrong",
+                "Bearer ",
+                "Basic bW10ZXN0LWtleQ==",
+                "mgmt-test-key",
+            ] {
+                let r = raw(
+                    srv.addr,
+                    method,
+                    path,
+                    Some(body.clone()),
+                    &[("authorization", bad)],
+                )
+                .await;
+                assert_eq!(r.status, 401, "{bad:?} {method} {path}");
+            }
+            // The proxy-style x-api-key is not a management credential.
+            let r = raw(
+                srv.addr,
+                method,
+                path,
+                Some(body.clone()),
+                &[("x-api-key", KEY)],
+            )
+            .await;
+            assert_eq!(r.status, 401, "x-api-key {method} {path}");
+            // The raw key is not the cookie value: the cookie carries a derived token.
+            let leaked = format!("{SESSION_COOKIE}={KEY}");
+            let r = raw(
+                srv.addr,
+                method,
+                path,
+                Some(body.clone()),
+                &[("cookie", &leaked)],
+            )
+            .await;
+            assert_eq!(r.status, 401, "raw key as cookie {method} {path}");
+            let r = raw(
+                srv.addr,
+                method,
+                path,
+                Some(body.clone()),
+                &[("cookie", &format!("{SESSION_COOKIE}=nope"))],
+            )
+            .await;
+            assert_eq!(r.status, 401, "bad cookie {method} {path}");
+        }
+        // Nothing above changed anything.
+        assert!(pool.reg.get(&id("work")).is_some());
+        assert!(pool.reg.get(&id("x")).is_none());
+
+        // A good bearer or cookie gets past auth (the call itself may still be refused).
+        for (method, path, body) in &mutations {
+            if *method == "DELETE" {
+                continue;
+            }
+            for h in [
+                ("authorization", format!("Bearer {KEY}")),
+                ("authorization", format!("bearer {KEY}")),
+                ("cookie", format!("other=1; {cookie}; more=2")),
+            ] {
+                let r = raw(srv.addr, method, path, Some(body.clone()), &[(h.0, &h.1)]).await;
+                assert_ne!(r.status, 401, "{method} {path} with {}", h.0);
+                assert_ne!(r.status, 403, "{method} {path} with {}", h.0);
+            }
+        }
+        // Reads need nothing.
+        assert_eq!(http_get(srv.addr, "/api/v1/status", &[]).await.status, 200);
+        assert_eq!(
+            http_get(srv.addr, "/api/v1/signin/nope", &[]).await.status,
+            404
+        );
+        // Auth is checked after the method: a wrong verb is a 405, not a 401.
+        let r = raw(srv.addr, "GET", "/api/v1/tuning", None, &[]).await;
+        assert_eq!(r.status, 405);
+        assert_eq!(r.header("allow"), Some("POST"));
+        // A valid key does not bypass the Host/Origin guard.
+        let before = srv.app.tuning();
+        let r = raw(
+            srv.addr,
+            "POST",
+            "/api/v1/tuning",
+            Some(json!({"five_hour_exp": 3})),
+            &[
+                ("authorization", &format!("Bearer {KEY}")),
+                ("origin", "http://evil.example"),
+            ],
+        )
+        .await;
+        assert_eq!(r.status, 403);
+        assert_eq!(srv.app.tuning(), before);
+    }
+
+    #[tokio::test]
+    async fn session_exchange_sets_cookie() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+
+        // Wrong or missing key: no cookie.
+        for body in [
+            json!({"k": "wrong"}),
+            json!({"k": ""}),
+            json!({}),
+            json!({"k": 7}),
+        ] {
+            let r = raw(srv.addr, "POST", "/api/v1/session", Some(body), &[]).await;
+            assert_eq!(r.status, 401);
+            assert!(r.header("set-cookie").is_none());
+        }
+
+        let r = raw(
+            srv.addr,
+            "POST",
+            "/api/v1/session",
+            Some(json!({"k": KEY})),
+            &[],
+        )
+        .await;
+        assert_eq!(r.status, 200);
+        assert_eq!(r.json()["ok"], true);
+        let set = r.header("set-cookie").expect("set-cookie").to_string();
+        assert!(set.starts_with(&format!("{SESSION_COOKIE}=")), "{set}");
+        assert!(set.contains("HttpOnly"), "{set}");
+        assert!(set.contains("SameSite=Strict"), "{set}");
+        assert!(set.contains("Path=/"), "{set}");
+        assert!(!set.contains("Secure"), "plain http on localhost: {set}");
+        assert!(
+            !set.contains(KEY),
+            "the cookie must not carry the key itself"
+        );
+        assert!(!r.text().contains(KEY));
+
+        // The cookie alone authorizes a mutation.
+        let pair = set.split(';').next().unwrap().to_string();
+        let r = raw(
+            srv.addr,
+            "POST",
+            "/api/v1/tuning",
+            Some(json!({"five_hour_exp": 2.0})),
+            &[("cookie", &pair)],
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert_eq!(srv.app.tuning().five_hour_exp, 2.0);
+
+        // A foreign page cannot exchange or ride the cookie.
+        let r = raw(
+            srv.addr,
+            "POST",
+            "/api/v1/session",
+            Some(json!({"k": KEY})),
+            &[("origin", "http://evil.example")],
+        )
+        .await;
+        assert_eq!(r.status, 403);
+        assert!(r.header("set-cookie").is_none());
+    }
+
+    #[test]
+    fn mgmt_key_created_once_with_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let key = ensure_mgmt_key(&paths).unwrap();
+        assert_eq!(key.len(), 64);
+        assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
+        let p = mgmt_key_path(&paths);
+        assert!(p.starts_with(&paths.run));
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&p), 0o600);
+        assert_eq!(std::fs::read_to_string(&p).unwrap().trim(), key);
+        // Stable across calls, even if the file got looser permissions.
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(ensure_mgmt_key(&paths).unwrap(), key);
+        assert_eq!(mode(&p), 0o600);
+        // A truncated/garbled file is replaced rather than used as a weak key.
+        std::fs::write(&p, "short").unwrap();
+        let fresh = ensure_mgmt_key(&paths).unwrap();
+        assert_eq!(fresh.len(), 64);
+        assert_ne!(fresh, key);
+    }
+
+    // ---- routing ----
+
+    #[tokio::test]
+    async fn routing_bounds_rejected() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        let path = "/api/v1/accounts/work/routing";
+        let future = rfc3339(OffsetDateTime::now_utc() + time::Duration::hours(1));
+        let past = rfc3339(OffsetDateTime::now_utc() - time::Duration::hours(1));
+
+        let prio = "priority must be a non-negative integer";
+        let wt = "weight must be a number between 0.1 and 10";
+        let bad: Vec<(Value, &str)> = vec![
+            (json!({}), "provide priority"),
+            (json!({"priority": -1}), prio),
+            (json!({"priority": 1.5}), prio),
+            (json!({"priority": "high"}), prio),
+            (json!({"priority": 4_294_967_296u64}), prio),
+            (json!({"weight": 0.05}), wt),
+            (json!({"weight": 10.5}), wt),
+            (json!({"weight": "2"}), wt),
+            (json!({"weight": null}), wt),
+            (
+                json!({"weight": 2, "until": "tomorrow"}),
+                "until must be an RFC 3339",
+            ),
+            (
+                json!({"weight": 2, "until": 12345}),
+                "until must be an RFC 3339",
+            ),
+            (
+                json!({"weight": 2, "until": past}),
+                "until must be in the future",
+            ),
+            (json!({"until": future}), "until requires weight"),
+            (json!({"weight": 20, "until": future}), wt),
+            // One bad field rejects the whole request: priority must not be applied.
+            (json!({"priority": 1, "weight": 99}), wt),
+            (json!([1, 2]), "JSON object"),
+        ];
+        for (body, want) in bad {
+            let r = call(&srv, "POST", path, Some(body.clone())).await;
+            assert_eq!(r.status, 400, "{body}: {}", r.text());
+            assert_eq!(r.json()["error"]["type"], "invalid_request_error");
+            assert!(message(&r).contains(want), "{body}: {}", message(&r));
+        }
+        let meta = pool.reg.get(&id("work")).unwrap();
+        assert_eq!(meta.priority, 100);
+        assert_eq!(meta.weight, 1.0);
+        assert!(meta.weight_override.is_none());
+
+        // Unknown account and malformed id.
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts/ghost/routing",
+            Some(json!({"priority": 1})),
+        )
+        .await;
+        assert_eq!(r.status, 404);
+        assert!(message(&r).contains("ghost"));
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts/bad%20id/routing",
+            Some(json!({"priority": 1})),
+        )
+        .await;
+        assert_eq!(r.status, 400);
+        let r = call(&srv, "POST", path, None).await;
+        assert_eq!(r.status, 400, "empty body is not JSON");
+
+        // Boundary values are accepted.
+        for body in [
+            json!({"priority": 0}),
+            json!({"priority": 4_294_967_295u64}),
+            json!({"weight": 0.1}),
+            json!({"weight": 10}),
+            json!({"priority": 7, "weight": 2.5}),
+        ] {
+            let r = call(&srv, "POST", path, Some(body.clone())).await;
+            assert_eq!(r.status, 200, "{body}: {}", r.text());
+        }
+        let meta = pool.reg.get(&id("work")).unwrap();
+        assert_eq!((meta.priority, meta.weight), (7, 2.5));
+        let r = call(&srv, "POST", path, Some(json!({"priority": 3}))).await;
+        assert_eq!(r.json()["priority"], 3);
+        assert_eq!(r.json()["weight"], 2.5, "an omitted field is left alone");
+    }
+
+    #[tokio::test]
+    async fn timed_weight_override_reverts() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        let path = "/api/v1/accounts/work/routing";
+        let until = OffsetDateTime::now_utc() + time::Duration::milliseconds(1500);
+
+        let r = call(
+            &srv,
+            "POST",
+            path,
+            Some(json!({"weight": 8, "until": rfc3339(until)})),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let meta = pool.reg.get(&id("work")).unwrap();
+        assert_eq!(meta.weight, 1.0, "the base weight is untouched");
+        assert_eq!(meta.weight_override.as_ref().map(|o| o.weight), Some(8.0));
+
+        // Visible while active, and what routing scores with.
+        let v = http_get(srv.addr, "/api/v1/status", &[]).await.json();
+        let a = &v["accounts"][0];
+        assert_eq!(a["weight"], 1.0);
+        assert_eq!(a["weight_override"]["weight"], 8.0);
+        assert_eq!(a["weight_override"]["until"], rfc3339(until).as_str());
+        assert_eq!(a["effective_weight"], 8.0);
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(pooltime::routing::score::effective_weight(&meta, now), 8.0);
+
+        // After `until` it reverts without anyone touching it.
+        tokio::time::sleep(Duration::from_millis(1700)).await;
+        let v = http_get(srv.addr, "/api/v1/status", &[]).await.json();
+        let a = &v["accounts"][0];
+        assert_eq!(a["weight_override"], Value::Null);
+        assert_eq!(a["effective_weight"], 1.0);
+        let meta = pool.reg.get(&id("work")).unwrap();
+        assert_eq!(
+            pooltime::routing::score::effective_weight(&meta, OffsetDateTime::now_utc()),
+            1.0
+        );
+
+        // An explicit `until: null` with no weight cancels an active override early.
+        let later = rfc3339(OffsetDateTime::now_utc() + time::Duration::hours(1));
+        call(
+            &srv,
+            "POST",
+            path,
+            Some(json!({"weight": 4, "until": later})),
+        )
+        .await;
+        let r = call(&srv, "POST", path, Some(json!({"until": null}))).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert!(pool.reg.get(&id("work")).unwrap().weight_override.is_none());
+    }
+
+    // ---- tuning & mappings ----
+
+    #[tokio::test]
+    async fn tuning_bounds_and_live_apply() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        let before = srv.app.tuning();
+        assert_eq!(before, Tuning::default());
+
+        for (body, want) in [
+            (json!({}), "at least one"),
+            (json!([]), "JSON object"),
+            (
+                json!({"five_hour_exp": 6}),
+                "five_hour_exp must be within 0..=5",
+            ),
+            (
+                json!({"five_hour_exp": -0.1}),
+                "five_hour_exp must be within 0..=5",
+            ),
+            (
+                json!({"min_headroom": 1.5}),
+                "min_headroom must be within 0..=1",
+            ),
+            (
+                json!({"headroom_taper_start": 0}),
+                "headroom_taper_start must be within (0, 1]",
+            ),
+            (
+                json!({"headroom_taper_start": "x"}),
+                "headroom_taper_start must be a number",
+            ),
+            (json!({"bogus": 1}), "unknown tuning field 'bogus'"),
+            // Atomic: the valid half is not applied.
+            (
+                json!({"five_hour_exp": 2, "min_headroom": 9}),
+                "min_headroom",
+            ),
+        ] {
+            let r = call(&srv, "POST", "/api/v1/tuning", Some(body.clone())).await;
+            assert_eq!(r.status, 400, "{body}: {}", r.text());
+            assert!(message(&r).contains(want), "{body}: {}", message(&r));
+        }
+        assert_eq!(srv.app.tuning(), before);
+
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/tuning",
+            Some(json!({"five_hour_exp": 2.5})),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert_eq!(r.json()["tuning"]["five_hour_exp"], 2.5);
+        let now = srv.app.tuning();
+        assert_eq!(now.five_hour_exp, 2.5);
+        assert_eq!(
+            now.min_headroom, before.min_headroom,
+            "a partial patch keeps the rest"
+        );
+        let v = http_get(srv.addr, "/api/v1/status", &[]).await.json();
+        assert_eq!(v["tuning"]["five_hour_exp"], 2.5);
+
+        // Persisted to config.toml (so it survives a restart), other settings untouched.
+        let saved = Config::load_file(&Paths::under(pool.dir.path())).unwrap();
+        assert_eq!(saved.routing.five_hour_exp, 2.5);
+        assert_eq!(saved.routing.min_headroom, before.min_headroom);
+        assert_eq!(saved.port, Config::default().port);
+    }
+
+    #[tokio::test]
+    async fn mappings_validation_and_persist() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        for (body, want) in [
+            (json!({}), "provide enabled and/or mappings"),
+            (json!({"enabled": "yes"}), "enabled must be a boolean"),
+            (json!({"mappings": {}}), "mappings must be an array"),
+            (json!({"mappings": [{"from": 1}]}), "each mapping needs"),
+            (
+                json!({"mappings": [{"from": "nope", "to": "gpt-6-sol"}]}),
+                "unknown family 'nope'",
+            ),
+            (
+                json!({"mappings": [{"from": "opus", "to": "no-such-model"}]}),
+                "unknown target model 'no-such-model'",
+            ),
+            (
+                json!({"mappings": [{"from": "opus", "to": "gpt-6-sol", "effort": {"low": "bogus"}}]}),
+                "invalid effort value 'bogus' for tier 'low'",
+            ),
+            // Atomic: the flag is not flipped when a row is bad.
+            (
+                json!({"enabled": true, "mappings": [{"from": "x", "to": "y"}]}),
+                "unknown family",
+            ),
+        ] {
+            let r = call(&srv, "POST", "/api/v1/mappings", Some(body.clone())).await;
+            assert_eq!(r.status, 400, "{body}: {}", r.text());
+            assert!(message(&r).contains(want), "{body}: {}", message(&r));
+        }
+        assert!(!srv.app.models.read().unwrap().mapping_enabled());
+
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/mappings",
+            Some(json!({"enabled": true, "mappings": [{"from": "opus", "to": "gpt-6-luna", "effort": {"low": "low"}}]})),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        assert_eq!(v["mapping"]["enabled"], true);
+        let rows = v["mapping"]["mappings"].as_array().unwrap();
+        let opus = rows.iter().find(|m| m["from"] == "opus").unwrap();
+        assert_eq!(opus["to"], "gpt-6-luna");
+        assert_eq!(opus["effort"]["low"], "low");
+        // Untouched families keep their rows.
+        assert!(rows
+            .iter()
+            .any(|m| m["from"] == "haiku" && m["to"] == "gpt-6-luna"));
+        assert!(rows
+            .iter()
+            .any(|m| m["from"] == "fable" && m["to"] == "gpt-6-astra"));
+
+        let status = http_get(srv.addr, "/api/v1/status", &[]).await.json();
+        assert_eq!(status["mapping"]["enabled"], true);
+
+        // Persisted: a fresh load sees it.
+        let loaded = ModelTable::load(&Paths::under(pool.dir.path())).unwrap();
+        assert!(loaded.mapping_enabled());
+        assert_eq!(
+            loaded
+                .mappings()
+                .iter()
+                .find(|m| m.from == "opus")
+                .unwrap()
+                .to,
+            "gpt-6-luna"
+        );
+    }
+
+    // ---- accounts ----
+
+    #[tokio::test]
+    async fn account_create_delete_forgets_state() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts",
+            Some(json!({"id": "extra", "provider": "anthropic"})),
+        )
+        .await;
+        assert_eq!(r.status, 201, "{}", r.text());
+        assert_eq!(r.json()["id"], "extra");
+        let meta = pool.reg.get(&id("extra")).unwrap();
+        assert_eq!(meta.provider, ProviderId::Anthropic);
+        assert_eq!(meta.priority, 100);
+
+        for (body, status, want) in [
+            (
+                json!({"id": "extra", "provider": "anthropic"}),
+                409,
+                "already exists",
+            ),
+            (
+                json!({"id": "../etc", "provider": "anthropic"}),
+                400,
+                "invalid account id",
+            ),
+            (
+                json!({"id": "ok-id", "provider": "gemini"}),
+                400,
+                "unknown provider",
+            ),
+            (json!({"id": "ok-id"}), 400, "provider"),
+            (json!({"provider": "anthropic"}), 400, "id"),
+        ] {
+            let r = call(&srv, "POST", "/api/v1/accounts", Some(body.clone())).await;
+            assert_eq!(r.status, status, "{body}: {}", r.text());
+            assert!(message(&r).contains(want), "{body}: {}", message(&r));
+        }
+        assert!(pool.reg.get(&id("ok-id")).is_none());
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts",
+            Some(json!({"id": "oa", "provider": "openai"})),
+        )
+        .await;
+        assert_eq!(
+            r.status, 201,
+            "an openai account can be registered even before it can sign in"
+        );
+
+        // Cool the account down, then delete it.
+        let now = OffsetDateTime::now_utc();
+        pool.state.mark_rate_limited(
+            &id("extra"),
+            now + time::Duration::hours(1),
+            Some("5h".into()),
+            now,
+        );
+        let r = call(&srv, "DELETE", "/api/v1/accounts/extra", None).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert!(pool.reg.get(&id("extra")).is_none());
+        let v = http_get(srv.addr, "/api/v1/status", &[]).await.json();
+        assert!(v["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["id"] != "extra"));
+        assert_eq!(
+            call(&srv, "DELETE", "/api/v1/accounts/extra", None)
+                .await
+                .status,
+            404
+        );
+
+        // Re-adding the same id starts clean: the old cooldown is gone.
+        pool.add_account("extra", ProviderId::Anthropic, 100, "tok");
+        let v = http_get(srv.addr, "/api/v1/status", &[]).await.json();
+        let extra = v["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"] == "extra")
+            .unwrap()
+            .clone();
+        assert_eq!(extra["status"], "ready", "{extra}");
+    }
+
+    /// Counts polls; the error it answers with (if any) is scripted.
+    struct PollProvider {
+        polls: AtomicUsize,
+        fail: Option<UsageError>,
+    }
+
+    #[async_trait]
+    impl Provider for PollProvider {
+        fn id(&self) -> ProviderId {
+            ProviderId::Anthropic
+        }
+        async fn access_token(&self, _: &AccountMeta, _: bool) -> Result<String, RefreshErrorKind> {
+            Ok("t".into())
+        }
+        async fn attempt(
+            &self,
+            _: AttemptCtx<'_>,
+            _: &InboundRequest,
+            _: &StateBook,
+        ) -> AttemptOutcome {
+            unreachable!("not used")
+        }
+        async fn poll_usage(&self, _: &AccountMeta) -> Result<RateLimitSnapshot, UsageError> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            match &self.fail {
+                Some(e) => Err(e.clone()),
+                None => Ok(snapshot(vec![], OffsetDateTime::now_utc())),
+            }
+        }
+        async fn catalog(&self, _: &AccountMeta) -> anyhow::Result<Vec<RouteDef>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn recheck_clears_billing_and_repolls() {
+        for (fail, want_poll) in [(None, "ok"), (Some(UsageError::Status(500)), "status:500")] {
+            let pool = Pool::new();
+            let provider = Arc::new(PollProvider {
+                polls: AtomicUsize::new(0),
+                fail,
+            });
+            let srv = pool.boot(Boot::default().provider(provider.clone())).await;
+            pool.state
+                .mark_billing(&pool.meta.id, OffsetDateTime::now_utc());
+            let v = http_get(srv.addr, "/api/v1/status", &[]).await.json();
+            assert_eq!(v["accounts"][0]["status"], "billing");
+
+            let r = call(&srv, "POST", "/api/v1/accounts/work/recheck", None).await;
+            assert_eq!(r.status, 200, "{}", r.text());
+            let v = r.json();
+            assert_eq!(v["poll"], want_poll);
+            assert_eq!(
+                v["status"], "ready",
+                "the billing block is cleared either way"
+            );
+            assert_eq!(provider.polls.load(Ordering::SeqCst), 1);
+        }
+
+        // Unknown account; and no provider registered for the account's provider.
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        let r = call(&srv, "POST", "/api/v1/accounts/ghost/recheck", None).await;
+        assert_eq!(r.status, 404);
+        let r = call(&srv, "POST", "/api/v1/accounts/work/recheck", None).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(r.json()["poll"], "unavailable");
+    }
+
+    // ---- sign-in ----
+
+    /// A fake Claude OAuth server (token + profile).
+    async fn oauth_fake(profile_uuid: &'static str) -> FakeAnthropic {
+        let fake = FakeAnthropic::start().await;
+        fake.route(TOKEN, |_, _| {
+            Reply::json(
+                200,
+                &json!({
+                    "access_token": "at-new-SECRET",
+                    "refresh_token": "rt-new-SECRET",
+                    "expires_in": 28800,
+                    "refresh_token_expires_in": 30 * 86_400,
+                    "scope": "user:inference user:profile",
+                }),
+            )
+        });
+        fake.route("/api/oauth/profile", move |_, _| {
+            Reply::json(
+                200,
+                &json!({
+                    "account": {"uuid": profile_uuid, "email": "me@example.com"},
+                    "organization": {"uuid": ORG},
+                }),
+            )
+        });
+        fake
+    }
+
+    /// A boot whose daemon config points the Anthropic OAuth endpoints at `fake`.
+    fn boot_against(fake: &FakeAnthropic) -> Boot {
+        let url = fake.url();
+        Boot {
+            configure: Some(Box::new(move |cfg: &mut Config| {
+                cfg.anthropic.token_url = format!("{url}{TOKEN}");
+                cfg.anthropic.api_base = url;
+            })),
+            ..Boot::default()
+        }
+    }
+
+    fn param(url: &str, name: &str) -> Option<String> {
+        reqwest::Url::parse(url)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.into_owned())
+    }
+
+    async fn wait_signin(srv: &Booted, signin_id: &str, until_not: &str) -> Value {
+        let path = format!("/api/v1/signin/{signin_id}");
+        for _ in 0..100 {
+            let v = http_get(srv.addr, &path, &[]).await.json();
+            if v["status"] != until_not {
+                return v;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("sign-in stayed {until_not}");
+    }
+
+    fn with_baseline(pool: &Pool, uuid: &str, email: &str) {
+        let mut meta = pool.meta.clone();
+        meta.identity = Identity {
+            account_uuid: Some(uuid.into()),
+            email: Some(email.into()),
+            org_uuid: None,
+        };
+        pool.reg.upsert(meta).unwrap();
+    }
+
+    #[tokio::test]
+    async fn login_returns_authorize_url_and_completes_via_paste_code() {
+        let fake = oauth_fake(UUID).await;
+        let pool = Pool::new();
+        // The account already has a baseline identity, so the sign-in saves without binding.
+        with_baseline(&pool, UUID, "me@example.com");
+        let srv = pool.boot(boot_against(&fake)).await;
+
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts/work/login",
+            Some(json!({"mode": "paste"})),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        let signin_id = v["signin_id"].as_str().unwrap().to_string();
+        let url = v["authorize_url"].as_str().unwrap().to_string();
+        assert!(
+            url.starts_with(&srv.app.cfg.anthropic.authorize_url),
+            "{url}"
+        );
+        assert_eq!(
+            param(&url, "code_challenge_method").as_deref(),
+            Some("S256")
+        );
+        assert_eq!(
+            param(&url, "redirect_uri").as_deref(),
+            Some(srv.app.cfg.anthropic.manual_redirect_url.as_str()),
+            "paste mode uses the manual redirect page"
+        );
+        assert_eq!(param(&url, "login_hint").as_deref(), Some("me@example.com"));
+        assert!(v["expires_at"].as_str().is_some());
+        let state = param(&url, "state").unwrap();
+
+        // Pending until a code arrives.
+        let r = http_get(srv.addr, &format!("/api/v1/signin/{signin_id}"), &[]).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(r.json()["status"], "pending");
+        assert_eq!(r.json()["account"], "work");
+
+        // Bad input is refused and leaves the flow usable.
+        let path = format!("/api/v1/signin/{signin_id}/code");
+        let r = call(&srv, "POST", &path, Some(json!({"code": "no-hash"}))).await;
+        assert_eq!(r.status, 400);
+        assert!(message(&r).contains("code"), "{}", message(&r));
+        let r = call(
+            &srv,
+            "POST",
+            &path,
+            Some(json!({"code": "abc#wrong-state"})),
+        )
+        .await;
+        assert_eq!(r.status, 400);
+        assert!(message(&r).contains("state"), "{}", message(&r));
+        let r = call(&srv, "POST", &path, Some(json!({}))).await;
+        assert_eq!(r.status, 400);
+        assert_eq!(
+            wait_signin(&srv, &signin_id, "x").await["status"],
+            "pending"
+        );
+
+        let r = call(
+            &srv,
+            "POST",
+            &path,
+            Some(json!({"code": format!("auth-code#{state}")})),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let done = wait_signin(&srv, &signin_id, "pending").await;
+        assert_eq!(done["status"], "saved", "{done}");
+        assert_eq!(done["identity"]["email"], "me@example.com");
+
+        // Credentials really were replaced, and nothing secret is in any response.
+        assert_eq!(pool.creds().access_token, "at-new-SECRET");
+        assert_eq!(fake.requests_to(TOKEN)[0].json()["code"], "auth-code");
+        assert!(!r.text().contains("SECRET"));
+        assert!(!done.to_string().contains("SECRET"));
+
+        // The code is single use.
+        let r = call(
+            &srv,
+            "POST",
+            &path,
+            Some(json!({"code": format!("again#{state}")})),
+        )
+        .await;
+        assert_eq!(r.status, 409, "{}", r.text());
+    }
+
+    #[tokio::test]
+    async fn login_for_new_account_creates_it_and_needs_binding() {
+        let fake = oauth_fake(UUID).await;
+        let pool = Pool::new();
+        let srv = pool.boot(boot_against(&fake)).await;
+
+        // `provider` defaults to anthropic; the account is created by the login.
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts/fresh/login",
+            Some(json!({"mode": "paste"})),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        let signin_id = v["signin_id"].as_str().unwrap().to_string();
+        let state = param(v["authorize_url"].as_str().unwrap(), "state").unwrap();
+        let meta = pool.reg.get(&id("fresh")).expect("created by login");
+        assert_eq!(meta.provider, ProviderId::Anthropic);
+
+        let r = call(
+            &srv,
+            "POST",
+            &format!("/api/v1/signin/{signin_id}/code"),
+            Some(json!({"code": format!("c#{state}")})),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let done = wait_signin(&srv, &signin_id, "pending").await;
+        assert_eq!(done["status"], "needs_binding", "{done}");
+        assert_eq!(done["got"]["email"], "me@example.com");
+        assert!(
+            pool.reg.read_creds(&id("fresh")).unwrap().is_none(),
+            "nothing saved yet"
+        );
+
+        let r = call(
+            &srv,
+            "POST",
+            &format!("/api/v1/signin/{signin_id}/bind"),
+            None,
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert_eq!(r.json()["identity"]["email"], "me@example.com");
+        assert!(pool.reg.read_creds(&id("fresh")).unwrap().is_some());
+        let meta = pool.reg.get(&id("fresh")).unwrap();
+        assert_eq!(meta.identity.account_uuid.as_deref(), Some(UUID));
+        let v = http_get(srv.addr, &format!("/api/v1/signin/{signin_id}"), &[])
+            .await
+            .json();
+        assert_eq!(v["status"], "saved");
+
+        // Binding twice, or an unknown flow, is refused.
+        let r = call(
+            &srv,
+            "POST",
+            &format!("/api/v1/signin/{signin_id}/bind"),
+            None,
+        )
+        .await;
+        assert_eq!(r.status, 409);
+        let r = call(&srv, "POST", "/api/v1/signin/nope/bind", None).await;
+        assert_eq!(r.status, 404);
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/signin/nope/code",
+            Some(json!({"code": "a#b"})),
+        )
+        .await;
+        assert_eq!(r.status, 404);
+    }
+
+    #[tokio::test]
+    async fn login_mismatch_reports_both_identities_and_saves_nothing() {
+        let fake = oauth_fake("bbbbbbbb-0000-0000-0000-000000000002").await;
+        let pool = Pool::new();
+        with_baseline(&pool, UUID, "owner@example.com");
+        let before = pool.creds();
+        let srv = pool.boot(boot_against(&fake)).await;
+
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts/work/login",
+            Some(json!({"mode": "paste"})),
+        )
+        .await;
+        let v = r.json();
+        let signin_id = v["signin_id"].as_str().unwrap().to_string();
+        let state = param(v["authorize_url"].as_str().unwrap(), "state").unwrap();
+        call(
+            &srv,
+            "POST",
+            &format!("/api/v1/signin/{signin_id}/code"),
+            Some(json!({"code": format!("c#{state}")})),
+        )
+        .await;
+        let done = wait_signin(&srv, &signin_id, "pending").await;
+        assert_eq!(done["status"], "mismatch", "{done}");
+        assert_eq!(done["expected"]["email"], "owner@example.com");
+        assert_eq!(done["got"]["email"], "me@example.com");
+        let msg = done["message"].as_str().unwrap();
+        assert!(
+            msg.contains("owner@example.com") && msg.contains("me@example.com"),
+            "{msg}"
+        );
+        assert_eq!(pool.creds(), before, "credentials untouched");
+    }
+
+    #[tokio::test]
+    async fn login_validation() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts/oa/login",
+            Some(json!({"mode": "paste", "provider": "openai"})),
+        )
+        .await;
+        assert_eq!(r.status, 400);
+        assert!(message(&r).contains("not yet supported"), "{}", message(&r));
+        assert!(
+            pool.reg.get(&id("oa")).is_none(),
+            "an unsupported login must not create the account"
+        );
+
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts/work/login",
+            Some(json!({"mode": "telepathy"})),
+        )
+        .await;
+        assert_eq!(r.status, 400);
+        assert!(message(&r).contains("mode"), "{}", message(&r));
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts/work/login",
+            Some(json!({"mode": "paste", "provider": "nope"})),
+        )
+        .await;
+        assert_eq!(r.status, 400);
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts/work/login",
+            Some(json!({"mode": "paste", "provider": "openai"})),
+        )
+        .await;
+        assert_eq!(
+            r.status, 400,
+            "provider disagrees with the existing account"
+        );
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts/bad%2Fid/login",
+            Some(json!({"mode": "paste"})),
+        )
+        .await;
+        assert_eq!(r.status, 400);
+
+        // An existing OpenAI account cannot sign in yet either.
+        pool.add_account("codex1", ProviderId::OpenAi, 100, "x");
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts/codex1/login",
+            Some(json!({"mode": "paste"})),
+        )
+        .await;
+        assert_eq!(r.status, 400);
+        assert!(message(&r).contains("not yet supported"), "{}", message(&r));
+
+        // `mode` defaults to the callback listener: the URL carries a localhost redirect.
+        let r = call(&srv, "POST", "/api/v1/accounts/work/login", Some(json!({}))).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let url = r.json()["authorize_url"].as_str().unwrap().to_string();
+        assert!(
+            param(&url, "redirect_uri")
+                .unwrap()
+                .starts_with("http://localhost:"),
+            "{url}"
+        );
+    }
+}

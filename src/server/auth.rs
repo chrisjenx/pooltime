@@ -49,7 +49,7 @@ fn presented_keys(h: &HeaderMap) -> impl Iterator<Item = &str> {
 
 /// Comparison whose timing does not depend on how much of the key matched (digests of equal
 /// length, folded without early exit).
-fn keys_match(presented: &str, expected: &str) -> bool {
+pub(crate) fn keys_match(presented: &str, expected: &str) -> bool {
     let a = Sha256::digest(presented.as_bytes());
     let b = Sha256::digest(expected.as_bytes());
     a.iter()

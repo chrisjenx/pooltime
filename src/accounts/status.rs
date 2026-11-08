@@ -526,6 +526,20 @@ impl StateBook {
 
     // ---- mutators ----
 
+    /// Drop everything known about a deleted account (memory and its persisted state row), so
+    /// re-adding the same id starts clean. Timeline rows are history and stay.
+    pub fn forget(&self, id: &AccountId) {
+        self.lock().remove(id);
+        let account = id.to_string();
+        let queued = self.store.submit(move |c| {
+            c.execute("DELETE FROM account_state WHERE account = ?1", [account])?;
+            Ok(())
+        });
+        if let Err(err) = queued {
+            tracing::error!(account = %id, error = %err, "could not queue account state delete");
+        }
+    }
+
     /// Sideline until `until` (explicit 429 cooldown). `window` names the binding window if known.
     pub fn mark_rate_limited(
         &self,
