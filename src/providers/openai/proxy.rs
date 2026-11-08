@@ -439,6 +439,10 @@ impl Provider for OpenAiProvider {
             .await
             .map_err(|reason| anyhow::anyhow!(reason))
     }
+
+    async fn drain_refreshes(&self) {
+        OpenAiProvider::drain_refreshes(self).await
+    }
 }
 
 fn is_auth_refusal(s: StatusCode) -> bool {

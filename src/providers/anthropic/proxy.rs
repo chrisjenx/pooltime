@@ -483,6 +483,10 @@ impl Provider for AnthropicProvider {
     async fn refresh_live_models(&self) -> anyhow::Result<Vec<serde_json::Value>> {
         AnthropicProvider::refresh_live_models(self).await
     }
+
+    async fn drain_refreshes(&self) {
+        AnthropicProvider::drain_refreshes(self).await
+    }
 }
 
 /// Outcome when no usable access token could be obtained for an account: 401
