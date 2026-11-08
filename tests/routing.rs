@@ -1,0 +1,510 @@
+//! Weighted selection (INV §2), ported from bro `pool/src/accounts/manager.test.ts`.
+//!
+//! Ported from `describe("weighted strategy")`:
+//! - urgency dominates ... (soonest 7d reset wins)            -> `earliest_7d_reset_gets_highest_share`
+//! - load flips the winner                                     -> `load_flips_the_winner`
+//! - expiry order beats weekly headroom                        -> `expiry_order_beats_weekly_headroom`
+//! - manual weight biases selection                            -> `manual_weight_biases_selection`
+//! - 5h headroom collapse drops below later-expiring           -> `five_hour_headroom_collapse_drops_below_later_expiring`
+//! - below routingMinHeadroom falls to a fallback pool         -> `no_viable_falls_back_best_effort`
+//! - priority tiers still gate hard                            -> `only_lowest_priority_tier_used`
+//! - weekly-spent with unknown reset ranks last                -> `weekly_spent_unknown_reset_ranks_last`
+//!
+//! Ported from `describe("routing tuning")`:
+//! - expiry ordering: unknown first, known next, spent last    -> `unknown_data_probed_first`
+//!
+//! Ported from `describe("expiry-share regression")`:
+//! - eleven live sessions allocate 5/3/2/1                     -> `eleven_live_sessions_allocate_5_3_2_1`
+//! - healthy 5h quota is neutral; only scarcity tapers         -> `low_5h_headroom_tapers_score`
+//! - repeated tie preview / round robin (a, b tied)            -> `ties_round_robin`
+//!
+//! Ported from `describe("expiry shares edge cases")`:
+//! - later ranks halve; equal resets share rank; weights multiply -> `later_ranks_halve_equal_resets_share_rank`
+//! - weekly-only Codex near exhaustion neutral; allowed kept   -> `weekly_only_allowed_window_stays_neutral`
+//! - expired and unrelated 5h windows are neutral              -> `expired_and_model_scoped_windows_are_neutral`
+//!
+//! New in pooltime:
+//! - `timed_weight_override_applies_until_expiry`, `usable_*`, `choose_*`, `tuning_*`.
+//!
+//! Not ported (not part of `choose`): provider-level ranking, session pins, in-flight caps,
+//! the routing preview/`routingSnapshot` shape, and tuning.json persistence.
+
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use pooltime::accounts::{
+    AccountId, AccountMeta, AccountStatus, RateLimitSnapshot, TimedOverride, Window, WindowStatus,
+};
+use pooltime::config::RoutingCfg;
+use pooltime::providers::ProviderId;
+use pooltime::routing::score::{expiry_rank, expiry_shares, gate_headroom};
+use pooltime::routing::{choose, score, usable, Candidate, ExpiryRank, Tuning};
+use time::macros::datetime;
+use time::{Duration, OffsetDateTime};
+
+const NOW: OffsetDateTime = datetime!(2026-11-07 12:00 UTC);
+
+fn meta(id: &str) -> AccountMeta {
+    AccountMeta::new(id.parse().unwrap(), ProviderId::Anthropic)
+}
+
+fn win(key: &str, utilization: f64, reset: Option<Duration>) -> Window {
+    Window {
+        key: key.to_string(),
+        model: None,
+        status: WindowStatus::Allowed,
+        utilization,
+        reset: reset.map(|d| NOW + d),
+    }
+}
+
+/// A weekly window that is fully used with no explicit `allowed` (i.e. spent).
+fn spent_7d(reset: Option<Duration>) -> Window {
+    Window {
+        status: WindowStatus::AllowedWarning,
+        ..win("7d", 1.0, reset)
+    }
+}
+
+fn model_win(key: &str, model: &str, utilization: f64, reset: Duration) -> Window {
+    Window {
+        model: Some(model.to_string()),
+        ..win(key, utilization, Some(reset))
+    }
+}
+
+fn snap(windows: Vec<Window>) -> RateLimitSnapshot {
+    RateLimitSnapshot {
+        unified_status: None,
+        windows,
+        updated_at: NOW,
+    }
+}
+
+/// Healthy 5h (20% used) + 7d resetting in `d7`.
+fn snap_7d(util5: f64, d7: Duration) -> RateLimitSnapshot {
+    snap(vec![
+        win("5h", util5, Some(Duration::hours(1))),
+        win("7d", 0.2, Some(d7)),
+    ])
+}
+
+fn cand<'a>(m: &'a AccountMeta, s: Option<&'a RateLimitSnapshot>, sessions: u32) -> Candidate<'a> {
+    Candidate {
+        meta: m,
+        snapshot: s,
+        active_sessions: sessions,
+    }
+}
+
+fn pick<'a>(cands: &[Candidate<'a>]) -> Option<&'a AccountId> {
+    choose(cands, &Tuning::default(), &AtomicUsize::new(0), NOW)
+}
+
+fn name(id: Option<&AccountId>) -> &str {
+    id.expect("a winner").as_str()
+}
+
+#[test]
+fn earliest_7d_reset_gets_highest_share() {
+    let (soon, later) = (meta("soon"), meta("later"));
+    let (s1, s2) = (
+        snap_7d(0.2, Duration::days(1)),
+        snap_7d(0.2, Duration::days(6)),
+    );
+    // Order must not matter.
+    let a = [cand(&later, Some(&s2), 0), cand(&soon, Some(&s1), 0)];
+    assert_eq!(name(pick(&a)), "soon");
+    let b = [cand(&soon, Some(&s1), 0), cand(&later, Some(&s2), 0)];
+    assert_eq!(name(pick(&b)), "soon");
+}
+
+#[test]
+fn load_flips_the_winner() {
+    let (busy, idle) = (meta("soon-busy"), meta("later-idle"));
+    let (s1, s2) = (
+        snap_7d(0.2, Duration::days(1)),
+        snap_7d(0.2, Duration::days(6)),
+    );
+    // soon-busy: 5 / 3 sessions = 1.67 vs later-idle: 3 -> later-idle wins.
+    let c = [cand(&busy, Some(&s1), 2), cand(&idle, Some(&s2), 0)];
+    assert_eq!(name(pick(&c)), "later-idle");
+    let c = [cand(&busy, Some(&s1), 0), cand(&idle, Some(&s2), 0)];
+    assert_eq!(name(pick(&c)), "soon-busy");
+}
+
+#[test]
+fn expiry_order_beats_weekly_headroom() {
+    let (expiring, fresh) = (meta("expiring-soon"), meta("fresh"));
+    let s1 = snap(vec![
+        win("5h", 0.0, Some(Duration::hours(1))),
+        win("7d", 0.97, Some(Duration::hours(3))),
+    ]);
+    let s2 = snap(vec![
+        win("5h", 0.0, Some(Duration::hours(1))),
+        win("7d", 0.49, Some(Duration::hours(65))),
+    ]);
+    let c = [cand(&fresh, Some(&s2), 0), cand(&expiring, Some(&s1), 0)];
+    assert_eq!(name(pick(&c)), "expiring-soon");
+}
+
+#[test]
+fn manual_weight_biases_selection() {
+    let plain = meta("plain");
+    let mut boosted = meta("boosted");
+    boosted.weight = 2.0;
+    let s = snap_7d(0.2, Duration::days(3));
+    // Identical snapshots tie on rank; weight decides regardless of order.
+    let c = [cand(&plain, Some(&s), 0), cand(&boosted, Some(&s), 0)];
+    assert_eq!(name(pick(&c)), "boosted");
+}
+
+#[test]
+fn five_hour_headroom_collapse_drops_below_later_expiring() {
+    let (full, fresh) = (meta("soon-full"), meta("later-fresh"));
+    let s1 = snap_7d(0.9, Duration::days(1));
+    let s2 = snap_7d(0.1, Duration::days(6));
+    // soon-full: 0.1 headroom is still viable, score 5 x (0.1/0.2) = 2.5; later-fresh: 3 x 1.
+    let c = [cand(&full, Some(&s1), 0), cand(&fresh, Some(&s2), 0)];
+    assert_eq!(name(pick(&c)), "later-fresh");
+}
+
+#[test]
+fn no_viable_falls_back_best_effort() {
+    let (a, b) = (meta("nearly-out"), meta("also-out"));
+    let s1 = snap_7d(0.95, Duration::days(1));
+    let s2 = snap_7d(0.99, Duration::days(2));
+    // Neither clears min_headroom (0.1); best-effort still serves the higher score.
+    let c = [cand(&b, Some(&s2), 0), cand(&a, Some(&s1), 0)];
+    assert_eq!(name(pick(&c)), "nearly-out");
+}
+
+#[test]
+fn viable_account_beats_higher_scoring_unviable_one() {
+    let (soon, ok) = (meta("soon-unviable"), meta("later-viable"));
+    let s1 = snap_7d(0.95, Duration::days(1));
+    let s2 = snap_7d(0.5, Duration::days(6));
+    let mut heavy = soon.clone();
+    heavy.weight = 10.0;
+    // Unviable score: 10 x 5 x 0.25 = 12.5 > 3, but the gate removes it.
+    let c = [cand(&heavy, Some(&s1), 0), cand(&ok, Some(&s2), 0)];
+    assert_eq!(name(pick(&c)), "later-viable");
+}
+
+#[test]
+fn only_lowest_priority_tier_used() {
+    let mut t1 = meta("tier1");
+    let mut t2 = meta("tier2-heavy");
+    t1.priority = 1;
+    t2.priority = 2;
+    t2.weight = 10.0;
+    let c = [cand(&t2, None, 0), cand(&t1, None, 5)];
+    assert_eq!(name(pick(&c)), "tier1");
+}
+
+#[test]
+fn weekly_spent_unknown_reset_ranks_last() {
+    let (spent, known) = (meta("spent"), meta("known-later"));
+    let s1 = snap(vec![
+        win("5h", 0.0, Some(Duration::hours(1))),
+        spent_7d(None),
+    ]);
+    let s2 = snap_7d(0.0, Duration::days(5));
+    assert_eq!(expiry_rank(Some(&s1), NOW), ExpiryRank::Spent);
+    let c = [cand(&spent, Some(&s1), 0), cand(&known, Some(&s2), 0)];
+    assert_eq!(name(pick(&c)), "known-later");
+}
+
+#[test]
+fn unknown_data_probed_first() {
+    let (unprobed, known, spent) = (meta("unprobed"), meta("known"), meta("spent"));
+    let s_known = snap_7d(0.0, Duration::days(5));
+    let s_spent = snap(vec![
+        win("5h", 0.0, Some(Duration::hours(1))),
+        spent_7d(None),
+    ]);
+    let all = [
+        cand(&spent, Some(&s_spent), 0),
+        cand(&known, Some(&s_known), 0),
+        cand(&unprobed, None, 0),
+    ];
+    assert_eq!(name(pick(&all)), "unprobed");
+    // Failover: the caller drops tried accounts.
+    assert_eq!(name(pick(&all[..2])), "known");
+    assert_eq!(name(pick(&all[..1])), "spent");
+}
+
+#[test]
+fn eleven_live_sessions_allocate_5_3_2_1() {
+    let metas: Vec<AccountMeta> = ["a", "b", "c", "d"].map(meta).into();
+    let snaps: Vec<RateLimitSnapshot> = (1..=4)
+        .map(|h| snap(vec![win("7d", 0.1, Some(Duration::hours(h)))]))
+        .collect();
+    let mut sessions = [0u32; 4];
+    let cursor = AtomicUsize::new(0);
+    for _ in 0..11 {
+        let cands: Vec<Candidate> = (0..4)
+            .map(|i| cand(&metas[i], Some(&snaps[i]), sessions[i]))
+            .collect();
+        let w = choose(&cands, &Tuning::default(), &cursor, NOW).unwrap();
+        let i = metas.iter().position(|m| &m.id == w).unwrap();
+        sessions[i] += 1;
+    }
+    assert_eq!(sessions, [5, 3, 2, 1]);
+}
+
+#[test]
+fn low_5h_headroom_tapers_score() {
+    let t = Tuning::default();
+    for (headroom, factor) in [
+        (1.0, 1.0),
+        (0.5, 1.0),
+        (0.2, 1.0),
+        (0.15, 0.75),
+        (0.05, 0.25),
+    ] {
+        let s = snap(vec![win("5h", 1.0 - headroom, Some(Duration::hours(1)))]);
+        let h = gate_headroom(Some(&s), NOW);
+        assert!((h - headroom).abs() < 1e-12);
+        // Single account -> expiry rank 0 -> share 5.
+        let got = score(1.0, 5.0, h, 0, &t);
+        assert!((got - 5.0 * factor).abs() < 1e-9, "{headroom}: {got}");
+    }
+}
+
+#[test]
+fn five_hour_exp_shapes_the_taper() {
+    let t = Tuning::new(2.0, 0.1, 0.2).unwrap();
+    assert!((score(1.0, 1.0, 0.1, 0, &t) - 0.25).abs() < 1e-12);
+    let t0 = Tuning::new(0.0, 0.1, 0.2).unwrap();
+    assert_eq!(score(1.0, 1.0, 0.1, 0, &t0), 1.0);
+    // A wider taper start penalizes mid headroom.
+    let wide = Tuning::new(1.0, 0.1, 1.0).unwrap();
+    assert!((score(1.0, 1.0, 0.5, 0, &wide) - 0.5).abs() < 1e-12);
+}
+
+#[test]
+fn later_ranks_halve_equal_resets_share_rank() {
+    let ids = ["a", "b", "c", "d", "e", "f", "g"];
+    let metas: Vec<AccountMeta> = ids.map(meta).into();
+    let snaps: Vec<RateLimitSnapshot> = (0..7usize)
+        .map(|i| {
+            snap(vec![win(
+                "7d",
+                0.99,
+                Some(Duration::hours(i.min(5) as i64 + 1)),
+            )])
+        })
+        .collect();
+    let ranks: Vec<ExpiryRank> = snaps.iter().map(|s| expiry_rank(Some(s), NOW)).collect();
+    assert_eq!(
+        expiry_shares(&ranks),
+        vec![5.0, 3.0, 2.0, 1.0, 0.5, 0.25, 0.25]
+    );
+    // Weight multiplies: failover drops a, b, c; ranks are recomputed over d..g.
+    let mut metas = metas;
+    metas[6].weight = 4.0;
+    let rest: Vec<Candidate> = (3..7)
+        .map(|i| cand(&metas[i], Some(&snaps[i]), 0))
+        .collect();
+    // d:5, e:3, f:2, g:2x4=8 -> g.
+    assert_eq!(name(pick(&rest)), "g");
+}
+
+#[test]
+fn weekly_only_allowed_window_stays_neutral() {
+    let c = meta("codex");
+    for util in [0.92, 0.999, 1.0] {
+        let s = snap(vec![win("7d", util, Some(Duration::hours(1)))]);
+        assert_eq!(gate_headroom(Some(&s), NOW), 1.0);
+        assert_eq!(name(pick(&[cand(&c, Some(&s), 0)])), "codex");
+    }
+    // `allowed` at 100% 5h is unenforced: neutral. An enforced one is not.
+    let s = snap(vec![win("5h", 1.0, Some(Duration::hours(1)))]);
+    assert_eq!(gate_headroom(Some(&s), NOW), 1.0);
+    let mut w = win("5h", 1.0, Some(Duration::hours(1)));
+    w.status = WindowStatus::AllowedWarning;
+    assert_eq!(gate_headroom(Some(&snap(vec![w])), NOW), 0.0);
+}
+
+#[test]
+fn expired_and_model_scoped_windows_are_neutral() {
+    let s = snap(vec![
+        // 5h window whose reset already passed: refreshed.
+        win("5h", 0.99, Some(Duration::seconds(-1))),
+        model_win("5h-fable", "fable", 0.95, Duration::hours(1)),
+        model_win("7d-fable", "fable", 0.999, Duration::hours(2)),
+    ]);
+    assert_eq!(gate_headroom(Some(&s), NOW), 1.0);
+    // Model-scoped and expired windows leave no usable 7d data: probe-first.
+    assert_eq!(expiry_rank(Some(&s), NOW), ExpiryRank::Unknown);
+    // A 7d whose reset has passed is likewise treated as unknown/refreshing.
+    let s = snap(vec![win("7d", 1.0, Some(Duration::seconds(-5)))]);
+    assert_eq!(expiry_rank(Some(&s), NOW), ExpiryRank::Unknown);
+}
+
+#[test]
+fn ties_round_robin() {
+    let (a, b) = (meta("a"), meta("b"));
+    let cands = [cand(&a, None, 0), cand(&b, None, 0)];
+    let cursor = AtomicUsize::new(0);
+    let t = Tuning::default();
+    let seq: Vec<&str> = (0..6)
+        .map(|_| name(choose(&cands, &t, &cursor, NOW)))
+        .collect();
+    assert_eq!(seq, ["a", "b", "a", "b", "a", "b"]);
+}
+
+#[test]
+fn cursor_advances_only_on_ties() {
+    let (a, b) = (meta("a"), meta("b"));
+    let (s1, s2) = (
+        snap_7d(0.2, Duration::days(1)),
+        snap_7d(0.2, Duration::days(2)),
+    );
+    let cands = [cand(&a, Some(&s1), 0), cand(&b, Some(&s2), 0)];
+    let cursor = AtomicUsize::new(0);
+    for _ in 0..5 {
+        assert_eq!(name(choose(&cands, &Tuning::default(), &cursor, NOW)), "a");
+    }
+    assert_eq!(cursor.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn timed_weight_override_applies_until_expiry() {
+    let (plain, mut boosted) = (meta("plain"), meta("boosted"));
+    boosted.weight_override = Some(TimedOverride {
+        weight: 5.0,
+        until: NOW + Duration::minutes(10),
+    });
+    let s = snap_7d(0.2, Duration::days(3));
+    let c = [cand(&plain, Some(&s), 0), cand(&boosted, Some(&s), 0)];
+    let t = Tuning::default();
+    let at = |now| name(choose(&c, &t, &AtomicUsize::new(0), now));
+    assert_eq!(at(NOW), "boosted");
+    assert_eq!(at(NOW + Duration::minutes(9)), "boosted");
+    // Expired: both weigh 1 and tie, so the fresh cursor yields the first candidate.
+    assert_eq!(at(NOW + Duration::minutes(10)), "plain");
+    assert_eq!(at(NOW + Duration::hours(1)), "plain");
+    // Override can also lower the weight below the base.
+    let mut base_heavy = meta("heavy");
+    base_heavy.weight = 3.0;
+    base_heavy.weight_override = Some(TimedOverride {
+        weight: 0.1,
+        until: NOW + Duration::hours(1),
+    });
+    let c = [cand(&base_heavy, Some(&s), 0), cand(&plain, Some(&s), 0)];
+    assert_eq!(name(pick(&c)), "plain");
+}
+
+#[test]
+fn choose_empty_is_none() {
+    assert!(pick(&[]).is_none());
+}
+
+#[test]
+fn choose_ignores_nothing_when_snapshot_missing() {
+    let a = meta("a");
+    assert_eq!(name(pick(&[cand(&a, None, 0)])), "a");
+}
+
+// ---- usable ------------------------------------------------------------------
+
+fn tried(ids: &[&str]) -> HashSet<AccountId> {
+    ids.iter().map(|s| s.parse().unwrap()).collect()
+}
+
+#[test]
+fn usable_requires_ready_status() {
+    let m = meta("a");
+    let none = tried(&[]);
+    let p = ProviderId::Anthropic;
+    assert!(usable(&m, &AccountStatus::Ready, p, None, &[], &none));
+    let until = NOW + Duration::hours(1);
+    for st in [
+        AccountStatus::NeedsLogin,
+        AccountStatus::Billing,
+        AccountStatus::RateLimited {
+            until,
+            window: Some("5h".into()),
+        },
+        AccountStatus::AccessDenied { until },
+    ] {
+        assert!(!usable(&m, &st, p, None, &[], &none), "{st:?}");
+    }
+}
+
+#[test]
+fn usable_checks_provider_tried_and_spent_family() {
+    let m = meta("a");
+    let ready = AccountStatus::Ready;
+    let spent = vec!["fable".to_string()];
+    assert!(!usable(
+        &m,
+        &ready,
+        ProviderId::OpenAi,
+        None,
+        &[],
+        &tried(&[])
+    ));
+    assert!(!usable(
+        &m,
+        &ready,
+        ProviderId::Anthropic,
+        None,
+        &[],
+        &tried(&["a"])
+    ));
+    assert!(usable(
+        &m,
+        &ready,
+        ProviderId::Anthropic,
+        None,
+        &[],
+        &tried(&["b"])
+    ));
+    // Spent fable blocks fable requests only.
+    let a = ProviderId::Anthropic;
+    assert!(!usable(&m, &ready, a, Some("fable"), &spent, &tried(&[])));
+    assert!(usable(&m, &ready, a, Some("opus"), &spent, &tried(&[])));
+    assert!(usable(&m, &ready, a, None, &spent, &tried(&[])));
+}
+
+// ---- tuning ------------------------------------------------------------------
+
+#[test]
+fn tuning_from_routing_cfg() {
+    let cfg = RoutingCfg {
+        five_hour_exp: 2.0,
+        min_headroom: 0.3,
+        headroom_taper_start: 0.5,
+        ..RoutingCfg::default()
+    };
+    let t = Tuning::from(&cfg);
+    assert_eq!(
+        (t.five_hour_exp, t.min_headroom, t.headroom_taper_start),
+        (2.0, 0.3, 0.5)
+    );
+    assert_eq!(Tuning::default(), Tuning::from(&RoutingCfg::default()));
+}
+
+#[test]
+fn tuning_new_rejects_out_of_range() {
+    assert!(Tuning::new(5.5, 0.1, 0.2).is_err());
+    assert!(Tuning::new(1.0, 2.0, 0.2).is_err());
+    assert!(Tuning::new(1.0, 0.1, 0.0).is_err());
+}
+
+#[test]
+fn min_headroom_gate_follows_tuning() {
+    let (mid, fresh) = (meta("mid"), meta("fresh"));
+    let s1 = snap_7d(0.4, Duration::days(1));
+    let s2 = snap_7d(0.1, Duration::days(5));
+    let c = [cand(&mid, Some(&s1), 0), cand(&fresh, Some(&s2), 0)];
+    let cursor = AtomicUsize::new(0);
+    let loose = Tuning::new(1.0, 0.1, 0.2).unwrap();
+    assert_eq!(name(choose(&c, &loose, &cursor, NOW)), "mid");
+    // 0.7 gate is above mid's 0.6 headroom -> benched.
+    let strict = Tuning::new(1.0, 0.7, 0.2).unwrap();
+    assert_eq!(name(choose(&c, &strict, &cursor, NOW)), "fresh");
+}

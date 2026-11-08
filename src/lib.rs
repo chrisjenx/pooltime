@@ -5,4 +5,5 @@ pub mod errors;
 pub mod fsutil;
 pub mod logging;
 pub mod providers;
+pub mod routing;
 pub mod store;
