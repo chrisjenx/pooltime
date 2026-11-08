@@ -27,7 +27,7 @@ pub use proxy::{
     anthropic_error, refresh_failure_outcome, POOL_ACCOUNT_HEADER, RETRYABLE_TRANSPORT_HEADER,
     UPSTREAM_REJECTED_HEADER,
 };
-pub use ratelimit::{has_quota_signal, parse_unified_headers};
+pub use ratelimit::{has_quota_signal, has_rate_limit_wording, parse_unified_headers};
 pub use strip::{
     codex_stash_signature, is_codex_stash_signature, prepare_body, CODEX_STASH_PREFIX,
 };

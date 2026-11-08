@@ -535,6 +535,104 @@ async fn unauthorized_forces_refresh_then_retries_once() {
 }
 
 #[tokio::test]
+async fn unauthorized_with_already_rotated_token_resends_without_refresh() {
+    // The caller's token is stale; the store already holds a fresh one (another request
+    // refreshed meanwhile): resend with the stored token, no token-endpoint call.
+    let fake = FakeAnthropic::start().await;
+    fake.route(MESSAGES, |r, _| {
+        if r.header("authorization") == Some(&format!("Bearer {ACCESS}")) {
+            Reply::json(200, &ok_message(1, 1))
+        } else {
+            Reply::error(401, "authentication_error", "invalid token")
+        }
+    });
+    fake.script(
+        TOKEN,
+        vec![Reply::error(500, "api_error", "must not be called")],
+    );
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let p = pool.provider(&fake, policy);
+    let req = inbound(&simple_body(), HeaderMap::new());
+    let route = route(&req.model);
+    let ctx = AttemptCtx {
+        account: &pool.meta,
+        token: "stale-access-SECRET".into(),
+        route: &route,
+        limits: limits(),
+        upstream: &pool.up,
+    };
+    let out = p.attempt(ctx, &req, &pool.state).await;
+    assert_eq!(kind(&out), "done 200 OK");
+    let auths: Vec<_> = fake
+        .requests_to(MESSAGES)
+        .iter()
+        .map(|r| r.header("authorization").unwrap().to_string())
+        .collect();
+    assert_eq!(
+        auths,
+        vec![
+            "Bearer stale-access-SECRET".to_string(),
+            format!("Bearer {ACCESS}")
+        ]
+    );
+    assert_eq!(fake.requests_to(TOKEN).len(), 0);
+    assert_eq!(pool.creds().access_token, ACCESS);
+}
+
+#[tokio::test]
+async fn rate_limit_wording_on_non_429_is_quota() {
+    // bro: for a non-429 status, rate-limit wording in "{type}\n{message}" means quota, checked
+    // before the overload (529/500/503) and 403 rules.
+    let cases = [
+        Reply::error(403, "rate_limit_error", "Forbidden"),
+        Reply::error(529, "overloaded_error", "Rate limit exceeded, slow down"),
+        Reply::error(
+            400,
+            "invalid_request_error",
+            "Your usage limit reached for today",
+        ),
+    ];
+    for reply in cases {
+        let status = reply.status;
+        let fake = FakeAnthropic::start().await;
+        fake.script(MESSAGES, vec![reply]);
+        let pool = Pool::new();
+        let (policy, sleeper) = fast_policy();
+        let p = pool.provider(&fake, policy);
+        let out = run(
+            &p,
+            &pool,
+            &inbound(&simple_body(), HeaderMap::new()),
+            limits(),
+        )
+        .await;
+        let AttemptOutcome::Retry {
+            reason: FailReason::Quota { reset: Some(reset) },
+            fallback_response,
+        } = out
+        else {
+            panic!("{status}: expected quota retry, got {}", kind(&out));
+        };
+        assert_eq!(fallback_response.status(), status);
+        let now = OffsetDateTime::now_utc();
+        assert!(
+            near(reset, now + time::Duration::hours(1)),
+            "{status}: cooldown"
+        );
+        let st = pool.state.state(&pool.meta.id, now);
+        assert_eq!(st.rate_limited_until, Some(reset));
+        assert_eq!(st.access_denied_until, None, "{status}: not access-denied");
+        assert!(matches!(
+            pool.state.status(&pool.meta.id, true, now),
+            AccountStatus::RateLimited { .. }
+        ));
+        assert_eq!(fake.requests_to(MESSAGES).len(), 1, "{status}: no backoff");
+        assert!(sleeper.slept().is_empty());
+    }
+}
+
+#[tokio::test]
 async fn transport_error_is_retry_with_flag() {
     // Nothing listening: connect failure.
     let closed = {
@@ -798,6 +896,8 @@ async fn upstream_error_message_not_persisted() {
         "log capture works"
     );
     assert!(!logs.contains(SECRET), "upstream message leaked into logs");
+    // No bearer/refresh token of any test in this binary (all end in `-SECRET`).
+    assert!(!logs.contains("-SECRET"), "a token leaked into logs");
     for entry in walk(pool.dir.path()) {
         let bytes = std::fs::read(&entry).unwrap();
         assert!(

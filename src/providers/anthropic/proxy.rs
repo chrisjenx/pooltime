@@ -5,7 +5,7 @@
 //! |---|---|
 //! | 2xx | buffer, record usage from the JSON `usage`, `Done` |
 //! | 429 without quota signal | `Terminal(UpstreamRejected)`, replay + `x-pool-upstream-rejected: 1`, no state change |
-//! | 429 with quota signal | bench (reset: explicit -> blocking window -> cooldown), `Retry(Quota)` |
+//! | 429 with quota signal, or any other status whose `"{type}\n{message}"` has rate-limit wording (bro) | bench (reset: explicit -> blocking window -> cooldown), `Retry(Quota)` |
 //! | 529 / 500 / 503 | same-account backoff ([`super::overload`]), then `Terminal(Overloaded)` replaying the last upstream error, recorded once, no sideline |
 //! | 403 | entitlement wording -> billing block, else access-denied cooldown; `Retry` |
 //! | 401 | refresh (forced unless someone already rotated the token) and retry once; a second 401 is "other" |
@@ -31,7 +31,10 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use super::overload::{explicit_reset, OverloadPolicy};
-use super::{has_quota_signal, parse_unified_headers, prepare_body, AnthropicProvider};
+use super::{
+    has_quota_signal, has_rate_limit_wording, parse_unified_headers, prepare_body,
+    AnthropicProvider,
+};
 use crate::accounts::status::is_spent;
 use crate::accounts::{
     AccountId, AccountMeta, ErrorRecord, RateLimitSnapshot, StateBook, TokenUsage,
@@ -298,8 +301,16 @@ impl AnthropicProvider {
                 "anthropic upstream error"
             );
         };
+        // bro `classifyHttpError`: a 429 is quota only with a quota signal; any other status is
+        // quota when "{error.type}\n{message}" has rate-limit wording - checked before the
+        // overload and 403 rules.
+        let quota = if code == 429 {
+            has_quota_signal(&b.headers, &text)
+        } else {
+            has_rate_limit_wording(&format!("{}\n{message}", raw_error_type(&text)))
+        };
         match code {
-            429 if !has_quota_signal(&b.headers, &text) => {
+            429 if !quota => {
                 // Per-request refusal (e.g. no Claude Code system prompt): every account would
                 // answer the same, so no bench and no failover.
                 log("upstream_rejected");
@@ -310,7 +321,7 @@ impl AnthropicProvider {
                 );
                 Step::Outcome(AttemptOutcome::Terminal(r, FailReason::UpstreamRejected))
             }
-            429 => {
+            _ if quota => {
                 let (until, window) = match explicit_reset(&b.headers, now).filter(|r| *r > now) {
                     Some(r) => (r, None),
                     None => match blocking_window(call.state, call.acct, now) {
@@ -588,6 +599,15 @@ fn error_fields(text: &str) -> (Option<String>, String) {
         .map(str::to_owned)
         .unwrap_or_else(|| text.chars().take(500).collect());
     (kind, message)
+}
+
+/// Unsanitized `error.type` for rate-limit wording checks only (bro default `api_error` for a
+/// non-429). Never log it; use [`error_fields`]' sanitized type for that.
+fn raw_error_type(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("error")?.get("type")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "api_error".into())
 }
 
 /// Token usage from a non-streaming Messages response (zeros when absent).
