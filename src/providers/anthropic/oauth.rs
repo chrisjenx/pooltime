@@ -586,6 +586,67 @@ mod tests {
         hex::encode(Sha256::digest(t.as_bytes()))[..16].to_string()
     }
 
+    /// Like [`fx`], but the account's stored state is unreadable, so it loads `unverified`
+    /// (INV §10.9).
+    async fn fx_unverified(c: Credentials) -> Fx {
+        let mut f = fx(c);
+        let store = Arc::new(Store::open(&f._dir.path().join("unverified.db")).unwrap());
+        let id = f.meta.id.to_string();
+        store
+            .exec(move |c| {
+                c.execute(
+                    "INSERT INTO account_state(account, json) VALUES (?1, '{corrupt')",
+                    [&id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        f.state = Arc::new(StateBook::load(store).unwrap());
+        assert!(f.state.is_unverified(&f.meta.id));
+        assert_eq!(f.status(), AccountStatus::NeedsLogin);
+        f
+    }
+
+    #[tokio::test]
+    async fn successful_refresh_heals_an_unverified_account() {
+        // A forced refresh (the recheck path) of a still-fresh access token.
+        let fx = fx_unverified(creds_expiring_in(3600)).await;
+        let fake = fake_token_endpoint(|_| reply(200, &ok_body("healed", Some("rt2"), 3600))).await;
+        let p = fx.provider(&fake.url);
+        assert_eq!(p.access_token(&fx.meta, true).await.unwrap(), "healed");
+        assert!(!fx.state.is_unverified(&fx.meta.id));
+        assert_eq!(fx.status(), AccountStatus::Ready);
+        assert_eq!(fx.creds().refresh_token.as_deref(), Some("rt2"));
+    }
+
+    #[tokio::test]
+    async fn transient_refresh_failure_leaves_an_account_unverified() {
+        let fx = fx_unverified(creds_expiring_in(3600)).await;
+        let fake = fake_token_endpoint(|_| reply(503, "upstream connect error")).await;
+        let p = fx.provider(&fake.url);
+        assert_eq!(
+            p.access_token(&fx.meta, true).await.unwrap_err(),
+            RefreshErrorKind::Server(503)
+        );
+        assert!(fx.state.is_unverified(&fx.meta.id));
+        assert_eq!(fx.status(), AccountStatus::NeedsLogin);
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_on_an_unverified_account_marks_it_dead_instead() {
+        let fx = fx_unverified(creds_expiring_in(3600)).await;
+        let fake = fake_token_endpoint(|_| reply(400, r#"{"error":"invalid_grant"}"#)).await;
+        let p = fx.provider(&fake.url);
+        assert_eq!(
+            p.access_token(&fx.meta, true).await.unwrap_err(),
+            RefreshErrorKind::InvalidGrant
+        );
+        assert!(!fx.state.is_unverified(&fx.meta.id));
+        assert!(fx.state.is_refresh_dead(&fx.meta.id, OLD_RT));
+        assert_eq!(fx.status(), AccountStatus::NeedsLogin);
+    }
+
     #[tokio::test]
     async fn refreshes_within_skew_and_persists_rotated_tokens() {
         let mut c = creds_expiring_in(60); // inside the 300 s skew

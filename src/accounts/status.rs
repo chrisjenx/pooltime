@@ -461,6 +461,7 @@ impl StateBook {
             ..AccountState::default()
         };
         let Ok(json) = serde_json::to_string(&state) else {
+            tracing::error!(account = %id, "could not serialize the unverified account state; quarantine skipped");
             return;
         };
         let (account, ts) = (id.to_string(), now.unix_timestamp());

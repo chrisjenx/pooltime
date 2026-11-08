@@ -867,6 +867,9 @@ async fn routing(
 
 /// Clear a billing block and re-poll usage now, so a reactivated subscription rejoins the
 /// rotation without waiting for the sweeper. If it is still not entitled the block returns.
+/// An account whose stored state was unreadable (`unverified`, INV §10.9) first gets a forced
+/// token refresh, so it can self-heal even when usage polling is off: success marks it verified,
+/// `invalid_grant` re-establishes its dead marker, a transient failure leaves it unverified.
 async fn recheck(State(app): State<Arc<AppState>>, Path(raw): Path<String>) -> Response {
     let id = match parse_id(&raw) {
         Ok(id) => id,
@@ -879,7 +882,15 @@ async fn recheck(State(app): State<Arc<AppState>>, Path(raw): Path<String>) -> R
         Err(r) => return r,
     };
     app.state.clear_billing(&id, OffsetDateTime::now_utc());
-    let poll = match app.providers.get(&meta.provider) {
+    let provider = app.providers.get(&meta.provider);
+    let refresh = match provider {
+        Some(p) if app.state.is_unverified(&id) => Some(match p.access_token(&meta, true).await {
+            Ok(_) => "ok".to_string(),
+            Err(k) => k.detail(),
+        }),
+        _ => None,
+    };
+    let poll = match provider {
         None => "unavailable".to_string(),
         Some(p) => match p.poll_usage(&meta).await {
             Ok(_) => "ok".to_string(),
@@ -895,7 +906,13 @@ async fn recheck(State(app): State<Arc<AppState>>, Path(raw): Path<String>) -> R
     })
     .await;
     match status {
-        Ok(status) => ok(json!({ "ok": true, "id": id.as_str(), "status": status, "poll": poll })),
+        Ok(status) => ok(json!({
+            "ok": true,
+            "id": id.as_str(),
+            "status": status,
+            "poll": poll,
+            "refresh": refresh,
+        })),
         Err(r) => r,
     }
 }

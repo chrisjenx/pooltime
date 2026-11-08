@@ -1554,6 +1554,96 @@ mod mgmt {
         assert_eq!(r.json()["poll"], "unavailable");
     }
 
+    /// A pool whose `work` account has an unreadable `account_state` row (so it loads
+    /// `unverified`), served by the real Anthropic provider against `fake`.
+    async fn unverified_pool(fake: &FakeAnthropic) -> (Pool, Booted) {
+        let mut pool = Pool::new();
+        pool.store
+            .exec(|c| {
+                c.execute(
+                    "INSERT OR REPLACE INTO account_state(account, json) VALUES ('work', '{corrupt')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        pool.state = Arc::new(pooltime::accounts::StateBook::load(pool.store.clone()).unwrap());
+        let (policy, _) = super::support::fast_policy();
+        let provider = Arc::new(pool.provider(fake, policy));
+        let srv = pool.boot(Boot::default().provider(provider)).await;
+        (pool, srv)
+    }
+
+    async fn work_account(srv: &Booted) -> Value {
+        http_get(srv.addr, "/api/v1/status", &[]).await.json()["accounts"][0].clone()
+    }
+
+    #[tokio::test]
+    async fn recheck_heals_an_unverified_account_with_a_forced_refresh() {
+        let fake = FakeAnthropic::start().await;
+        fake.route(TOKEN, |_, _| {
+            Reply::json(
+                200,
+                &json!({"access_token": "at-new", "refresh_token": "rt-new", "expires_in": 28800}),
+            )
+        });
+        // No usage route: the poll fails, so only the refresh can heal the account.
+        let (_pool, srv) = unverified_pool(&fake).await;
+        let a = work_account(&srv).await;
+        assert_eq!(a["status"], "needs_login", "{a}");
+        assert_eq!(a["reason"], "state_unreadable", "{a}");
+
+        let r = call(&srv, "POST", "/api/v1/accounts/work/recheck", None).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        assert_eq!(v["refresh"], "ok", "{v}");
+        assert_ne!(v["poll"], "ok", "the heal must not depend on the poll: {v}");
+        assert_eq!(v["status"], "ready", "{v}");
+        assert_eq!(fake.requests_to(TOKEN).len(), 1);
+        let a = work_account(&srv).await;
+        assert_eq!(a["status"], "ready", "{a}");
+        assert_eq!(a["reason"], Value::Null);
+
+        // Verified now: another recheck does not spend the refresh token again.
+        let r = call(&srv, "POST", "/api/v1/accounts/work/recheck", None).await;
+        assert_eq!(r.json()["refresh"], Value::Null);
+        assert_eq!(fake.requests_to(TOKEN).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recheck_of_an_unverified_account_with_a_dead_token_marks_it_dead() {
+        let fake = FakeAnthropic::start().await;
+        fake.route(TOKEN, |_, _| {
+            Reply::json(400, &json!({"error": "invalid_grant"}))
+        });
+        let (_pool, srv) = unverified_pool(&fake).await;
+        let r = call(&srv, "POST", "/api/v1/accounts/work/recheck", None).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        assert_eq!(v["refresh"], "invalid_grant", "{v}");
+        assert_eq!(v["status"], "needs_login", "{v}");
+        let a = work_account(&srv).await;
+        assert_eq!(a["reason"], "refresh_token_dead", "{a}");
+        // The dead marker is known now: a second recheck does not re-POST the token.
+        call(&srv, "POST", "/api/v1/accounts/work/recheck", None).await;
+        assert_eq!(fake.requests_to(TOKEN).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recheck_with_a_transient_refresh_failure_stays_unverified() {
+        let fake = FakeAnthropic::start().await;
+        fake.route(TOKEN, |_, _| Reply::new(503));
+        let (_pool, srv) = unverified_pool(&fake).await;
+        let r = call(&srv, "POST", "/api/v1/accounts/work/recheck", None).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        assert_eq!(v["refresh"], "server:503", "{v}");
+        assert_eq!(v["status"], "needs_login", "{v}");
+        let a = work_account(&srv).await;
+        assert_eq!(a["reason"], "state_unreadable", "{a}");
+    }
+
     // ---- sign-in ----
 
     /// A fake Claude OAuth server (token + profile).
