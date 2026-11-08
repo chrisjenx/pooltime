@@ -1644,6 +1644,28 @@ mod mgmt {
         assert_eq!(a["reason"], "state_unreadable", "{a}");
     }
 
+    #[tokio::test]
+    async fn recheck_skips_the_poll_after_a_failed_refresh() {
+        // A working usage route: were it polled, success would clear `unverified`.
+        const USAGE: &str = "/api/oauth/usage";
+        let fake = FakeAnthropic::start().await;
+        fake.route(TOKEN, |_, _| Reply::new(503));
+        fake.route(USAGE, |_, _| {
+            Reply::json(200, &json!({"five_hour": {"utilization": 10}}))
+        });
+        let (_pool, srv) = unverified_pool(&fake).await;
+        let r = call(&srv, "POST", "/api/v1/accounts/work/recheck", None).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        assert_eq!(v["refresh"], "server:503", "{v}");
+        assert_eq!(v["poll"], "skipped", "{v}");
+        assert_eq!(v["status"], "needs_login", "{v}");
+        let a = work_account(&srv).await;
+        assert_eq!(a["status"], "needs_login", "{a}");
+        assert_eq!(a["reason"], "state_unreadable", "{a}");
+        assert!(fake.requests_to(USAGE).is_empty(), "usage must not be hit");
+    }
+
     // ---- sign-in ----
 
     /// A fake Claude OAuth server (token + profile).

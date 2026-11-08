@@ -271,6 +271,11 @@ pub async fn run(paths: &Paths, cmd: AccountsCmd) -> anyhow::Result<i32> {
                 v["status"].as_str().unwrap_or("?"),
                 v["poll"].as_str().unwrap_or("?")
             );
+            match v["refresh"].as_str() {
+                Some("ok") => println!("token refresh: ok"),
+                Some(e) => println!("token refresh failed: {e}"),
+                None => {}
+            }
             Ok(0)
         }
         AccountsCmd::Set {

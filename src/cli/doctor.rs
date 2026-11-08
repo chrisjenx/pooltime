@@ -469,8 +469,7 @@ fn account_check(a: AccountFacts, live: bool, warn_days: u32, now: OffsetDateTim
     match a.status.as_str() {
         "needs_login" if a.reason.as_deref() == Some("state_unreadable") => {
             return Check::new(Level::Fail, label, format!("needs login{source}")).hint(format!(
-                "account state was unreadable and is being re-verified — wait for the next usage \
-                 sweep or run `pooltime accounts recheck {}`",
+                "account state was unreadable; re-verify it with `pooltime accounts recheck {}`",
                 a.id
             ))
         }
@@ -821,8 +820,7 @@ mod tests {
         assert!(line.starts_with("✗ account a: "), "{line}");
         assert!(
             line.contains(
-                "account state was unreadable and is being re-verified — wait for the next usage \
-                 sweep or run `pooltime accounts recheck a`"
+                "account state was unreadable; re-verify it with `pooltime accounts recheck a`"
             ),
             "{line}"
         );

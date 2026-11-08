@@ -56,6 +56,7 @@ its port, `pooltime serve` refuses imported accounts unless started with `--i-st
 pooltime status                  # accounts, 7-day headroom, alerts
 pooltime accounts list           # accounts and their status
 pooltime accounts login <name>   # sign in or re-login an account
+pooltime accounts recheck <name> # re-verify an account now (token refresh + usage poll)
 pooltime connect --all           # point every Claude Code profile under ~/.claude* at the pool
 pooltime connect default         # ...or just the named profiles
 pooltime disconnect              # restore the connected profiles' own settings
