@@ -52,7 +52,7 @@ use crate::accounts::{
 };
 use crate::claude_code::snapshot::{self, Snapshot, SnapshotState};
 use crate::claude_code::{discover, snapshot_path, Profile};
-use crate::config::{AnthropicCfg, Config, Paths};
+use crate::config::{AnthropicCfg, Config, Paths, RoutingCfg};
 use crate::logging::hash_session;
 use crate::models::ModelTable;
 use crate::providers::ProviderId;
@@ -607,9 +607,22 @@ pub enum AccountOutcome {
         needs_login: bool,
         identity: IdentityState,
     },
-    Skipped {
-        reason: String,
-    },
+    /// A pooltime account with this id already exists; it was left untouched.
+    AlreadyExists,
+    /// Nothing usable to import (invalid name, no credentials, ...). bro keeps the only copy.
+    Skipped { reason: String },
+    /// Writing the account into pooltime failed; nothing of it was kept. bro keeps the only copy.
+    Failed { error: String },
+}
+
+impl AccountOutcome {
+    /// bro still holds the only copy of this account (so bro's files must not be deleted).
+    fn kept_in_bro(&self) -> bool {
+        matches!(
+            self,
+            AccountOutcome::Skipped { .. } | AccountOutcome::Failed { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -629,6 +642,8 @@ pub enum ItemOutcome {
     Absent,
     Imported,
     Skipped(String),
+    /// Writing it into pooltime failed (the rest of the import went on).
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -654,9 +669,10 @@ impl ImportReport {
 }
 
 /// Write `plan` into pooltime's data dir. Reads credentials (files, or `keychain` for accounts
-/// without a `.credentials.json`); never writes outside `paths`. Per-item problems are reported
-/// in the [`ImportReport`]; I/O failures writing pooltime's own files are errors. Identities are
-/// left pending for [`fill_identities`].
+/// without a `.credentials.json`); never writes outside `paths`. Per-item problems, including
+/// failed writes, are recorded in the [`ImportReport`] and the import goes on; only failing to
+/// open pooltime's data dir, registry or database (before anything is written) is an error.
+/// Identities are left pending for [`fill_identities`].
 pub fn apply_import(
     plan: &ImportPlan,
     paths: &Paths,
@@ -683,14 +699,10 @@ pub fn apply_import(
         });
     }
     let mut imported = HashSet::new();
-    let mut keychain_services = Vec::new();
     for a in &plan.accounts {
-        let outcome = import_account(a, paths, &reg, &book, keychain, now)?;
+        let outcome = import_account(a, paths, &reg, &book, &store, keychain, now);
         if matches!(outcome, AccountOutcome::Imported { .. }) {
             imported.insert(a.name.as_str());
-            if let CredsSource::Keychain { service } = &a.source {
-                keychain_services.push(service.clone());
-            }
         }
         report.accounts.push(AccountReport {
             name: a.name.clone(),
@@ -713,32 +725,42 @@ pub fn apply_import(
             _ => report.sessions_skipped += 1,
         }
     }
-    flush(&store)?;
+    if let Err(e) = flush(&store) {
+        report
+            .notes
+            .push(format!("sticky sessions may not have been saved: {e:#}"));
+    }
 
+    let failed = |e: anyhow::Error| ItemOutcome::Failed(format!("{e:#}"));
     report.models = match &plan.models_json {
         None => ItemOutcome::Absent,
         Some(_) if ModelTable::path(paths).exists() => {
             ItemOutcome::Skipped("pooltime already has a models.toml".into())
         }
-        Some(text) => {
-            ModelTable::from_bro_json(text).save(paths)?;
-            ItemOutcome::Imported
-        }
+        Some(text) => ModelTable::from_bro_json(text)
+            .save(paths)
+            .map_or_else(failed, |()| ItemOutcome::Imported),
     };
 
     report.tuning = match plan.tuning {
         None => ItemOutcome::Absent,
         Some(t) if t.is_empty() => ItemOutcome::Skipped("tuning.json has no valid fields".into()),
-        Some(t) => apply_tuning(paths, t)?,
+        Some(t) => apply_tuning(paths, t).unwrap_or_else(failed),
     };
 
     for s in &plan.snapshots {
-        let outcome = apply_snapshot(paths, s)?;
+        let outcome = apply_snapshot(paths, s).unwrap_or_else(failed);
         report.snapshots.push((s.profile.id.clone(), outcome));
     }
     report.orphans = plan.orphans.clone();
-    report.cleanup = cleanup_commands(plan, &keychain_services);
+    report.cleanup = cleanup_commands(plan, &report);
     Ok(report)
+}
+
+/// Whether pooltime already has account `id` (its `account.toml` or `credentials.json`).
+fn exists_in_pooltime(paths: &Paths, id: &AccountId) -> bool {
+    let dir = paths.accounts.join(id.as_str());
+    dir.join("account.toml").exists() || dir.join("credentials.json").exists()
 }
 
 fn import_account(
@@ -746,14 +768,12 @@ fn import_account(
     paths: &Paths,
     reg: &Registry,
     book: &StateBook,
+    store: &Store,
     keychain: &dyn Keychain,
     now: OffsetDateTime,
-) -> anyhow::Result<AccountOutcome> {
-    let skipped = |reason: String| Ok(AccountOutcome::Skipped { reason });
-    if paths.accounts.join(a.id.as_str()).exists() {
-        return skipped(
-            "a pooltime account with this id already exists (remove it to re-import)".into(),
-        );
+) -> AccountOutcome {
+    if exists_in_pooltime(paths, &a.id) {
+        return AccountOutcome::AlreadyExists;
     }
     let creds = match &a.source {
         CredsSource::ClaudeFile(p) => match fs::read(p) {
@@ -774,49 +794,77 @@ fn import_account(
     };
     let creds = match creds {
         Ok(c) => c,
-        Err(reason) => return skipped(reason),
+        Err(reason) => return AccountOutcome::Skipped { reason },
     };
 
-    reg.write_creds(&a.id, &creds)?;
-    let mut meta = AccountMeta::new(a.id.clone(), a.provider);
-    meta.priority = a.priority;
-    meta.weight = a.weight;
-    meta.imported = true;
-    reg.upsert(meta)?;
-
-    let mut needs_login = false;
-    if let Some(u) = &a.usage {
-        if let Some(snap) = u.snapshot.clone() {
-            book.merge_header_snapshot(&a.id, snap);
+    // Markers first and on disk before `account.toml` appears, so an account that is visible
+    // to pooltime always carries its dead/cooldown markers.
+    let needs_login = seed_state(a, &creds, book, now);
+    let dir = paths.accounts.join(a.id.as_str());
+    let existed = fs::symlink_metadata(&dir).is_ok();
+    let written = flush(store)
+        .and_then(|()| reg.write_creds(&a.id, &creds))
+        .and_then(|()| {
+            let mut meta = AccountMeta::new(a.id.clone(), a.provider);
+            meta.priority = a.priority;
+            meta.weight = a.weight;
+            meta.imported = true;
+            reg.upsert(meta)
+        });
+    if let Err(e) = written {
+        book.forget(&a.id);
+        if !existed {
+            let _ = fs::remove_dir_all(&dir);
         }
-        if let Some(until) = u.rate_limited_until.filter(|t| *t > now) {
-            book.mark_rate_limited(&a.id, until, None, now);
-        }
-        if u.access_denied_until.is_some_and(|t| t > now) {
-            // pooltime re-derives the probe cooldown from its own config.
-            if u.billing_blocked_at.is_some() {
-                book.mark_billing(&a.id, now);
-            } else {
-                book.mark_access_denied(&a.id, now);
-            }
-        }
-        if let (Some(fp), Some(rt)) = (&u.dead_refresh_fp, &creds.refresh_token) {
-            if *fp == sha_hex(rt, 16) {
-                book.mark_refresh_dead(&a.id, rt, now);
-                needs_login = true;
-            }
-        }
+        return AccountOutcome::Failed {
+            error: format!("{e:#}"),
+        };
     }
+
     let identity =
         if a.provider == ProviderId::Anthropic && creds.refresh_token.is_some() && !needs_login {
             IdentityState::Pending
         } else {
             IdentityState::NotApplicable
         };
-    Ok(AccountOutcome::Imported {
+    AccountOutcome::Imported {
         needs_login,
         identity,
-    })
+    }
+}
+
+/// Seed bro's usage snapshot, cooldowns and dead-token marker; returns whether the account
+/// needs a login (bro's dead fingerprint matches the current refresh token).
+fn seed_state(
+    a: &PlannedAccount,
+    creds: &Credentials,
+    book: &StateBook,
+    now: OffsetDateTime,
+) -> bool {
+    let Some(u) = &a.usage else {
+        return false;
+    };
+    if let Some(snap) = u.snapshot.clone() {
+        book.merge_header_snapshot(&a.id, snap);
+    }
+    if let Some(until) = u.rate_limited_until.filter(|t| *t > now) {
+        book.mark_rate_limited(&a.id, until, None, now);
+    }
+    if u.access_denied_until.is_some_and(|t| t > now) {
+        // pooltime re-derives the probe cooldown from its own config.
+        if u.billing_blocked_at.is_some() {
+            book.mark_billing(&a.id, now);
+        } else {
+            book.mark_access_denied(&a.id, now);
+        }
+    }
+    match (&u.dead_refresh_fp, &creds.refresh_token) {
+        (Some(fp), Some(rt)) if *fp == sha_hex(rt, 16) => {
+            book.mark_refresh_dead(&a.id, rt, now);
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Errors never echo file content (it holds tokens).
@@ -889,6 +937,38 @@ fn apply_tuning(paths: &Paths, t: TuningImport) -> anyhow::Result<ItemOutcome> {
             "pooltime's config.toml is unreadable or invalid".into(),
         ));
     };
+    // Values the user already customised in pooltime win: skip rather than overwrite them.
+    let (cur, def) = (&cfg.routing, RoutingCfg::default());
+    let conflicts: Vec<&str> = [
+        (
+            "five_hour_exp",
+            t.five_hour_exp,
+            cur.five_hour_exp,
+            def.five_hour_exp,
+        ),
+        (
+            "min_headroom",
+            t.min_headroom,
+            cur.min_headroom,
+            def.min_headroom,
+        ),
+        (
+            "headroom_taper_start",
+            t.headroom_taper_start,
+            cur.headroom_taper_start,
+            def.headroom_taper_start,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, new, cur, def)| new.is_some_and(|n| cur != def && *cur != n))
+    .map(|(k, ..)| k)
+    .collect();
+    if !conflicts.is_empty() {
+        return Ok(ItemOutcome::Skipped(format!(
+            "pooltime's config.toml already sets routing {} (left as is)",
+            conflicts.join(", ")
+        )));
+    }
     let r = &mut cfg.routing;
     if let Some(v) = t.five_hour_exp {
         r.five_hour_exp = v;
@@ -931,20 +1011,68 @@ fn flush(store: &Store) -> anyhow::Result<()> {
     rx.recv().map_err(|_| anyhow!("the store writer stopped"))
 }
 
-fn cleanup_commands(plan: &ImportPlan, keychain_services: &[String]) -> Vec<String> {
-    let mut out = vec![
-        "bro pool down".to_string(),
-        format!("rm -rf {}", shell_quote(&plan.bro_pool.to_string_lossy())),
-        format!(
+/// What the user may delete once pooltime serves the accounts. bro's pool dir is only offered
+/// for deletion as a whole when bro holds nothing that was not imported (accounts already in
+/// pooltime count as imported); otherwise only the imported accounts' dirs are listed. Likewise
+/// for snapshot files and Keychain items.
+fn cleanup_commands(plan: &ImportPlan, report: &ImportReport) -> Vec<String> {
+    let mut out = vec!["bro pool down".to_string()];
+    let kept: Vec<&str> = report
+        .accounts
+        .iter()
+        .filter(|a| a.outcome.kept_in_bro())
+        .map(|a| a.name.as_str())
+        .collect();
+    let imported: Vec<&PlannedAccount> = plan
+        .accounts
+        .iter()
+        .filter(|a| {
+            report
+                .account(&a.name)
+                .is_some_and(|r| matches!(r.outcome, AccountOutcome::Imported { .. }))
+        })
+        .collect();
+    if kept.is_empty() {
+        out.push(format!(
+            "rm -rf {}",
+            shell_quote(&plan.bro_pool.to_string_lossy())
+        ));
+    } else {
+        for a in &imported {
+            let dir = plan.bro_pool.join("accounts").join(&a.name);
+            out.push(format!("rm -rf {}", shell_quote(&dir.to_string_lossy())));
+        }
+        out.push(format!("# kept in bro (not imported): {}", kept.join(", ")));
+    }
+
+    let all_snapshots = plan.orphans.is_empty()
+        && report
+            .snapshots
+            .iter()
+            .all(|(_, o)| *o == ItemOutcome::Imported);
+    if all_snapshots && !plan.snapshots.is_empty() {
+        out.push(format!(
             "rm -f {}pool-settings*.json",
             shell_quote(&format!("{}/", plan.bro_home.display()))
-        ),
-    ];
-    out.extend(
-        keychain_services
-            .iter()
-            .map(|s| format!("security delete-generic-password -s {}", shell_quote(s))),
-    );
+        ));
+    } else {
+        for (s, (_, o)) in plan.snapshots.iter().zip(&report.snapshots) {
+            if *o == ItemOutcome::Imported {
+                out.push(format!(
+                    "rm -f {}",
+                    shell_quote(&s.source.to_string_lossy())
+                ));
+            }
+        }
+    }
+
+    out.extend(imported.iter().filter_map(|a| match &a.source {
+        CredsSource::Keychain { service } => Some(format!(
+            "security delete-generic-password -s {}",
+            shell_quote(service)
+        )),
+        _ => None,
+    }));
     out
 }
 
@@ -960,14 +1088,21 @@ pub async fn fill_identities(
     up: &Upstream,
     cfg: &AnthropicCfg,
 ) {
-    let Ok(reg) = Registry::load(paths) else {
-        return;
+    let reg = match Registry::load(paths) {
+        Ok(r) => r,
+        Err(e) => {
+            report.notes.push(format!(
+                "could not open pooltime's accounts ({e:#}); identities not fetched"
+            ));
+            return;
+        }
     };
     let base = cfg
         .profile_url
         .trim_end_matches('/')
         .strip_suffix(PROFILE_PATH)
         .map_or_else(|| cfg.api_base.clone(), str::to_string);
+    let mut notes = Vec::new();
     for a in &mut report.accounts {
         let AccountOutcome::Imported { identity, .. } = &mut a.outcome else {
             continue;
@@ -978,8 +1113,17 @@ pub async fn fill_identities(
         let Ok(id) = a.name.parse::<AccountId>() else {
             continue;
         };
-        let Ok(Some(creds)) = reg.read_creds(&id) else {
-            continue;
+        let creds = match reg.read_creds(&id) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                notes.push(format!("{id}: credentials vanished; identity not fetched"));
+                continue;
+            }
+            // CredsError never echoes the file's content.
+            Err(e) => {
+                notes.push(format!("{id}: {e}; identity not fetched"));
+                continue;
+            }
         };
         match fetch_profile(up, &base, &creds.access_token, &cfg.user_agent).await {
             Ok(p) if p.identity.account_uuid.is_some() || p.identity.email.is_some() => {
@@ -987,20 +1131,16 @@ pub async fn fill_identities(
                     meta.identity = p.identity;
                     match reg.upsert(meta) {
                         Ok(()) => *identity = IdentityState::Resolved,
-                        Err(e) => {
-                            tracing::warn!(account = %id, error = %format!("{e:#}"), "could not save the imported account's identity")
-                        }
+                        Err(e) => notes.push(format!("{id}: could not save its identity: {e:#}")),
                     }
                 }
             }
-            Ok(_) => {
-                tracing::warn!(account = %id, "profile reported no identity; identity pending")
-            }
-            Err(e) => {
-                tracing::warn!(account = %id, error = %format!("{e:#}"), "identity fetch failed; identity pending")
-            }
+            Ok(_) => notes.push(format!("{id}: the profile reported no identity")),
+            // Errors carry only the HTTP status / transport kind, never a body or token.
+            Err(e) => notes.push(format!("{id}: identity fetch failed: {e:#}")),
         }
     }
+    report.notes.extend(notes);
 }
 
 // ---- rendering ----------------------------------------------------------------------------------
@@ -1054,7 +1194,7 @@ impl ImportPlan {
             if matches!(a.source, CredsSource::Keychain { .. }) {
                 flags.push("Keychain read at import (may prompt)".into());
             }
-            if paths.accounts.join(a.id.as_str()).exists() {
+            if exists_in_pooltime(paths, &a.id) {
                 flags.push("SKIP: pooltime account already exists".into());
             }
             let _ = writeln!(
@@ -1146,13 +1286,23 @@ impl ImportReport {
                         parts.push("needs login (bro marked its refresh token dead)".into());
                     }
                     match identity {
-                        IdentityState::Pending => parts.push("identity pending".into()),
+                        // Nothing fills a missing identity later (refresh does not fetch it).
+                        IdentityState::Pending => parts.push(format!(
+                            "identity pending (run `pooltime accounts login {}` to verify it, or it stays pending)",
+                            a.name
+                        )),
                         IdentityState::Resolved => parts.push("identity verified".into()),
                         IdentityState::NotApplicable => {}
                     }
                     parts.join("; ")
                 }
-                AccountOutcome::Skipped { reason } => format!("skipped: {reason}"),
+                AccountOutcome::AlreadyExists => "skipped: a pooltime account with this id \
+                     already exists (left untouched; remove it to re-import)"
+                    .to_string(),
+                AccountOutcome::Skipped { reason } => format!("skipped (kept in bro): {reason}"),
+                AccountOutcome::Failed { error } => {
+                    format!("FAILED (nothing kept; bro's copy is untouched): {error}")
+                }
             };
             let _ = writeln!(s, "  {:<16} {provider:<9} {line}", a.name);
         }
@@ -1165,6 +1315,7 @@ impl ImportReport {
             ItemOutcome::Absent => "nothing to import".to_string(),
             ItemOutcome::Imported => "imported".into(),
             ItemOutcome::Skipped(r) => format!("skipped: {r}"),
+            ItemOutcome::Failed(e) => format!("FAILED: {e}"),
         };
         let _ = writeln!(s, "Models: {}", item(&self.models));
         let _ = writeln!(s, "Tuning: {}", item(&self.tuning));
