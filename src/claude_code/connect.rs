@@ -11,10 +11,13 @@
 //!   connected profile, so a Claude model released while the pool stays up, or a
 //!   moved port after a restart, reaches the pickers without a manual reconnect.
 //!
-//! With the catalog unavailable (no usable Anthropic account, upstream down) a
-//! sync changes nothing, so a pin is never dropped for a flaky fetch.
+//! With the catalog unavailable (no usable Anthropic account, upstream down)
+//! the pins and context already in a profile are kept as they are (and the Fable
+//! rows are left alone); only the base URL and token follow the pool. A pin is
+//! never dropped for a flaky fetch.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
@@ -23,7 +26,8 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use super::pins::{derive_pins, max_context};
-use super::{apply, clear, is_connected, rewrite_fable_rows, EnvBlock, Profile};
+use super::scrub::{context_is_managed, CONTEXT_KEY};
+use super::{apply, clear, is_connected, rewrite_fable_rows, EnvBlock, Pin, Pins, Profile};
 use crate::config::{Config, Paths, ProfileRef};
 use crate::fsutil::WriteOutcome;
 use crate::providers::ProviderId;
@@ -49,12 +53,16 @@ pub async fn catalog(state: &AppState) -> Option<Vec<Value>> {
 }
 
 /// The [`Profile`] a stored [`ProfileRef`] stands for. Only the default profile
-/// (`id == "default"`, i.e. `~/.claude`) keeps `.claude.json` in the directory
-/// above its settings dir; every other profile keeps it inside.
+/// (`id == "default"` and a settings dir named `.claude`, i.e. `~/.claude`)
+/// keeps `.claude.json` in the directory above its settings dir; every other
+/// profile keeps it inside.
 pub fn profile_of(r: &ProfileRef) -> Profile {
-    let claude_json = match (r.id.as_str(), r.settings_dir.parent()) {
-        ("default", Some(home)) => home.join(".claude.json"),
-        _ => r.settings_dir.join(".claude.json"),
+    let home = r.settings_dir.parent().filter(|_| {
+        r.id == "default" && r.settings_dir.file_name().is_some_and(|n| n == ".claude")
+    });
+    let claude_json = match home {
+        Some(home) => home.join(".claude.json"),
+        None => r.settings_dir.join(".claude.json"),
     };
     Profile {
         id: r.id.clone(),
@@ -103,8 +111,63 @@ fn merge(a: WriteOutcome, b: WriteOutcome) -> WriteOutcome {
     }
 }
 
-/// Apply the env block (pins and context from `catalog`, if any) and refresh the
-/// Fable rows of one profile. Blocking file work.
+/// Each profile id is warned about a missing proxy key once per process.
+fn first_no_key_warning(id: &str) -> bool {
+    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    SEEN.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert(id.to_string())
+}
+
+/// The pins and max-context already in `p`'s settings `env`, for re-applying
+/// unchanged when there is no catalog. `apply` rebuilds the managed keys from
+/// the user's snapshot and then writes the block, so a block without them would
+/// drop the pins. A family counts only when its model, name and description are
+/// all present; the context value only when a marker proves it is ours. An
+/// unreadable settings file preserves nothing (and `apply` will report it).
+fn current_pins(p: &Profile) -> (Pins, Option<u32>) {
+    let env = std::fs::read(&p.settings_json)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| match v.get("env") {
+            Some(Value::Object(m)) => Some(m.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let pin = |family: &str| {
+        let base = format!("ANTHROPIC_DEFAULT_{family}_MODEL");
+        let get = |k: String| env.get(&k)?.as_str().map(str::to_string);
+        Some(Pin {
+            id: get(base.clone())?,
+            name: get(format!("{base}_NAME"))?,
+            description: get(format!("{base}_DESCRIPTION"))?,
+        })
+    };
+    let max_context = context_is_managed(&env)
+        .then(|| env.get(CONTEXT_KEY)?.as_str()?.parse::<u32>().ok())
+        .flatten();
+    (
+        Pins {
+            sonnet: pin("SONNET"),
+            haiku: pin("HAIKU"),
+        },
+        max_context,
+    )
+}
+
+/// Apply the env block and refresh the Fable rows of one profile. Blocking file
+/// work.
+///
+/// With a catalog, pins and max-context are derived from it. Without one
+/// (`None`: unreachable) the pins and context currently in the profile are
+/// re-applied as they are (see [`current_pins`]) and the Fable rows are not
+/// touched, so only the base URL and token can change. (Chosen over a "preserve"
+/// flag on `apply` to keep that Task 27 API as it was.)
+///
+/// The Fable refresh is cosmetic and never fails the call: an error is logged
+/// by profile id only (never content) and the env outcome is returned; a corrupt
+/// `.claude.json` is left untouched.
 fn sync_profile(
     paths: &Paths,
     p: &Profile,
@@ -112,15 +175,23 @@ fn sync_profile(
     key: &str,
     catalog: Option<&[Value]>,
 ) -> anyhow::Result<WriteOutcome> {
+    let (pins, max_context) = match catalog {
+        Some(c) => (derive_pins(c), max_context(c)),
+        None => current_pins(p),
+    };
     let block = EnvBlock {
         base_url: base_url.to_string(),
         auth_token: key.to_string(),
-        pins: catalog.map(derive_pins).unwrap_or_default(),
-        max_context: catalog.and_then(max_context),
+        pins,
+        max_context,
     };
     let env = apply(p, &block, paths)?;
-    let fable = match catalog {
-        Some(c) => rewrite_fable_rows(p, c)?,
+    let fable = match catalog.map(|c| rewrite_fable_rows(p, c)) {
+        Some(Ok(o)) => o,
+        Some(Err(_)) => {
+            tracing::warn!(profile = %p.id, "could not refresh cached Fable rows; left as is");
+            WriteOutcome::Unchanged
+        }
         None => WriteOutcome::Unchanged,
     };
     Ok(merge(env, fable))
@@ -135,12 +206,14 @@ fn sync_profile(
 ///    generated key only takes effect in a pool that is restarted afterwards; a
 ///    pool running without a key accepts any token until then.
 /// 3. Each profile gets the `env` block (pins from the catalog; with the catalog
-///    unavailable only the base URL and token) and refreshed Fable rows.
-///    Re-connecting a connected profile while the catalog is unavailable drops
-///    its pins until the next sync restores them.
+///    unavailable the pins and context already in the profile are kept, so a
+///    first connect writes only the base URL and token, and a re-connect never
+///    drops pins) and refreshed Fable rows. The Fable refresh is cosmetic: its
+///    failure (e.g. a corrupt `.claude.json`, left untouched) is only logged.
 /// 4. Profiles that were applied are recorded in `config.profiles` (deduped by
-///    id). If one profile fails, the ones already applied are still recorded and
-///    the error (naming the profile) is returned.
+///    id). A profile whose `env` cannot be applied (e.g. a corrupt
+///    `settings.json`) does not stop the others: every other profile is applied
+///    and recorded, then an error naming the failed profile(s) is returned.
 ///
 /// Returns each profile's id with its combined write outcome.
 pub async fn connect(
@@ -173,19 +246,16 @@ pub async fn connect(
 
     let paths = state.paths.clone();
     let owned: Vec<Profile> = profiles.to_vec();
-    let (outcomes, failure) = tokio::task::spawn_blocking(move || {
+    let (outcomes, failures) = tokio::task::spawn_blocking(move || {
         let mut outcomes = Vec::new();
-        let mut failure = None;
+        let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
         for p in &owned {
             match sync_profile(&paths, p, &url, &key, catalog.as_deref()) {
                 Ok(o) => outcomes.push((p.clone(), o)),
-                Err(e) => {
-                    failure = Some(e.context(format!("connecting profile {}", p.id)));
-                    break;
-                }
+                Err(e) => failures.push((p.id.clone(), e)),
             }
         }
-        (outcomes, failure)
+        (outcomes, failures)
     })
     .await
     .context("connect task")?;
@@ -203,9 +273,18 @@ pub async fn connect(
     if cfg.profiles != before {
         cfg.save(&state.paths)?;
     }
-    match failure {
-        Some(e) => Err(e),
+    let mut failures = failures.into_iter();
+    match failures.next() {
         None => Ok(outcomes.into_iter().map(|(p, o)| (p.id, o)).collect()),
+        Some((id, first)) => {
+            let rest: Vec<String> = failures.map(|(id, _)| id).collect();
+            let also = if rest.is_empty() {
+                String::new()
+            } else {
+                format!(" (also failed: {})", rest.join(", "))
+            };
+            Err(first.context(format!("connecting profile {id}{also}")))
+        }
     }
 }
 
@@ -251,11 +330,15 @@ pub fn disconnect(
 }
 
 /// One sync pass: re-apply the env block (current port and key) and Fable rows
-/// to every configured profile that is still connected. With the catalog
-/// unavailable, or no key to send, nothing is touched and the result is empty.
-/// A profile that cannot be written (corrupt settings, ...) is logged by id and
-/// skipped; `GaveUp` is logged as a warning. Returns the processed profiles in
-/// config order.
+/// to every configured profile that is still connected.
+///
+/// With the catalog unavailable the pins and context already in each profile
+/// are kept as they are (see [`sync_profile`]) and the Fable rows are left
+/// alone, but the base URL and token are still re-applied, so a moved port
+/// re-syncs even while the catalog is blind. With no key to send, nothing is
+/// touched (warned once per profile). A profile that cannot be written (corrupt
+/// settings, ...) is logged by id and skipped; `GaveUp` is logged as a warning.
+/// Returns the processed profiles in config order.
 pub async fn sync_once(state: &AppState) -> anyhow::Result<Vec<(String, WriteOutcome)>> {
     let cfg = Config::load_file(&state.paths)?;
     let connected: Vec<Profile> = cfg
@@ -267,19 +350,24 @@ pub async fn sync_once(state: &AppState) -> anyhow::Result<Vec<(String, WriteOut
     if connected.is_empty() {
         return Ok(Vec::new());
     }
-    let Some(catalog) = catalog(state).await else {
-        return Ok(Vec::new());
-    };
     let Some(key) = existing_key(state, &cfg) else {
-        tracing::warn!("profile sync skipped: no proxy key is known");
+        for p in &connected {
+            if first_no_key_warning(&p.id) {
+                tracing::warn!(
+                    profile = %p.id,
+                    "profile sync skipped: no proxy key is known for this connected profile"
+                );
+            }
+        }
         return Ok(Vec::new());
     };
+    let catalog = catalog(state).await;
     let url = base_url(&state.cfg);
     let paths = state.paths.clone();
     tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
         for p in connected {
-            match sync_profile(&paths, &p, &url, &key, Some(&catalog)) {
+            match sync_profile(&paths, &p, &url, &key, catalog.as_deref()) {
                 Ok(WriteOutcome::GaveUp) => {
                     tracing::warn!(profile = %p.id, "profile sync gave up: settings kept changing");
                     out.push((p.id, WriteOutcome::GaveUp));

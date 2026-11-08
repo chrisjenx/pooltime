@@ -249,11 +249,11 @@ async fn unreachable_catalog_changes_nothing() {
     let settings = fs::read(&p.settings_json).unwrap();
     let claude_json = fs::read(&p.claude_json).unwrap();
 
-    // A pool whose Anthropic catalog is unavailable (no provider at all) over the same home.
-    let blind = fx.pool.boot(Boot::default()).await;
+    // Same address, but the catalog cannot be fetched: a sync is a complete no-op.
+    let blind = fx.blind(Some(fx.srv.addr.port())).await;
     assert!(pooltime::claude_code::catalog(&blind.app).await.is_none());
     let synced = sync_once(&blind.app).await.unwrap();
-    assert!(synced.is_empty(), "{synced:?}");
+    assert_eq!(synced, vec![(p.id.clone(), WriteOutcome::Unchanged)]);
     assert_eq!(fs::read(&p.settings_json).unwrap(), settings);
     assert_eq!(fs::read(&p.claude_json).unwrap(), claude_json);
     assert_eq!(
@@ -276,6 +276,140 @@ async fn unreachable_catalog_changes_nothing() {
     assert_eq!(keys, ["KEEP", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]);
     // Fable rows are left alone too.
     assert_eq!(fable_row(&q)["value"], "claude-fable-4[1m]");
+}
+
+impl Fix {
+    /// A pool over the same home whose Anthropic catalog is unavailable (no provider at all),
+    /// listening on its own port, or reporting `port` as its configured one.
+    async fn blind(&self, port: Option<u16>) -> Booted {
+        self.pool
+            .boot(Boot {
+                configure: port.map(|p| -> ConfigEdit { Box::new(move |c| c.port = p) }),
+                ..Boot::default()
+            })
+            .await
+    }
+}
+
+#[tokio::test]
+async fn reconnect_with_blind_catalog_keeps_pins() {
+    let fx = Fix::new().await;
+    let p = fx.profile(".claude-work");
+    connect(fx.app(), std::slice::from_ref(&p)).await.unwrap();
+    let env = env_of(&p);
+    assert!(env["ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION"].is_string());
+    assert!(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"].is_string());
+    let claude_json = fs::read(&p.claude_json).unwrap();
+
+    let blind = fx.blind(Some(fx.srv.addr.port())).await;
+    let out = connect(&blind.app, std::slice::from_ref(&p)).await.unwrap();
+    assert_eq!(out, vec![(p.id.clone(), WriteOutcome::Unchanged)]);
+    assert_eq!(env_of(&p), env, "pins and context unchanged");
+    assert_eq!(fs::read(&p.claude_json).unwrap(), claude_json);
+    // Still releasable to the user's original env.
+    disconnect(&fx.paths(), std::slice::from_ref(&p)).unwrap();
+    assert_eq!(env_of(&p), json!({"KEEP": "1"}));
+}
+
+#[tokio::test]
+async fn blind_sync_after_port_change_updates_url_keeps_pins() {
+    let fx = Fix::new().await;
+    let p = fx.profile(".claude-work");
+    connect(fx.app(), std::slice::from_ref(&p)).await.unwrap();
+    let before = env_of(&p);
+
+    // The daemon restarted on another port and cannot reach the catalog.
+    let blind = fx.blind(None).await;
+    assert_ne!(blind.addr.port(), fx.srv.addr.port());
+    let out = sync_once(&blind.app).await.unwrap();
+    assert_eq!(out, vec![(p.id.clone(), WriteOutcome::Written)]);
+    let after = env_of(&p);
+    assert_eq!(
+        after["ANTHROPIC_BASE_URL"],
+        format!("http://127.0.0.1:{}", blind.addr.port())
+    );
+    let mut expected = before.clone();
+    expected["ANTHROPIC_BASE_URL"] = after["ANTHROPIC_BASE_URL"].clone();
+    assert_eq!(after, expected, "token, pins and context unchanged");
+    assert_eq!(fable_row(&p)["value"], "claude-fable-5[1m]");
+}
+
+#[tokio::test]
+async fn corrupt_claude_json_does_not_block_connect() {
+    support::capture_logs();
+    let fx = Fix::new().await;
+    let (bad, good) = (fx.profile(".claude-bad"), fx.profile(".claude-good"));
+    fs::write(&bad.claude_json, "{not json-SECRET-CONTENT").unwrap();
+    let out = connect(fx.app(), &[bad.clone(), good.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        vec![
+            (bad.id.clone(), WriteOutcome::Written),
+            (good.id.clone(), WriteOutcome::Written)
+        ]
+    );
+    assert!(env_of(&bad)["ANTHROPIC_BASE_URL"].is_string());
+    assert_eq!(
+        env_of(&bad)["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+        "claude-sonnet-5[1m]"
+    );
+    assert_eq!(
+        fs::read_to_string(&bad.claude_json).unwrap(),
+        "{not json-SECRET-CONTENT"
+    );
+    assert_eq!(fable_row(&good)["value"], "claude-fable-5[1m]");
+    let ids: Vec<String> = fx.config().profiles.into_iter().map(|p| p.id).collect();
+    assert_eq!(ids, [bad.id.clone(), good.id.clone()]);
+    assert!(!support::captured_logs().contains("SECRET-CONTENT"));
+}
+
+#[tokio::test]
+async fn failing_profile_does_not_stop_the_others() {
+    let fx = Fix::new().await;
+    let (bad, good) = (fx.profile(".claude-bad"), fx.profile(".claude-good"));
+    fs::write(&bad.settings_json, "{not json").unwrap();
+    let err = connect(fx.app(), &[bad.clone(), good.clone()])
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains(&bad.id), "{err:#}");
+    // The healthy profile after the failing one was still applied and recorded.
+    assert!(env_of(&good)["ANTHROPIC_BASE_URL"].is_string());
+    let ids: Vec<String> = fx.config().profiles.into_iter().map(|p| p.id).collect();
+    assert_eq!(ids, std::slice::from_ref(&good.id));
+    assert_eq!(fs::read_to_string(&bad.settings_json).unwrap(), "{not json");
+}
+
+#[tokio::test]
+async fn no_known_key_warns_once_per_profile() {
+    support::capture_logs();
+    let fx = Fix::new().await;
+    let p = fx.profile(".claude-nokey-warn-once");
+    connect(fx.app(), std::slice::from_ref(&p)).await.unwrap();
+    // The stored key is lost (hand-edited config) and this pool enforces none.
+    let mut cfg = fx.config();
+    cfg.proxy_key = None;
+    cfg.save(&fx.paths()).unwrap();
+    for _ in 0..3 {
+        assert!(sync_once(fx.app()).await.unwrap().is_empty());
+    }
+    let logs = support::captured_logs();
+    let hits = logs
+        .lines()
+        .filter(|l| l.contains("no proxy key") && l.contains("nokey-warn-once"))
+        .count();
+    assert_eq!(hits, 1, "{logs}");
+}
+
+#[test]
+fn profile_of_default_needs_a_dot_claude_dir() {
+    use pooltime::config::ProfileRef;
+    let odd = profile_of(&ProfileRef {
+        id: "default".into(),
+        settings_dir: PathBuf::from("/h/elsewhere"),
+    });
+    assert_eq!(odd.claude_json, PathBuf::from("/h/elsewhere/.claude.json"));
 }
 
 #[tokio::test]
