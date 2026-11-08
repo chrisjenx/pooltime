@@ -22,6 +22,8 @@ fn serve_cmd(home: &TempDir, port: u16) -> Command {
         .env("HOME", home.path())
         .env_remove("POOLTIME_PORT")
         .env_remove("POOLTIME_HOST")
+        // Never a real desktop notification from a test daemon.
+        .env("POOLTIME_ALERTS_NOTIFY", "false")
         .stdin(Stdio::null())
         .stdout(Stdio::null());
     c
@@ -176,7 +178,9 @@ impl Home {
             .env("TMPDIR", std::env::temp_dir())
             .env("HOME", self.dir.path())
             .env("POOLTIME_HOME", self.pt())
-            .env("POOLTIME_NO_BROWSER", "1");
+            .env("POOLTIME_NO_BROWSER", "1")
+            // Never a real desktop notification from a test daemon.
+            .env("POOLTIME_ALERTS_NOTIFY", "false");
     }
 
     fn command(&self, args: &[&str]) -> Command {

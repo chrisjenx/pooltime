@@ -153,7 +153,9 @@ exit 0"#,
             .env("HOME", self.home())
             .env("POOLTIME_HOME", self.pt())
             .env("XDG_CONFIG_HOME", self.home().join(".config"))
-            .env("POOLTIME_NO_BROWSER", "1");
+            .env("POOLTIME_NO_BROWSER", "1")
+            // Never a real desktop notification from a test daemon.
+            .env("POOLTIME_ALERTS_NOTIFY", "false");
         c
     }
 
