@@ -347,6 +347,7 @@ mod tests {
 
     /// Run `emit` under a file-only subscriber built with `directive`; return parsed JSON lines.
     fn capture(directive: Option<&str>, emit: impl FnOnce()) -> Vec<serde_json::Value> {
+        crate::test_support::ensure_callsites_stay_enabled();
         let dir = tempfile::tempdir().unwrap();
         let (subscriber, guard) = build_subscriber(dir.path(), directive, false).unwrap();
         tracing::subscriber::with_default(subscriber, emit);
@@ -402,6 +403,9 @@ mod tests {
 
     #[test]
     fn init_is_repeatable_and_creates_log_dir() {
+        // init() installs a global subscriber; make sure ours wins the race so the capture
+        // tests in this binary keep a permissive global fallback.
+        crate::test_support::ensure_callsites_stay_enabled();
         let home = tempfile::tempdir().unwrap();
         let paths = Paths::under(home.path());
         let cfg = RetentionCfg::default();

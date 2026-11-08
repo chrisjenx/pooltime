@@ -474,6 +474,7 @@ async fn every_transition_emits_event_and_timeline_row() {
     let a = id("a");
     let mut rx = b.transitions();
 
+    crate::test_support::ensure_callsites_stay_enabled();
     let buf = SharedBuf::default();
     let sub = {
         let buf = buf.clone();
