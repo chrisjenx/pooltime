@@ -294,8 +294,22 @@ refresh anything by hand).
 
 ### Conclusion
 
-**Pending re-check ≥ 2026-11-07T23:15.** Working assumption until then: refresh tokens **do rotate**, so treat every refresh
-as consuming the old token. Design consequences that hold regardless of the final answer:
+**Confirmed: Anthropic rotates the refresh token on every refresh.** Re-check at 2026-11-07T23:17:33 (same script):
+
+| account | sha256(refreshToken)[:16] | credentials mtime (local) | vs baseline |
+|---|---|---|---|
+| haynet-chris | `9335cde77db2558b` | 2026-11-01T05:40:27 | unchanged (dormant, no evidence) |
+| haynet-chrisjenkins | `d41f484aaceb7700` | 2026-11-07T20:26:23 | **rotated** |
+| haynet-chrisjenx | `de34fccdda07f426` | 2026-11-07T12:32:23 | unchanged (not refreshed since baseline) |
+| haynet-christopherjenkins | `8fcd58f8807b29e2` | 2026-10-25T16:01:37 | unchanged (dormant, no evidence) |
+| haynet-cjenkins | `b9afd551c9125240` | 2026-11-07T20:31:24 | **rotated** |
+| haynet-cjenks | `f00f5521c1182d8e` | 2026-11-07T20:35:27 | **rotated** |
+| personal-adbrchfam | `befa1e186b847b82` | 2026-11-07T19:22:27 | **rotated** |
+| personal-chrismarkjenkins | `e3288752f6b42f7c` | 2026-11-07T20:23:27 | **rotated** |
+
+Every account whose mtime advanced (5 of 5) has a new fingerprint; no account was rewritten with the same token. The
+writes landed ~7h56m–7h58m after the previous ones (an ~8 h access-token lifetime, refreshed on use). Refresh tokens are
+single-use. Design consequences (all already implemented or required):
 
 - Persist the new refresh token atomically (temp + fsync + rename) **before** using the new access token, and use
   compare-and-swap semantics against the old value (Claude Code does exactly this), serialising refreshes per account
