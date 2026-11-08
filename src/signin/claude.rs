@@ -596,7 +596,14 @@ impl FlowControl for Ctl {
     }
 
     fn bind(&self) -> BoxFuture<'static, anyhow::Result<Identity>> {
-        self.0.clone().bind().boxed()
+        // Its own task: a confirm request that goes away mid-save must not drop the held
+        // credentials half-saved.
+        let task = tokio::spawn(self.0.clone().bind());
+        async move {
+            task.await
+                .map_err(|_| anyhow!("saving the confirmed sign-in failed"))?
+        }
+        .boxed()
     }
 
     /// A newer sign-in for the account replaces this one: an unclaimed flow fails as superseded
@@ -638,6 +645,8 @@ mod tests {
     const ORG: &str = "cccccccc-0000-0000-0000-000000000003";
 
     struct Script {
+        /// How long the token endpoint takes to answer.
+        token_delay: Duration,
         token_status: u16,
         token_body: String,
         profile_status: u16,
@@ -677,6 +686,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let script = Arc::new(Mutex::new(Script {
+            token_delay: Duration::ZERO,
             token_status: 200,
             token_body: token_body(),
             profile_status: 200,
@@ -703,6 +713,10 @@ mod tests {
                             let method = req.method().clone();
                             let headers = req.headers().clone();
                             let raw = req.into_body().collect().await.unwrap().to_bytes();
+                            let delay = s.lock().unwrap().token_delay;
+                            if path == "/v1/oauth/token" {
+                                tokio::time::sleep(delay).await;
+                            }
                             let (status, body) = {
                                 let s = s.lock().unwrap();
                                 match (method.as_str(), path.as_str()) {
@@ -1034,6 +1048,56 @@ mod tests {
         assert_eq!(h[0]["cache-control"], "no-cache");
         assert_eq!(h[0]["content-type"], "application/json");
         assert_eq!(fx.creds().access_token, "at-new");
+    }
+
+    #[tokio::test]
+    async fn callback_exchange_survives_closed_tab() {
+        use tokio::io::AsyncWriteExt;
+        let fx = fx(baseline_a(), UUID_A).await;
+        fx.fake.script.lock().unwrap().token_delay = Duration::from_millis(500);
+        let p = fx.flow.start(&fx.id, None, SignInMode::Callback).unwrap();
+        let redirect = param(&p.authorize_url, "redirect_uri");
+        let port = reqwest::Url::parse(&redirect).unwrap().port().unwrap();
+
+        // The browser delivers the code, then the tab is closed mid-exchange.
+        let mut tab = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tab.write_all(
+            format!(
+                "GET /callback?code=the-code&state={STATE} HTTP/1.1\r\nhost: localhost\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fx.token_hits() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no exchange started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(tab);
+
+        // The exchange still completes: saved, marker retired, listener released.
+        let r = tokio::time::timeout(Duration::from_secs(10), p.wait())
+            .await
+            .expect("flow stuck after the tab closed");
+        assert!(matches!(r, SignInResult::Saved { .. }), "{r:?}");
+        assert_eq!(fx.creds().access_token, "at-new");
+        assert!(!fx.state.is_refresh_dead(&fx.id, OLD_RT));
+        for _ in 0..250 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("callback listener still accepting");
     }
 
     #[tokio::test]

@@ -648,7 +648,14 @@ impl FlowControl for Ctl {
     }
 
     fn bind(&self) -> BoxFuture<'static, anyhow::Result<Identity>> {
-        self.0.clone().bind().boxed()
+        // Its own task: a confirm request that goes away mid-save must not drop the held
+        // credentials half-saved.
+        let task = tokio::spawn(self.0.clone().bind());
+        async move {
+            task.await
+                .map_err(|_| anyhow!("saving the confirmed sign-in failed"))?
+        }
+        .boxed()
     }
 
     fn supersede(&self) {
