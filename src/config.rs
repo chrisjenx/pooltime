@@ -69,7 +69,7 @@ impl Paths {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub host: IpAddr,
@@ -84,6 +84,24 @@ pub struct Config {
     pub anthropic: AnthropicCfg,
     pub openai: OpenAiCfg,
     pub alerts: AlertsCfg,
+}
+
+/// Hand-written so `proxy_key` (a secret) never reaches logs.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("proxy_key", &self.proxy_key.as_ref().map(|_| "<redacted>"))
+            .field("timeouts", &self.timeouts)
+            .field("routing", &self.routing)
+            .field("retention", &self.retention)
+            .field("profiles", &self.profiles)
+            .field("anthropic", &self.anthropic)
+            .field("openai", &self.openai)
+            .field("alerts", &self.alerts)
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -311,8 +329,10 @@ impl Default for AlertsCfg {
 }
 
 impl Config {
-    /// Load `config.toml` (missing file = defaults, corrupt file = error), apply
-    /// the `POOLTIME_*` env overlay, then clamp.
+    /// Runtime path: `config.toml` (missing file = defaults, corrupt = error),
+    /// then the `POOLTIME_*` env overlay, then clamping. Do NOT use this for
+    /// load-mutate-save flows (it would persist env values such as the proxy
+    /// key, and baked clamps); use [`Config::load_file`] for those.
     pub fn load(p: &Paths) -> anyhow::Result<Config> {
         Self::load_with_env(p, |k| std::env::var(k).ok())
     }
@@ -321,15 +341,59 @@ impl Config {
         p: &Paths,
         get: impl Fn(&str) -> Option<String>,
     ) -> anyhow::Result<Config> {
-        let mut cfg = match fs::read_to_string(&p.config) {
+        let mut cfg = Self::load_file(p)?;
+        cfg.apply_env(get)?;
+        cfg.validate()?;
+        cfg.normalize();
+        Ok(cfg)
+    }
+
+    /// File-only loader for mutate-and-save callers: defaults + `config.toml`,
+    /// validated, but no env overlay and no clamping.
+    pub fn load_file(p: &Paths) -> anyhow::Result<Config> {
+        let cfg = match fs::read_to_string(&p.config) {
             Ok(s) => toml::from_str::<Config>(&s)
                 .with_context(|| format!("parsing {}", p.config.display()))?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => Config::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", p.config.display())),
         };
-        cfg.apply_env(get)?;
-        cfg.normalize();
+        cfg.validate()
+            .with_context(|| format!("invalid {}", p.config.display()))?;
         Ok(cfg)
+    }
+
+    /// Reject out-of-range values (unlike `normalize`, which clamps durations
+    /// up to their floors).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let r = &self.routing;
+        if self.port == 0 {
+            return Err(anyhow!("port must not be 0"));
+        }
+        if !(0.0..=5.0).contains(&r.five_hour_exp) {
+            return Err(anyhow!(
+                "routing.five_hour_exp must be between 0 and 5, got {}",
+                r.five_hour_exp
+            ));
+        }
+        if !(0.0..=1.0).contains(&r.min_headroom) {
+            return Err(anyhow!(
+                "routing.min_headroom must be between 0 and 1, got {}",
+                r.min_headroom
+            ));
+        }
+        if !(r.headroom_taper_start > 0.0 && r.headroom_taper_start <= 1.0) {
+            return Err(anyhow!(
+                "routing.headroom_taper_start must be greater than 0 and at most 1, got {}",
+                r.headroom_taper_start
+            ));
+        }
+        let t = &self.timeouts;
+        if t.overload_retry_base > t.overload_retry_cap {
+            return Err(anyhow!(
+                "timeouts.overload_retry_base must not exceed timeouts.overload_retry_cap"
+            ));
+        }
+        Ok(())
     }
 
     /// Overlay `POOLTIME_*` variables. Only the `POOLTIME_` prefix is read.
@@ -525,5 +589,93 @@ mod tests {
         c.save(&p).unwrap();
         let mode = std::fs::metadata(&p.config).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn load_file_ignores_env_and_does_not_bake_clamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths::under(dir.path());
+        std::fs::write(&p.config, "[timeouts]\nanthropic_idle = \"10s\"\n").unwrap();
+        // Runtime load: env applied, clamp applied.
+        let env = env_of(&[("POOLTIME_PROXY_KEY", "sekrit"), ("POOLTIME_PORT", "4000")]);
+        let c = Config::load_with_env(&p, env).unwrap();
+        assert_eq!(c.proxy_key.as_deref(), Some("sekrit"));
+        assert_eq!(c.timeouts.anthropic_idle, Duration::from_secs(30));
+        // File-only load then save: neither env nor clamp is persisted.
+        let mut f = Config::load_file(&p).unwrap();
+        assert_eq!(f.proxy_key, None);
+        assert_eq!(f.port, 3460);
+        assert_eq!(f.timeouts.anthropic_idle, Duration::from_secs(10));
+        f.alerts.warn_days = vec![7];
+        f.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p.config).unwrap();
+        assert!(
+            !text.contains("proxy_key") && !text.contains("sekrit"),
+            "{text}"
+        );
+        assert!(text.contains("port = 3460"), "{text}");
+        let again = Config::load_file(&p).unwrap();
+        assert_eq!(again.timeouts.anthropic_idle, Duration::from_secs(10));
+        assert_eq!(again.alerts.warn_days, vec![7]);
+    }
+
+    #[test]
+    fn debug_redacts_proxy_key() {
+        let c = Config {
+            proxy_key: Some("sekrit-value".into()),
+            ..Config::default()
+        };
+        let d = format!("{c:?}");
+        assert!(!d.contains("sekrit-value"), "{d}");
+        assert!(d.contains("Some(\"<redacted>\")"), "{d}");
+        assert!(!format!("{c:#?}").contains("sekrit-value"));
+        let d = format!("{:?}", Config::default());
+        assert!(d.contains("proxy_key: None"), "{d}");
+    }
+
+    #[test]
+    fn out_of_range_values_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Paths::under(dir.path());
+        let cases = [
+            ("port = 0\n", "port must not be 0"),
+            ("[routing]\nfive_hour_exp = 5.5\n", "five_hour_exp"),
+            ("[routing]\nfive_hour_exp = -1.0\n", "five_hour_exp"),
+            ("[routing]\nmin_headroom = 1.5\n", "min_headroom"),
+            ("[routing]\nmin_headroom = -0.1\n", "min_headroom"),
+            (
+                "[routing]\nheadroom_taper_start = 0.0\n",
+                "headroom_taper_start",
+            ),
+            (
+                "[routing]\nheadroom_taper_start = 1.1\n",
+                "headroom_taper_start",
+            ),
+            (
+                "[timeouts]\noverload_retry_base = \"10s\"\noverload_retry_cap = \"1s\"\n",
+                "overload_retry_base",
+            ),
+        ];
+        for (toml, needle) in cases {
+            std::fs::write(&p.config, toml).unwrap();
+            for err in [
+                Config::load_with_env(&p, no_env).unwrap_err(),
+                Config::load_file(&p).unwrap_err(),
+            ] {
+                let msg = format!("{err:#}");
+                assert!(msg.contains(needle), "{toml:?} -> {msg}");
+            }
+        }
+        // Boundary values are accepted.
+        std::fs::write(
+            &p.config,
+            "[routing]\nfive_hour_exp = 5.0\nmin_headroom = 0.0\nheadroom_taper_start = 1.0\n",
+        )
+        .unwrap();
+        assert!(Config::load_file(&p).is_ok());
+        // Env can't smuggle in port 0 either.
+        std::fs::remove_file(&p.config).unwrap();
+        let err = Config::load_with_env(&p, env_of(&[("POOLTIME_PORT", "0")])).unwrap_err();
+        assert!(format!("{err:#}").contains("port"), "{err:#}");
     }
 }
