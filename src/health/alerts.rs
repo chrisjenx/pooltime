@@ -10,7 +10,11 @@
 //!   state the account was not in at the previous evaluation counts (in memory), so an
 //!   `erroring` streak whose start drifts as old failures age out does not re-alert. After a
 //!   restart a still-dead account is checked against the persisted keys again: a dead account
-//!   notifies once ever per `since`, including on the very first start.
+//!   notifies once ever per `since`, including on the very first start. An unknown `since`
+//!   makes the key `<account>:<state>:unknown`; once recorded it suppresses every later entry
+//!   into that state with an unknown `since`, in this process and after restarts alike, until
+//!   retention prunes the row. That is intended: without a start time, re-entries cannot be told
+//!   apart, and at most once beats spam.
 //!
 //! Each key is written to `alerts_sent` *before* the notification is shown, and a failed send
 //! keeps the row: at most once beats spam. `alerts.notify = false` records and logs events but
