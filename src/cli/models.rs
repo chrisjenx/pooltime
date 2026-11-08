@@ -53,8 +53,12 @@ pub async fn run(paths: &Paths, cmd: ModelsCmd) -> anyhow::Result<i32> {
     }
 }
 
-/// The summary lines, warnings, and whether the command failed (profiles not re-synced, or no
-/// Codex account could be asked for its catalog). A partial Codex failure is only a warning.
+/// The summary lines, warnings, and whether the command failed.
+///
+/// A Claude live-catalog failure (`live_error`) or a Codex discovery failure (`codex.error`,
+/// per-account `codex.failed`) is only a warning while the other catalog answered; the command
+/// fails (exit 1) only when every catalog failed (the API answers 502 then, which the client
+/// reports as an error) or the connected profiles could not be re-synced.
 fn refresh_report(v: &serde_json::Value) -> (Vec<String>, Vec<String>, bool) {
     let mut lines = vec![format!(
         "refreshed: {} live Claude models, {} listed; {} connected profiles re-synced",
@@ -63,37 +67,59 @@ fn refresh_report(v: &serde_json::Value) -> (Vec<String>, Vec<String>, bool) {
         v["profiles_synced"]
     )];
     let mut warnings = Vec::new();
-    let mut failed = false;
+    let live_failed = match v["live_error"].as_str() {
+        Some(e) => {
+            warnings.push(format!(
+                "warning: Claude live model catalog unavailable ({e})"
+            ));
+            true
+        }
+        None => false,
+    };
     let codex = &v["codex"];
-    if let Some(e) = codex["error"].as_str() {
-        warnings.push(format!("warning: Codex model discovery failed ({e})"));
-        failed = true;
-    } else if codex.is_object() {
-        let added: Vec<&str> = codex["added"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|m| m.as_str())
-            .collect();
-        lines.push(
-            match (codex["accounts"].as_u64().unwrap_or(0), added.len()) {
+    let codex_failed = match codex["error"].as_str() {
+        Some(e) => {
+            warnings.push(format!("warning: Codex model discovery failed ({e})"));
+            true
+        }
+        None if codex.is_object() => {
+            let names = |k: &str| -> Vec<&str> {
+                codex[k]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| m.as_str())
+                    .collect()
+            };
+            let (added, updated) = (names("added"), names("updated"));
+            let n = codex["accounts"].as_u64().unwrap_or(0);
+            let asked = format!("{n} account{} asked", plural(n as usize));
+            let mut line = match (n, added.len()) {
                 (0, _) => "codex: no signed-in ChatGPT account; discovery skipped".to_string(),
-                (n, 0) => format!("codex: no new models ({n} accounts asked)"),
-                (n, k) => format!(
-                    "codex: discovered {k} new model{} ({n} accounts asked): {}",
-                    if k == 1 { "" } else { "s" },
+                (_, 0) => format!("codex: no new models ({asked})"),
+                (_, k) => format!(
+                    "codex: discovered {k} new model{} ({asked}): {}",
+                    plural(k),
                     added.join(", ")
                 ),
-            },
-        );
-        for f in codex["failed"].as_array().into_iter().flatten() {
-            warnings.push(format!(
-                "warning: Codex catalog unavailable for account {} ({})",
-                f["account"].as_str().unwrap_or("?"),
-                f["reason"].as_str().unwrap_or("unknown")
-            ));
+            };
+            if !updated.is_empty() {
+                line.push_str(&format!("; refreshed {}", updated.join(", ")));
+            }
+            lines.push(line);
+            for f in codex["failed"].as_array().into_iter().flatten() {
+                warnings.push(format!(
+                    "warning: Codex catalog unavailable for account {} ({})",
+                    f["account"].as_str().unwrap_or("?"),
+                    f["reason"].as_str().unwrap_or("unknown")
+                ));
+            }
+            false
         }
-    }
+        // No Codex provider: the Claude catalog was the only one asked.
+        None => true,
+    };
+    let mut failed = live_failed && codex_failed;
     if let Some(e) = v["sync_error"].as_str() {
         warnings.push(format!(
             "warning: connected profiles were not re-synced ({e}); see `pooltime logs`"
@@ -101,6 +127,14 @@ fn refresh_report(v: &serde_json::Value) -> (Vec<String>, Vec<String>, bool) {
         failed = true;
     }
     (lines, warnings, failed)
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 #[cfg(test)]
@@ -141,13 +175,35 @@ mod tests {
 
         let (lines, _, _) =
             refresh_report(&base(json!({"accounts": 1, "added": [], "failed": []})));
-        assert_eq!(lines[1], "codex: no new models (1 accounts asked)");
+        assert_eq!(lines[1], "codex: no new models (1 account asked)");
         let (lines, _, _) =
             refresh_report(&base(json!({"accounts": 0, "added": [], "failed": []})));
         assert!(lines[1].contains("skipped"));
+        let (lines, _, _) = refresh_report(&base(
+            json!({"accounts": 1, "added": [], "updated": ["gpt-z"], "failed": []}),
+        ));
+        assert_eq!(
+            lines[1],
+            "codex: no new models (1 account asked); refreshed gpt-z"
+        );
 
+        // Codex failing while Claude answered: a warning, not a failure.
         let (_, w, failed) = refresh_report(&base(json!({"error": "unavailable (status:401)"})));
-        assert!(failed);
+        assert!(!failed);
         assert!(w[0].contains("status:401"));
+
+        // Claude failing while Codex answered: a warning, not a failure.
+        let mut v = base(json!({"accounts": 1, "added": ["gpt-x"], "failed": []}));
+        v["live_error"] = json!("live model catalog refresh failed: status:500");
+        let (lines, w, failed) = refresh_report(&v);
+        assert!(!failed);
+        assert_eq!(
+            lines[1],
+            "codex: discovered 1 new model (1 account asked): gpt-x"
+        );
+        assert!(w[0].contains("Claude") && w[0].contains("status:500"));
+        // Every catalog failed: the command fails.
+        v["codex"] = json!({"error": "x"});
+        assert!(refresh_report(&v).2);
     }
 }

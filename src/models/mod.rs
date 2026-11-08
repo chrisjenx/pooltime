@@ -22,7 +22,7 @@ pub use defaults::{
 };
 pub use families::{family_of, MODEL_FAMILIES};
 pub use mapping::{Mapping, MappingError};
-pub use table::ModelTable;
+pub use table::{DiscoveredMerge, ModelTable};
 
 /// One row of the model table: a public model id and where it is served.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

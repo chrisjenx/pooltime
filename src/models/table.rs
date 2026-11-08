@@ -31,6 +31,19 @@ pub struct ModelTable {
     rows: Vec<RouteDef>,
     mapping_enabled: bool,
     mappings: Vec<Mapping>,
+    /// Ids of rows added by runtime catalog discovery ([`Self::merge_discovered`]). Runtime-only:
+    /// [`Self::save`] never writes them (the next discovery run re-adds them), and only these
+    /// rows may have their metadata refreshed by a later discovery.
+    discovered: HashSet<String>,
+}
+
+/// What [`ModelTable::merge_discovered`] changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveredMerge {
+    /// Ids newly added (as discovered rows).
+    pub added: Vec<String>,
+    /// Discovered rows whose context windows / efforts changed.
+    pub updated: Vec<String>,
 }
 
 impl Default for ModelTable {
@@ -46,6 +59,7 @@ impl ModelTable {
             rows: default_routes(),
             mapping_enabled: false,
             mappings: default_mappings(),
+            discovered: HashSet::new(),
         }
     }
 
@@ -102,8 +116,9 @@ impl ModelTable {
     }
 
     /// Atomically write `<home>/models.toml` (0600). Rows identical to a bundled default
-    /// are not written, so default refreshes still reach existing installs; all
-    /// mappings are written (persisted rows are authoritative, including opt-outs).
+    /// are not written, so default refreshes still reach existing installs, and neither are
+    /// runtime-discovered rows ([`Self::merge_discovered`]); all mappings are written (persisted
+    /// rows are authoritative, including opt-outs).
     pub fn save(&self, p: &Paths) -> anyhow::Result<()> {
         #[derive(Serialize)]
         struct Out<'a> {
@@ -114,7 +129,11 @@ impl ModelTable {
         let defaults = default_routes();
         let out = Out {
             mapping_enabled: self.mapping_enabled,
-            models: self.rows.iter().filter(|r| !defaults.contains(r)).collect(),
+            models: self
+                .rows
+                .iter()
+                .filter(|r| !defaults.contains(r) && !self.discovered.contains(&r.id))
+                .collect(),
             mappings: &self.mappings,
         };
         let text = toml::to_string(&out).context("serializing models.toml")?;
@@ -213,6 +232,44 @@ impl ModelTable {
         added
     }
 
+    /// Merge a runtime catalog: an id not in the table is added and marked discovered (never
+    /// saved); a row that was itself discovered gets its `context_window`, `max_context_window` and
+    /// `supported_efforts` refreshed; bundled and user-configured rows are never touched. Nothing
+    /// is removed. Duplicate ids in `defs` keep the first.
+    pub fn merge_discovered(&mut self, defs: Vec<RouteDef>) -> DiscoveredMerge {
+        let mut out = DiscoveredMerge::default();
+        let mut seen: HashSet<String> = HashSet::new();
+        for d in defs {
+            if !seen.insert(d.id.clone()) {
+                continue;
+            }
+            match self.rows.iter_mut().find(|r| r.id == d.id) {
+                None => {
+                    out.added.push(d.id.clone());
+                    self.discovered.insert(d.id.clone());
+                    self.rows.push(d);
+                }
+                Some(r) if self.discovered.contains(&r.id) => {
+                    if (r.context_window, r.max_context_window, &r.supported_efforts)
+                        != (d.context_window, d.max_context_window, &d.supported_efforts)
+                    {
+                        r.context_window = d.context_window;
+                        r.max_context_window = d.max_context_window;
+                        r.supported_efforts = d.supported_efforts;
+                        out.updated.push(d.id);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Whether `id` is a runtime-discovered row (see [`Self::merge_discovered`]).
+    pub fn is_discovered(&self, id: &str) -> bool {
+        self.discovered.contains(id)
+    }
+
     /// Client-facing id: `<id>[1m]` for OpenAI routes with `max_context_window >= 872000`.
     pub fn selector_id(def: &RouteDef) -> String {
         selector_id(def)
@@ -253,6 +310,7 @@ impl ModelTable {
             mappings: merge_over(default_mappings(), file_mappings),
             rows,
             mapping_enabled,
+            discovered: HashSet::new(),
         }
     }
 }
