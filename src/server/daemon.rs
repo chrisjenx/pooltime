@@ -52,6 +52,7 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
     }
     cfg.validate()?;
     let _log = crate::logging::init(&paths, &cfg.retention, std::io::stderr().is_terminal())?;
+    crate::logging::install_panic_hook();
 
     health::preflight(&cfg).await?;
     let registry = Arc::new(Registry::load(&paths)?);
@@ -147,7 +148,7 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
         openai::spawn_usage_sweeper(openai, SWEEP_INTERVAL),
         // Codex catalog discovery: at boot (providers are registered by now), then hourly. New
         // routes go live in the model table and trigger a profile re-sync.
-        spawn_every(CATALOG_REFRESH_EVERY, {
+        spawn_every("codex catalog refresh", CATALOG_REFRESH_EVERY, {
             let app = app.clone();
             move || {
                 let app = app.clone();
@@ -156,7 +157,7 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
         }),
         crate::claude_code::spawn_profile_sync(app.clone()),
         // Health tick: one probe refresh per passed login expiry (spec §16).
-        spawn_every(crate::health::HEALTH_TICK, {
+        spawn_every("health tick", crate::health::HEALTH_TICK, {
             let app = app.clone();
             let probe = Arc::new(crate::health::ExpiryProbe::default());
             move || {
@@ -171,7 +172,7 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
             app.clone(),
             Arc::new(crate::health::notify::SystemNotifier::from_env()),
         ),
-        spawn_every(SESSION_PRUNE_EVERY, move || {
+        spawn_every("session prune", SESSION_PRUNE_EVERY, move || {
             sessions.prune(OffsetDateTime::now_utc());
             std::future::ready(())
         }),
@@ -181,7 +182,7 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
             app.state.clone(),
             store.clone(),
         ),
-        spawn_every(RETENTION_EVERY, move || {
+        spawn_every("retention prune", RETENTION_EVERY, move || {
             let (store, cfg) = (store.clone(), retention_cfg.clone());
             async move {
                 // Local time: usage-history buckets follow the local ISO weeks of the burn report.
@@ -221,9 +222,9 @@ impl Drop for Tasks {
     }
 }
 
-/// Run `f` at once and then every `period` until aborted. A panic in `f` ends only this task
-/// (the runtime reports it); the daemon keeps serving.
-fn spawn_every<F, Fut>(period: Duration, mut f: F) -> JoinHandle<()>
+/// Run `f` at once and then every `period` until aborted. A panicking iteration is logged
+/// (with `name`) and the next tick runs as usual.
+fn spawn_every<F, Fut>(name: &'static str, period: Duration, mut f: F) -> JoinHandle<()>
 where
     F: FnMut() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -233,7 +234,7 @@ where
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            f().await;
+            crate::logging::catch_panic(name, f()).await;
         }
     })
 }
@@ -261,4 +262,34 @@ fn load_fixture_state() -> anyhow::Result<Option<serde_json::Value>> {
         "{FIXTURE_STATE_ENV} is set: /api/v1/status serves fixture data, not the live pool"
     );
     Ok(Some(v))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn spawn_every_survives_a_panicking_iteration() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let seen = runs.clone();
+        let task = spawn_every("test task", Duration::from_millis(10), move || {
+            let n = seen.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    panic!("first iteration fails");
+                }
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while runs.load(Ordering::SeqCst) < 3 {
+            assert!(
+                !task.is_finished(),
+                "the task died with its first iteration"
+            );
+            assert!(tokio::time::Instant::now() < deadline, "stopped ticking");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        task.abort();
+    }
 }

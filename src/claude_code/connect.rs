@@ -509,7 +509,9 @@ pub fn spawn_profile_sync(state: Arc<AppState>) -> JoinHandle<()> {
             if state.runtime.draining() {
                 continue;
             }
-            if let Err(e) = sync_once(&state).await {
+            if let Some(Err(e)) =
+                crate::logging::catch_panic("profile sync", sync_once(&state)).await
+            {
                 tracing::warn!(error = %e, "profile sync failed");
             }
         }

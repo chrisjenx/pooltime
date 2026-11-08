@@ -290,14 +290,17 @@ pub fn spawn_alerts(app: Arc<AppState>, notifier: Arc<dyn Notifier>) -> JoinHand
                 c.borrow_and_update();
             }
             let now = OffsetDateTime::now_utc();
-            match crate::server::mgmt::try_gather(&app, now).await {
-                Ok(inputs) => {
-                    let accounts: Vec<AlertInput> =
-                        inputs.accounts.iter().map(AlertInput::from).collect();
-                    alerts.evaluate(&accounts, now).await;
+            let round = async {
+                match crate::server::mgmt::try_gather(&app, now).await {
+                    Ok(inputs) => {
+                        let accounts: Vec<AlertInput> =
+                            inputs.accounts.iter().map(AlertInput::from).collect();
+                        alerts.evaluate(&accounts, now).await;
+                    }
+                    Err(e) => tracing::warn!(error = %e, "alerts: could not read the pool"),
                 }
-                Err(e) => tracing::warn!(error = %e, "alerts: could not read the pool"),
-            }
+            };
+            crate::logging::catch_panic("alerts", round).await;
         }
     })
 }
