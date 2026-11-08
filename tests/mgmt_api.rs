@@ -1917,12 +1917,18 @@ mod mgmt {
         }
         assert_eq!(settings(&dir), original);
 
-        // Nothing named, a relative path, a missing dir, a non-string: refused, nothing written.
+        // A dir without settings.json is not a Claude Code profile.
+        let bare = home.path().join(".claude-bare");
+        std::fs::create_dir_all(&bare).unwrap();
+
+        // Nothing named, a relative path, a missing dir, a dir without settings.json, a
+        // non-string: refused, nothing written.
         for body in [
             json!({}),
             json!({"profiles": []}),
             json!({"profiles": ["relative/dir"]}),
             json!({"profiles": [home.path().join("missing").to_str().unwrap()]}),
+            json!({"profiles": [bare.to_str().unwrap()]}),
             json!({"profiles": [7]}),
             json!({"profiles": "x"}),
         ] {
@@ -1971,6 +1977,75 @@ mod mgmt {
         let r = call(&srv, "POST", "/api/v1/profiles/disconnect", Some(json!({}))).await;
         assert_eq!(r.status, 200, "{}", r.text());
         assert_eq!(r.json()["profiles"], json!([]));
+        assert!(!bare.join("settings.json").exists());
+    }
+
+    #[tokio::test]
+    async fn profiles_response_reports_each_dir_even_with_equal_ids() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        let home = tempfile::tempdir().unwrap();
+        let dirs: Vec<std::path::PathBuf> = ["a", "b"]
+            .iter()
+            .map(|p| home.path().join(p).join(".claude-x"))
+            .collect();
+        for d in &dirs {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("settings.json"), "{}").unwrap();
+        }
+        let names: Vec<&str> = dirs.iter().map(|d| d.to_str().unwrap()).collect();
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/profiles/connect",
+            Some(json!({ "profiles": names })),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        assert_eq!(v["profiles"][0]["settings_dir"], names[0]);
+        assert_eq!(v["profiles"][1]["settings_dir"], names[1]);
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/profiles/disconnect",
+            Some(json!({ "profiles": names })),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        assert_eq!(v["profiles"][0]["settings_dir"], names[0]);
+        assert_eq!(v["profiles"][1]["settings_dir"], names[1]);
+    }
+
+    #[tokio::test]
+    async fn account_create_with_email_sets_expected_identity() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts",
+            Some(json!({"id": "mail", "provider": "anthropic", "email": " you@example.com "})),
+        )
+        .await;
+        assert_eq!(r.status, 201, "{}", r.text());
+        assert_eq!(r.json()["email"], "you@example.com");
+        let meta = pool.reg.get(&id("mail")).unwrap();
+        assert_eq!(meta.identity.email.as_deref(), Some("you@example.com"));
+        assert_eq!(meta.identity.account_uuid, None);
+        for bad in [json!(7), json!(""), json!("no-at-sign")] {
+            let r = call(
+                &srv,
+                "POST",
+                "/api/v1/accounts",
+                Some(json!({"id": "mail2", "provider": "anthropic", "email": bad})),
+            )
+            .await;
+            assert_eq!(r.status, 400, "{bad}: {}", r.text());
+            assert!(message(&r).contains("email"), "{}", message(&r));
+        }
+        assert!(pool.reg.get(&id("mail2")).is_none());
     }
 
     #[tokio::test]
@@ -2019,14 +2094,29 @@ mod mgmt {
             .contains(&json!("claude-live-1")));
         assert!(ids(http_get(srv.addr, "/v1/models", &[]).await.json())
             .contains(&"claude-live-1".to_string()));
+        assert!(v.get("sync_error").is_none(), "{v}");
+
+        // The profile sync failing (unreadable config.toml) is reported, without content.
+        let cfg_path = pool.dir.path().join("config.toml");
+        let saved_cfg = std::fs::read(&cfg_path).ok();
+        std::fs::write(&cfg_path, "this is = = not toml SECRETCONTENT").unwrap();
+        let r = call(&srv, "POST", "/api/v1/models/refresh", None).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert_eq!(r.json()["sync_error"], "profile_sync_failed");
+        assert!(!r.text().contains("SECRETCONTENT"), "{}", r.text());
+        match saved_cfg {
+            Some(b) => std::fs::write(&cfg_path, b).unwrap(),
+            None => std::fs::remove_file(&cfg_path).unwrap(),
+        }
 
         // A failed refresh is an error, and the last good list keeps being served.
         fail.store(true, Ordering::SeqCst);
         let r = call(&srv, "POST", "/api/v1/models/refresh", None).await;
         assert_eq!(r.status, 502, "{}", r.text());
         assert!(!r.text().contains("boom"), "no upstream text: {}", r.text());
+        // (The sync-error refresh above fetched `claude-live-2`, the last good list.)
         assert!(ids(http_get(srv.addr, "/v1/models", &[]).await.json())
-            .contains(&"claude-live-1".to_string()));
+            .contains(&"claude-live-2".to_string()));
 
         // No Anthropic provider registered: nothing to refresh.
         let pool = Pool::new();

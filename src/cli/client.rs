@@ -33,15 +33,35 @@ pub struct Client {
 /// The daemon answering on the configured address, `None` when nothing listens there. Anything
 /// else on the port (bro, another server, a hung listener) is an error: never guess.
 pub async fn find(paths: &Paths) -> anyhow::Result<Option<Client>> {
-    let cfg = Config::load(paths)?;
-    let addr = probe_addr(cfg.host, cfg.port);
-    match probe(addr).await {
-        Probe::Pooltime => Ok(Some(Client::new(addr, paths.clone())?)),
-        Probe::Free => Ok(None),
-        other => bail!(
-            "{addr} does not answer as a pooltime ({other:?}); is another server using the port?"
+    match locate(paths).await? {
+        Located::Daemon(c) => Ok(Some(c)),
+        Located::Absent {
+            probe: Probe::Free, ..
+        } => Ok(None),
+        Located::Absent { addr, probe } => bail!(
+            "{addr} does not answer as a pooltime ({probe:?}); is another server using the port?"
         ),
     }
+}
+
+/// What answers on the configured address.
+pub enum Located {
+    Daemon(Client),
+    /// No pooltime there; `probe` says what was found instead.
+    Absent {
+        addr: SocketAddr,
+        probe: Probe,
+    },
+}
+
+/// Probe the configured address (for callers that can work without a daemon).
+pub async fn locate(paths: &Paths) -> anyhow::Result<Located> {
+    let cfg = Config::load(paths)?;
+    let addr = probe_addr(cfg.host, cfg.port);
+    Ok(match probe(addr).await {
+        Probe::Pooltime => Located::Daemon(Client::new(addr, paths.clone())?),
+        probe => Located::Absent { addr, probe },
+    })
 }
 
 /// [`find`], with "not running" as an error that says how to start it.

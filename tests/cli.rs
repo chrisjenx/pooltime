@@ -288,6 +288,12 @@ fn accounts_add_list_remove() {
     h.cli(&["accounts", "remove", "alpha", "--yes"])
         .failure()
         .stderr(predicate::str::contains("Unknown account"));
+
+    // `--email` without `--login` records the expected identity (shown in the list).
+    h.cli(&["accounts", "add", "beta", "--email", "b@example.com"])
+        .success();
+    let out = stdout_of(&h.cli(&["accounts", "list"]).success());
+    assert!(out.contains("b@example.com"), "{out}");
 }
 
 #[test]
@@ -463,6 +469,71 @@ fn connect_disconnect_roundtrip_on_temp_profile() {
     assert!(!h.config().contains(".claude-test"));
 }
 
+#[test]
+fn connect_dot_claude_name_resolves_to_home_profile_not_cwd() {
+    let h = Home::new();
+    // The user's default profile ...
+    let home_prof = h.dir.path().join(".claude");
+    std::fs::create_dir_all(&home_prof).unwrap();
+    std::fs::write(home_prof.join("settings.json"), r#"{"env":{}}"#).unwrap();
+    // ... and a repository with its own (git-tracked) .claude/settings.json, used as the cwd.
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join(".claude")).unwrap();
+    let repo_settings = repo.path().join(".claude/settings.json");
+    let repo_bytes = br#"{"permissions":{"allow":["Bash(ls)"]}}"#;
+    std::fs::write(&repo_settings, repo_bytes).unwrap();
+
+    let _d = h.serve();
+    let run = |args: &[&str]| {
+        let mut c = h.command(args);
+        c.current_dir(repo.path());
+        assert_cmd::Command::from_std(c).write_stdin("").assert()
+    };
+    run(&["connect", ".claude"])
+        .success()
+        .stdout(predicate::str::contains("default"));
+    assert_eq!(std::fs::read(&repo_settings).unwrap(), repo_bytes);
+    assert_eq!(
+        settings_of(&home_prof)["env"]["ANTHROPIC_BASE_URL"],
+        format!("http://127.0.0.1:{}", h.port)
+    );
+
+    // $HOME itself is never a profile dir (its .claude.json belongs to ~/.claude), even with a
+    // settings.json in it.
+    std::fs::write(h.dir.path().join("settings.json"), "{}").unwrap();
+    run(&["connect", h.dir.path().to_str().unwrap()])
+        .failure()
+        .stderr(predicate::str::contains("home directory"));
+    assert_eq!(
+        std::fs::read_to_string(h.dir.path().join("settings.json")).unwrap(),
+        "{}"
+    );
+    run(&["disconnect", "default"]).success();
+    assert_eq!(std::fs::read(&repo_settings).unwrap(), repo_bytes);
+}
+
+#[test]
+fn disconnect_falls_back_offline_when_port_is_not_pooltime() {
+    let h = Home::new();
+    let prof = h.dir.path().join(".claude-test");
+    std::fs::create_dir_all(&prof).unwrap();
+    let original = json!({"env": {"KEEP": "1"}});
+    std::fs::write(prof.join("settings.json"), original.to_string()).unwrap();
+    let d = h.serve();
+    h.cli(&["connect", "claude-test"]).success();
+    drop(d);
+
+    // Something that accepts connections but never answers holds the port now.
+    let squatter = TcpListener::bind(("127.0.0.1", h.port)).unwrap();
+    h.cli(&["disconnect"])
+        .success()
+        .stderr(predicate::str::contains("Unresponsive"))
+        .stdout(predicate::str::contains("claude-test"));
+    assert_eq!(settings_of(&prof), original);
+    assert!(!h.config().contains(".claude-test"));
+    drop(squatter);
+}
+
 const TOKEN_PATH: &str = "/v1/oauth/token";
 const PROFILE_PATH: &str = "/api/oauth/profile";
 const EMAIL: &str = "you@example.com";
@@ -508,6 +579,15 @@ fn headless_login(h: &Home, args: &[&str]) -> (bool, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Watchdog: a regression that leaves the CLI waiting must fail the test, not hang the suite.
+    let (done, watch) = std::sync::mpsc::channel::<()>();
+    let pid = child.id().to_string();
+    let watchdog = std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(LOGIN_WATCHDOG)
+        {
+            let _ = Command::new("kill").args(["-KILL", &pid]).status();
+        }
+    });
     let mut stdin = child.stdin.take().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let mut seen = String::new();
@@ -543,6 +623,8 @@ fn headless_login(h: &Home, args: &[&str]) -> (bool, String, String) {
         seen.push('\n');
     }
     let st = child.wait().unwrap();
+    let _ = done.send(());
+    watchdog.join().unwrap();
     let mut err = String::new();
     child
         .stderr
@@ -553,6 +635,9 @@ fn headless_login(h: &Home, args: &[&str]) -> (bool, String, String) {
     seen.push_str(&err);
     (st.success(), seen, url)
 }
+
+/// How long a scripted login may run before the watchdog kills it.
+const LOGIN_WATCHDOG: Duration = Duration::from_secs(30);
 
 fn assert_signed_in(h: &Home, fake: &support::FakeAnthropic, ok: bool, out: &str, url: &str) {
     assert!(ok, "login failed:\n{out}");

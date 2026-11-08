@@ -14,8 +14,7 @@ use serde_json::{json, Value};
 use super::client;
 use crate::claude_code::{discover, is_connected};
 use crate::config::{Config, Paths};
-use crate::fsutil::WriteOutcome;
-use crate::server::mgmt::resolve_profiles;
+use crate::server::mgmt::{profile_id_arg, profiles_json, resolve_profiles};
 
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
@@ -23,9 +22,12 @@ fn home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Path-like arguments (`~/x`, `./x`, `x/y`) become absolute directories; ids found among this
-/// user's `~/.claude*` dirs become their directory too (so the daemon need not share `$HOME`);
-/// other ids pass through for the daemon to resolve from its config.
+/// An argument without `/` is always a profile id ([`profile_id_arg`]: `.claude` is `default`,
+/// `.claude-work` is `claude-work`), never a directory relative to the cwd: `pooltime connect
+/// .claude` inside a repository must not write the repository's `.claude/settings.json`. Ids
+/// found among this user's `~/.claude*` dirs are sent as their directory (so the daemon need not
+/// share `$HOME`); other ids pass through for the daemon to resolve from its config. Only an
+/// argument containing `/` (`~/x`, `./x`, `x/y`, `/x`) is a path; it is made absolute.
 fn normalize(args: &[String]) -> anyhow::Result<Vec<String>> {
     normalize_in(args, home().as_deref())
 }
@@ -34,16 +36,16 @@ fn normalize_in(args: &[String], home: Option<&Path>) -> anyhow::Result<Vec<Stri
     let found = home.map(discover).unwrap_or_default();
     args.iter()
         .map(|a| {
-            let path_like = a.contains('/') || a.starts_with('.') || a.starts_with('~');
-            if !path_like {
+            if !a.contains('/') {
+                let id = profile_id_arg(a);
                 return Ok(found
                     .iter()
-                    .find(|p| p.id == *a)
-                    .map_or_else(|| a.clone(), |p| p.settings_dir.to_string_lossy().into()));
+                    .find(|p| p.id == id)
+                    .map_or(id, |p| p.settings_dir.to_string_lossy().into()));
             }
             let p = match (a.strip_prefix("~/"), home) {
                 (Some(rest), Some(h)) => h.join(rest),
-                _ if a == "~" => home.context("HOME is not set")?.to_path_buf(),
+                (Some(_), None) => anyhow::bail!("HOME is not set; cannot resolve {a}"),
                 _ => PathBuf::from(a),
             };
             let abs = std::path::absolute(&p).with_context(|| format!("resolving {a}"))?;
@@ -106,14 +108,19 @@ pub async fn connect(paths: &Paths, profiles: Vec<String>, all: bool) -> anyhow:
 
 pub async fn disconnect(paths: &Paths, profiles: Vec<String>) -> anyhow::Result<i32> {
     let names = normalize(&profiles)?;
-    if let Some(c) = client::find(paths).await? {
-        let v = c
-            .post("/api/v1/profiles/disconnect", json!({ "profiles": names }))
-            .await?;
-        print_profiles("disconnected", &v["profiles"]);
-        return Ok(0);
+    match client::locate(paths).await? {
+        client::Located::Daemon(c) => {
+            let v = c
+                .post("/api/v1/profiles/disconnect", json!({ "profiles": names }))
+                .await?;
+            print_profiles("disconnected", &v["profiles"]);
+            return Ok(0);
+        }
+        client::Located::Absent { addr, probe } => eprintln!(
+            "warning: no pooltime answers on {addr} ({probe:?}); restoring the profiles offline"
+        ),
     }
-    // The pool is down: restore from the files directly.
+    // No pool to ask: restore from the files directly.
     let cfg = Config::load_file(paths)?;
     let targets = if names.is_empty() {
         cfg.profiles
@@ -124,22 +131,7 @@ pub async fn disconnect(paths: &Paths, profiles: Vec<String>) -> anyhow::Result<
         resolve_profiles(&names, &cfg.profiles).map_err(anyhow::Error::msg)?
     };
     let outcomes = crate::claude_code::disconnect(paths, &targets)?;
-    let list: Vec<Value> = outcomes
-        .iter()
-        .map(|(id, o)| {
-            let dir = targets
-                .iter()
-                .find(|p| p.id == *id)
-                .map(|p| p.settings_dir.display().to_string());
-            let o = match o {
-                WriteOutcome::Written => "written",
-                WriteOutcome::Unchanged => "unchanged",
-                WriteOutcome::GaveUp => "gave_up",
-            };
-            json!({ "id": id, "settings_dir": dir, "outcome": o })
-        })
-        .collect();
-    print_profiles("disconnected", &Value::Array(list));
+    print_profiles("disconnected", &profiles_json(&targets, &outcomes));
     Ok(0)
 }
 
@@ -153,9 +145,18 @@ mod tests {
         let prof = home.path().join(".claude-work2");
         std::fs::create_dir_all(&prof).unwrap();
         std::fs::write(prof.join("settings.json"), "{}").unwrap();
-        let args: Vec<String> = ["/abs/dir", "rel/dir", "~/x", "claude-work2", "other"]
-            .map(String::from)
-            .to_vec();
+        let args: Vec<String> = [
+            "/abs/dir",
+            "rel/dir",
+            "~/x",
+            "claude-work2",
+            "other",
+            ".claude-work2",
+            ".claude",
+            "./.claude",
+        ]
+        .map(String::from)
+        .to_vec();
         let out = normalize_in(&args, Some(home.path())).unwrap();
         assert_eq!(out[0], "/abs/dir");
         assert!(Path::new(&out[1]).is_absolute() && out[1].ends_with("rel/dir"));
@@ -166,5 +167,11 @@ mod tests {
             "a discovered id becomes its dir"
         );
         assert_eq!(out[4], "other", "unknown ids pass through to the daemon");
+        assert_eq!(out[5], prof.to_string_lossy(), "a dotted name is an id");
+        assert_eq!(out[6], "default", "`.claude` is never the cwd's .claude");
+        assert!(
+            Path::new(&out[7]).is_absolute() && out[7].ends_with(".claude"),
+            "an explicit ./ path is a path"
+        );
     }
 }
