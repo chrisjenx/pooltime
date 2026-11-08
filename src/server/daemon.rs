@@ -33,6 +33,10 @@ use crate::upstream::Upstream;
 const SESSION_PRUNE_EVERY: Duration = Duration::from_secs(60);
 /// How long shutdown waits for in-flight token refreshes.
 const REFRESH_DRAIN: Duration = Duration::from_secs(30);
+/// The refresh grace on a forced exit.
+const FORCED_REFRESH_DRAIN: Duration = Duration::from_secs(2);
+/// How long shutdown waits for queued database writes.
+const STORE_FLUSH: Duration = Duration::from_secs(5);
 /// How often journal/usage-history retention runs.
 const RETENTION_EVERY: Duration = Duration::from_secs(60 * 60);
 
@@ -209,11 +213,14 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
         let p = p.clone();
         Box::pin(async move { p.drain_refreshes().await }) as _
     });
-    if !drain_within(refreshes.collect(), REFRESH_DRAIN).await {
+    let (refresh_bound, flush_bound) = shutdown_bounds(outcome.as_ref().ok());
+    if !drain_within(refreshes.collect(), refresh_bound).await {
         tracing::warn!("token refreshes still running at exit");
     }
     // Journal, state and session writes queued so far.
-    flush_store(&app.store).await;
+    if !flush_store(&app.store, flush_bound).await {
+        tracing::warn!("database writes still queued at exit");
+    }
     match outcome? {
         Outcome::Drained => tracing::info!("pooltime stopped"),
         Outcome::TimedOut | Outcome::Forced => {
@@ -240,10 +247,25 @@ async fn drain_within(
         .is_ok()
 }
 
-/// Wait until every write queued on the store so far is on disk (the writer is FIFO).
-async fn flush_store(store: &Store) {
-    if let Err(e) = store.exec(|_| Ok(())).await {
-        tracing::warn!(error = %format!("{e:#}"), "could not flush the database writes");
+/// How long shutdown may wait for in-flight refreshes and for the store queue. A forced exit
+/// (second signal) gets a short refresh grace so it stays prompt.
+fn shutdown_bounds(outcome: Option<&Outcome>) -> (Duration, Duration) {
+    match outcome {
+        Some(Outcome::Forced) => (FORCED_REFRESH_DRAIN, STORE_FLUSH),
+        _ => (REFRESH_DRAIN, STORE_FLUSH),
+    }
+}
+
+/// Wait (at most `within`) until every write queued on the store so far is on disk (the writer
+/// is FIFO). False when the bound cut it short.
+async fn flush_store(store: &Store, within: Duration) -> bool {
+    match tokio::time::timeout(within, store.exec(|_| Ok(()))).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %format!("{e:#}"), "could not flush the database writes");
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -382,7 +404,28 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        flush_store(&store).await;
+        assert!(flush_store(&store, Duration::from_secs(5)).await);
         assert!(written.load(Ordering::SeqCst), "queued write lost at exit");
+    }
+
+    #[tokio::test]
+    async fn forced_exit_is_prompt() {
+        let (refresh, flush) = shutdown_bounds(Some(&Outcome::Forced));
+        assert!(refresh <= Duration::from_secs(2), "{refresh:?}");
+        assert!(flush <= Duration::from_secs(5), "{flush:?}");
+        assert_eq!(shutdown_bounds(Some(&Outcome::Drained)).0, REFRESH_DRAIN);
+
+        // A wedged writer does not hold the exit beyond the flush bound.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("pooltime.db")).unwrap();
+        store
+            .submit(|_| {
+                std::thread::sleep(Duration::from_secs(2));
+                Ok(())
+            })
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        assert!(!flush_store(&store, Duration::from_millis(100)).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

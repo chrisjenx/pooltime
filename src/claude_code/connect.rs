@@ -336,18 +336,23 @@ pub async fn connect_with(
         }
     }
 
-    let mut stored = Config::load_file(&state.paths)?;
-    let key = match existing_key(state, &stored) {
-        Some(k) => k,
-        None => {
-            let k = generate_key();
-            stored.proxy_key = Some(k.clone());
-            stored.save(&state.paths)?;
-            k
-        }
+    let key = {
+        // One connect at a time decides the key: the first generates it, the rest find it.
+        let _write = state.config_write.lock().await;
+        let mut stored = Config::load_file(&state.paths)?;
+        let key = match existing_key(state, &stored) {
+            Some(k) => k,
+            None => {
+                let k = generate_key();
+                stored.proxy_key = Some(k.clone());
+                stored.save(&state.paths)?;
+                k
+            }
+        };
+        // The running pool enforces the key the profiles are about to send, from now on.
+        state.set_proxy_key(&key);
+        key
     };
-    // The running pool enforces the key the profiles are about to send, from now on.
-    state.set_proxy_key(&key);
     let catalog = catalog(state).await;
     let url = base_url(&state.cfg);
 
@@ -400,6 +405,7 @@ pub async fn connect_with(
     .context("connect task")?;
 
     // Re-read: something else may have saved the config while we worked.
+    let _write = state.config_write.lock().await;
     let mut cfg = Config::load_file(&state.paths)?;
     let before = cfg.profiles.clone();
     for (p, _) in &outcomes {

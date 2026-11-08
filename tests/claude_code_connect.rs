@@ -261,6 +261,46 @@ async fn unchanged_claude_json_is_not_reread() {
     assert_eq!(fable_row(&p)["value"], "claude-fable-5-1[1m]");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_connects_agree_on_one_key() {
+    for round in 0..10 {
+        let fx = Arc::new(Fix::new().await);
+        let profiles: Vec<Profile> = (0..4)
+            .map(|i| fx.profile(&format!(".claude-race{round}-{i}")))
+            .collect();
+        let tasks: Vec<_> = profiles
+            .iter()
+            .cloned()
+            .map(|p| {
+                let fx = fx.clone();
+                tokio::spawn(async move { connect(fx.app(), &[p]).await.unwrap() })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let cfg = fx.config();
+        assert_eq!(
+            cfg.profiles.len(),
+            4,
+            "round {round}: a profile record was lost"
+        );
+        let saved = cfg.proxy_key.expect("key saved");
+        assert_eq!(
+            fx.app().proxy_key().as_deref(),
+            Some(saved.as_str()),
+            "round {round}"
+        );
+        for p in &profiles {
+            assert_eq!(
+                env_of(p)["ANTHROPIC_AUTH_TOKEN"],
+                saved.as_str(),
+                "round {round}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn connect_refuses_when_pool_unhealthy() {
     // Nothing listens on the configured port.

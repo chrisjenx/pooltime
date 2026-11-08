@@ -540,29 +540,30 @@ impl Flow {
     /// Persist new credentials under the account lock, retire a dead-refresh marker, record the
     /// identity baseline.
     async fn save(&self, creds: Credentials, identity: Identity) -> anyhow::Result<()> {
+        // Credentials and identity under ONE held account lock: a concurrent delete waits for
+        // both, and nothing recreates `account.toml` after it. Refused before writing anything
+        // when the account is already gone.
         let (reg, id) = (self.registry.clone(), self.account.clone());
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            // Never recreate a deleted account's dir: refuse before writing anything.
+        let meta_saved = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
             let _guard = reg.lock_existing(&id)?;
-            reg.write_creds_unlocked(&id, &creds)
+            reg.write_creds_unlocked(&id, &creds)?;
+            let meta_saved = reg.get(&id).is_some_and(|mut m| {
+                m.identity = identity;
+                reg.upsert_unlocked(m).is_ok()
+            });
+            Ok(meta_saved)
         })
         .await
         .context("saving credentials panicked")??;
+        // The binding constraint from Task 15: refresh never clears markers for tokens it did not
+        // spend, so a successful login must.
         self.state
             .clear_refresh_dead(&self.account, OffsetDateTime::now_utc());
         // A first login turns `needs_login` into `ready` without any state change.
         self.state.notify_changed();
-
-        let (reg, id) = (self.registry.clone(), self.account.clone());
-        let meta_saved = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let mut m = reg
-                .get(&id)
-                .ok_or_else(|| anyhow!("account {id} no longer exists"))?;
-            m.identity = identity;
-            reg.upsert(m)
-        })
-        .await;
-        if !matches!(meta_saved, Ok(Ok(()))) {
+        if !meta_saved {
+            // The credentials are saved and usable; a missing baseline only means the next login
+            // asks for confirmation again.
             tracing::warn!(account = %self.account, "signed in but could not update the account identity");
         }
         Ok(())
