@@ -29,6 +29,8 @@ const OVERLOAD_BASE_MS: u64 = 20;
 const OVERLOAD_CAP_MS: u64 = 80;
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
+/// `/health` poll interval while booting (short, so `harness bench` can time cold starts).
+const HEALTH_POLL: Duration = Duration::from_millis(5);
 
 /// Where the binaries under test live.
 pub struct Tools {
@@ -70,6 +72,11 @@ impl Daemon {
     pub async fn stop(mut self) {
         let _ = self.child.start_kill();
         let _ = tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await;
+    }
+
+    /// The daemon's OS process id (`harness bench` samples its process tree).
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
     }
 
     /// True when the `security` shim was invoked (bro tried the Keychain).
@@ -490,7 +497,7 @@ async fn wait_healthy(mut d: Daemon) -> anyhow::Result<Daemon> {
             let _ = d.child.start_kill();
             bail!("{} did not become healthy in time", d.kind.as_str());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(HEALTH_POLL).await;
     }
 }
 

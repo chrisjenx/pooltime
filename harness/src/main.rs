@@ -13,6 +13,7 @@
 //!
 //! Exit status 0 iff every scenario ran and every difference is allowlisted.
 
+mod bench;
 mod compare;
 mod daemons;
 mod fake;
@@ -586,6 +587,18 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // `harness bench ...` is the resource/latency benchmark (see bench.rs); everything else is
+    // the differential run.
+    if std::env::args().nth(1).as_deref() == Some("bench") {
+        let args = bench::BenchArgs::parse_from(std::env::args().skip(1));
+        return match rt.block_on(bench::run(args)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("harness bench: {e:#}");
+                ExitCode::from(2)
+            }
+        };
+    }
     match rt.block_on(real_main()) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::from(1),
