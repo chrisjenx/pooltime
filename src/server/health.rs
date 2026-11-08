@@ -158,7 +158,7 @@ pub async fn probe_within(addr: SocketAddr, timeout: Duration) -> Probe {
 }
 
 /// Loopback address to probe for a configured bind address (a wildcard bind answers on loopback).
-fn probe_addr(host: IpAddr, port: u16) -> SocketAddr {
+pub fn probe_addr(host: IpAddr, port: u16) -> SocketAddr {
     let ip = if host.is_unspecified() {
         match host {
             IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
