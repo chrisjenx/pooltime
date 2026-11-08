@@ -4,7 +4,8 @@
 //! The endpoint is the ChatGPT-subscription analogue of Anthropic's `/api/oauth/usage`:
 //! `rate_limit.{primary,secondary}_window` with `used_percent` (0-100, stored as a 0-1 fraction),
 //! `limit_window_seconds`, `reset_at` (unix seconds) / `reset_after_seconds`, plus `allowed` /
-//! `limit_reached`. The window key comes from the duration like the response headers
+//! `limit_reached`. A window without `used_percent` is skipped rather than shown as 0% used.
+//! The window key comes from the duration like the response headers
 //! ([`super::windows::window_key`]). A window is `rejected` only when the account is limited
 //! (`limit_reached` or `!allowed`) **and** that window is full: marking an unfull session window
 //! rejected under an enforced weekly limit would un-bench the account at the sooner session reset.
@@ -58,12 +59,13 @@ pub fn map_codex_usage(json: &Value, now: OffsetDateTime) -> Option<RateLimitSna
         let Some(w) = rl.get(field).filter(|v| v.is_object()) else {
             continue;
         };
-        let used = num(w, "used_percent");
+        // A window without a usage figure is skipped (bro keeps it with `utilization: null`; our
+        // `Window` has no "unknown" utilization, and 0% would claim headroom nobody reported).
+        let Some(used) = num(w, "used_percent") else {
+            continue;
+        };
         let reset_at = num(w, "reset_at");
         let reset_after = num(w, "reset_after_seconds");
-        if used.is_none() && reset_at.is_none() && reset_after.is_none() {
-            continue;
-        }
         let mut key = window_key(num(w, "limit_window_seconds").map(|s| s / 60.0), slot);
         // Two windows of the same scale (never seen today): keep both.
         if windows.iter().any(|w| w.key == key) {
@@ -76,16 +78,15 @@ pub fn map_codex_usage(json: &Value, now: OffsetDateTime) -> Option<RateLimitSna
             }
             (None, None) => None,
         };
-        let full = used.is_some_and(|u| u >= 100.0);
         windows.push(Window {
             key: key.to_string(),
             model: None,
-            status: if limited && full {
+            status: if limited && used >= 100.0 {
                 WindowStatus::Rejected
             } else {
                 WindowStatus::Allowed
             },
-            utilization: used.map_or(0.0, |u| (u / 100.0).clamp(0.0, 1.0)),
+            utilization: (used / 100.0).clamp(0.0, 1.0),
             reset,
         });
     }
@@ -351,6 +352,9 @@ mod tests {
             json!({}),
             json!({"rate_limit": null}),
             json!({"rate_limit": {"primary_window": null, "secondary_window": {}}}),
+            // A reset without a usage figure is not rendered as 0% used: no window.
+            json!({"rate_limit": {"primary_window": {"limit_window_seconds": 18000,
+                                                     "reset_at": 1784600000}}}),
         ] {
             assert!(map_codex_usage(&body, NOW).is_none(), "{body}");
         }

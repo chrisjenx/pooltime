@@ -11,12 +11,14 @@
 //! unknown levels are dropped). `context_window` / `max_context_window` are kept when positive
 //! integers, the max only when it is at least the context window.
 //!
-//! The merge into the live [`crate::models::ModelTable`] is additive ([`ModelTable::add_discovered`]):
-//! an id already in the table (bundled, user-configured or discovered earlier) is never replaced
-//! and nothing is ever removed. New rows are hot-applied (the next `/v1/models` listing and
-//! request see them) and persisted to `models.toml` with the table's atomic save, the same file
-//! and path the mapping editor uses, so a restart keeps them. [`refresh_codex_catalog`] then
-//! re-syncs connected Claude Code profiles so their pins / context hints include the new routes.
+//! The merge into the live [`crate::models::ModelTable`] is additive
+//! ([`crate::models::ModelTable::merge_discovered`]): a new id is added as a *discovered* row; a
+//! row that was itself discovered gets its context windows and efforts refreshed; bundled and
+//! user-configured rows are never touched, and nothing is ever removed. Changes are hot-applied
+//! (the next `/v1/models` listing and request see them). Discovered rows are **runtime-only**:
+//! `models.toml` is never written by discovery and its save skips them, so the boot run re-adds
+//! them after a restart (a mapping that targets one is inert until then). [`refresh_codex_catalog`]
+//! then re-syncs connected Claude Code profiles so their pins / context hints follow.
 //!
 //! Runs at boot (after providers are registered), every [`CATALOG_REFRESH_EVERY`], and on
 //! `POST /api/v1/models/refresh` (`pooltime models refresh`). Every account failing is an error;
@@ -34,7 +36,7 @@ use tokio::time::Instant;
 use super::OpenAiProvider;
 use crate::accounts::{AccountId, AccountMeta};
 use crate::errors::TransportKind;
-use crate::models::{ModelTable, RouteDef, CODEX_EFFORTS};
+use crate::models::{RouteDef, CODEX_EFFORTS};
 use crate::providers::ProviderId;
 use crate::server::AppState;
 use crate::upstream::{join_url, Limits, UpstreamResponse};
@@ -55,6 +57,8 @@ pub struct CodexDiscovery {
     pub accounts: usize,
     /// Ids newly added to the model table, in catalog order.
     pub added: Vec<String>,
+    /// Earlier-discovered rows whose context windows / efforts changed.
+    pub updated: Vec<String>,
     /// Accounts whose catalog was unavailable, with a classified reason.
     pub failed: Vec<(AccountId, String)>,
 }
@@ -200,8 +204,8 @@ impl OpenAiProvider {
     }
 }
 
-/// Ask every signed-in OpenAI account for its catalog and merge the new ids into the live model
-/// table (persisted). Does not re-sync profiles (see [`refresh_codex_catalog`]; the mgmt refresh
+/// Ask every signed-in OpenAI account for its catalog and merge it into the live model table
+/// (runtime-only, see the module docs). Does not re-sync profiles (see [`refresh_codex_catalog`]; the mgmt refresh
 /// endpoint syncs once for both providers).
 ///
 /// No OpenAI provider or no signed-in account: an empty report. Every account failing: `Err`
@@ -259,48 +263,31 @@ pub async fn discover_codex_models(app: &Arc<AppState>) -> anyhow::Result<CodexD
         );
     }
 
-    let a = app.clone();
-    report.added = tokio::task::spawn_blocking(move || merge(&a, found))
-        .await
-        .map_err(|_| anyhow!("codex catalog merge task failed"))?;
-    if report.added.is_empty() {
-        tracing::debug!("codex model catalog has no new model ids");
+    // In-memory only (runtime rows are never saved), so no blocking work under the lock.
+    let merged = app
+        .models
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .merge_discovered(found);
+    report.added = merged.added;
+    report.updated = merged.updated;
+    if report.added.is_empty() && report.updated.is_empty() {
+        tracing::debug!("codex model catalog brought no changes");
     } else {
         tracing::info!(
-            added = report.added.len(),
-            models = %report.added.join(","),
-            "discovered new codex models"
+            added = %report.added.join(","),
+            updated = %report.updated.join(","),
+            "codex model catalog applied"
         );
     }
     Ok(report)
 }
 
-/// Add the new ids to the live table (under its write lock) and persist; returns the added ids.
-/// A failed save is logged and the rows still go live (they are re-discovered next run).
-fn merge(app: &AppState, found: Vec<RouteDef>) -> Vec<String> {
-    let mut live = app.models.write().unwrap_or_else(|e| e.into_inner());
-    let new: Vec<RouteDef> = found
-        .into_iter()
-        .filter(|d| live.rows().iter().all(|r| r.id != d.id))
-        .collect();
-    if new.is_empty() {
-        return Vec::new();
-    }
-    let ids: Vec<String> = new.iter().map(|d| d.id.clone()).collect();
-    let mut next: ModelTable = live.clone();
-    next.add_discovered(new);
-    if let Err(e) = next.save(&app.paths) {
-        tracing::error!(error = %format!("{e:#}"), "could not save discovered codex models to models.toml");
-    }
-    *live = next;
-    ids
-}
-
-/// Discovery plus, when it added routes, a profile re-sync so connected Claude Code profiles see
-/// them. For the boot / periodic runs: failures are logged, never returned.
+/// Discovery plus, when it changed the table, a profile re-sync so connected Claude Code profiles
+/// follow. For the boot / periodic runs: failures are logged, never returned.
 pub async fn refresh_codex_catalog(app: &Arc<AppState>) {
     match discover_codex_models(app).await {
-        Ok(r) if !r.added.is_empty() => {
+        Ok(r) if !r.added.is_empty() || !r.updated.is_empty() => {
             if let Err(e) = crate::claude_code::sync_once(app).await {
                 tracing::warn!(error = %format!("{e:#}"), "profile sync after codex discovery failed");
             }

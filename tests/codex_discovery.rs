@@ -8,9 +8,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pooltime::accounts::{AccountMeta, AccountStatus, RateLimitSnapshot, Window, WindowStatus};
+use pooltime::claude_code::{connect, Profile};
 use pooltime::models::{ModelTable, RouteDef};
 use pooltime::providers::openai::{
-    discover_codex_models, spawn_usage_sweeper, OpenAiProvider, CODEX_CLIENT_VERSION,
+    discover_codex_models, refresh_codex_catalog, spawn_usage_sweeper, OpenAiProvider,
+    CODEX_CLIENT_VERSION,
 };
 use pooltime::providers::{Provider, ProviderId, UsageError};
 use serde_json::{json, Value};
@@ -334,12 +336,49 @@ async fn additive_only() {
             vec!["low", "high"]
         );
     }
-    // Persisted atomically to models.toml, so a restart keeps the discovered route.
+    // Runtime-only: discovery writes no models.toml, and a save (e.g. a mapping edit) never
+    // writes the discovered row; the next boot's discovery re-adds it. The user's row is saved.
+    assert!(!ModelTable::path(&srv.app.paths).exists());
+    assert!(srv.app.models.read().unwrap().is_discovered("gpt-new"));
+    srv.app.models.read().unwrap().save(&srv.app.paths).unwrap();
+    let text = std::fs::read_to_string(ModelTable::path(&srv.app.paths)).unwrap();
+    assert!(!text.contains("gpt-new"), "{text}");
     let reloaded = ModelTable::load(&srv.app.paths).unwrap();
-    assert!(row(&reloaded, "gpt-new").is_some());
+    assert!(row(&reloaded, "gpt-new").is_none());
     assert_eq!(row(&reloaded, "gpt-user"), Some(&user_row));
 
-    // A later catalog without a model never removes it.
+    // A later catalog refreshes the metadata of the discovered row only, and removes nothing.
+    fake.script(
+        MODELS,
+        vec![catalog(vec![
+            model_entry("gpt-5.5", "list", &["xhigh"], Some(9), Some(10)),
+            model_entry("gpt-user", "list", &["xhigh"], Some(9), Some(10)),
+            model_entry(
+                "gpt-new",
+                "list",
+                &["medium"],
+                Some(500_000),
+                Some(1_000_000),
+            ),
+        ])],
+    );
+    let report = discover_codex_models(&srv.app).await.unwrap();
+    assert!(report.added.is_empty());
+    assert_eq!(report.updated, vec!["gpt-new".to_string()]);
+    {
+        let t = srv.app.models.read().unwrap();
+        let n = row(&t, "gpt-new").unwrap();
+        assert_eq!(
+            (
+                n.context_window,
+                n.max_context_window,
+                n.supported_efforts.clone()
+            ),
+            (Some(500_000), Some(1_000_000), vec!["medium".to_string()])
+        );
+        assert_eq!(row(&t, "gpt-user"), Some(&user_row));
+        assert_eq!(row(&t, "gpt-5.5"), Some(&bundled_55));
+    }
     fake.script(
         MODELS,
         vec![catalog(vec![model_entry(
@@ -351,8 +390,115 @@ async fn additive_only() {
         )])],
     );
     let report = discover_codex_models(&srv.app).await.unwrap();
-    assert!(report.added.is_empty());
+    assert!(report.added.is_empty() && report.updated.is_empty());
     assert!(row(&srv.app.models.read().unwrap(), "gpt-new").is_some());
+}
+
+/// Claude's live catalog failing does not stop Codex discovery (both providers registered).
+#[tokio::test]
+async fn refresh_runs_codex_discovery_when_claude_catalog_fails() {
+    let claude = FakeAnthropic::start().await;
+    claude.route("/v1/models", |_, _| {
+        Reply::error(500, "api_error", "SECRET boom")
+    });
+    let fake = FakeOpenAi::start().await;
+    fake.script(
+        MODELS,
+        vec![catalog(vec![model_entry(
+            "gpt-indep",
+            "list",
+            &["low"],
+            Some(272_000),
+            None,
+        )])],
+    );
+    let pool = Pool::new(); // keeps the Anthropic `work` account, whose catalog fetch fails
+    add_codex_account(&pool, "a", 1, TOKEN_A);
+    let (policy, _) = fast_policy();
+    let srv = pool
+        .boot(
+            Boot::default()
+                .provider(Arc::new(pool.provider(&claude, policy)))
+                .provider(boxed(provider(&pool, &fake))),
+        )
+        .await;
+    let r = mgmt_post(srv.addr, "/api/v1/models/refresh").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let v = r.json();
+    assert_eq!(v["live"], 0);
+    assert!(
+        v["live_error"].as_str().unwrap().contains("status:500"),
+        "{v}"
+    );
+    assert!(!r.text().contains("SECRET"), "{}", r.text());
+    assert_eq!(v["codex"]["added"], json!(["gpt-indep"]), "{v}");
+    assert!(listed(&http_get(srv.addr, "/v1/models", &[]).await).contains(&"gpt-indep".into()));
+
+    // Both failing is a 502 (classified reasons only).
+    fake.script(MODELS, vec![Reply::json(500, &json!({"detail": "SECRET"}))]);
+    let r = mgmt_post(srv.addr, "/api/v1/models/refresh").await;
+    assert_eq!(r.status, 502, "{}", r.text());
+    assert!(!r.text().contains("SECRET"), "{}", r.text());
+}
+
+/// The boot / hourly run re-syncs connected profiles when discovery changes the table: the
+/// Codex context fallback follows a newly discovered (then refreshed) row.
+#[tokio::test]
+async fn boot_discovery_resyncs_connected_profiles() {
+    let claude = FakeAnthropic::start().await;
+    claude.route("/v1/models", |_, _| {
+        Reply::json(
+            200,
+            &json!({"data": [{"id": "claude-sonnet-5", "display_name": "Claude Sonnet 5",
+                "created_at": "2026-06-01T00:00:00Z"}], "has_more": false}),
+        )
+    });
+    let fake = FakeOpenAi::start().await;
+    let small = |ctx: u64| {
+        catalog(vec![model_entry(
+            "gpt-small",
+            "list",
+            &["low"],
+            Some(ctx),
+            None,
+        )])
+    };
+    fake.script(MODELS, vec![small(100_000)]);
+    let pool = Pool::new();
+    add_codex_account(&pool, "a", 1, TOKEN_A);
+    let (policy, _) = fast_policy();
+    let claude_provider = pool
+        .provider(&claude, policy)
+        .with_catalog_ttl(Duration::ZERO);
+    let srv = pool
+        .boot(
+            Boot::default()
+                .provider(Arc::new(claude_provider))
+                .provider(boxed(provider(&pool, &fake))),
+        )
+        .await;
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join(".claude-work");
+    std::fs::create_dir_all(&dir).unwrap();
+    let profile = Profile::from_dir(&dir, home.path());
+    std::fs::write(&profile.settings_json, b"{}").unwrap();
+    connect(&srv.app, std::slice::from_ref(&profile))
+        .await
+        .unwrap();
+    let ctx = || -> Value {
+        let s: Value =
+            serde_json::from_slice(&std::fs::read(&profile.settings_json).unwrap()).unwrap();
+        s["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"].clone()
+    };
+    assert_ne!(ctx(), json!("100000"));
+
+    refresh_codex_catalog(&srv.app).await;
+    assert_eq!(ctx(), json!("100000"));
+
+    // A metadata refresh of the discovered row re-syncs too.
+    fake.script(MODELS, vec![small(90_000)]);
+    refresh_codex_catalog(&srv.app).await;
+    assert_eq!(ctx(), json!("90000"));
 }
 
 #[tokio::test]
