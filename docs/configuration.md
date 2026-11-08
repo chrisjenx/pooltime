@@ -49,9 +49,9 @@ The background service sets only `POOLTIME_HOME`; put anything else it needs in 
 | `token_refresh_timeout` | `"30s"` | token refresh request timeout |
 | `inflight_wait` | `"90s"` | how long a request waits on an in-flight refresh of the same account |
 | `stream_keepalive` | `"1s"` | SSE ping cadence before the first upstream byte (at least 100 ms) |
-| `usage_window` | `"5h"` | rolling window of the per-account request counters. *Parsed but not yet applied: the daemon uses the built-in 5 h.* |
+| `usage_window` | `"5h"` | rolling window of the per-account request counters. |
 | `rate_limit_cooldown` | `"1h"` | bench time after a quota 429 with no reset time |
-| `access_denied_cooldown` | `"1h"` | how long an access-denied or billing account waits before it is tried again. *Parsed but not yet applied: the daemon uses the built-in 1 h.* |
+| `access_denied_cooldown` | `"1h"` | how long an access-denied or billing account waits before it is tried again. |
 | `overload_retry_max` | `4` | retries on upstream overload (529) |
 | `overload_retry_base` | `"500ms"` | first overload backoff (must not exceed the cap) |
 | `overload_retry_cap` | `"8s"` | longest overload backoff |
