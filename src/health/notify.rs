@@ -101,11 +101,20 @@ impl SystemNotifier {
                 args.push(OsString::from("-e"));
                 args.push(OsString::from(line));
             }
+            // `--`: a text starting with `-` (account ids may) is not an option.
+            args.push(OsString::from("--"));
             args.push(OsString::from(n.text()));
             return Some((osa, args));
         }
         let ns = self.find("notify-send")?;
-        Some((ns, vec![OsString::from(TITLE), OsString::from(n.text())]))
+        Some((
+            ns,
+            vec![
+                OsString::from(TITLE),
+                OsString::from("--"),
+                OsString::from(n.text()),
+            ],
+        ))
     }
 
     fn find(&self, name: &str) -> Option<PathBuf> {
@@ -266,12 +275,13 @@ mod tests {
                 "end run",
             ]
         );
-        assert_eq!(args.len(), 7);
+        assert_eq!(args.len(), 8);
+        assert_eq!(args[6], "--", "the text is never parsed as an option");
         assert_eq!(
-            args[6],
+            args[7],
             "work \"x\" \\ needs login — open pooltime → Re-login"
         );
-        assert!(args[6].ends_with("open pooltime → Re-login"));
+        assert!(args[7].ends_with("open pooltime → Re-login"));
     }
 
     #[test]
@@ -293,6 +303,7 @@ mod tests {
             args_of(out.path(), "notify-send").unwrap(),
             vec![
                 "pooltime",
+                "--",
                 "work \"x\" \\ needs login — open pooltime → Re-login"
             ]
         );
@@ -315,5 +326,42 @@ mod tests {
         let e = n.notify(&note()).unwrap_err();
         assert!(e.to_string().contains("timed out"), "{e}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn dash_leading_text_follows_double_dash() {
+        let (bin, out) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        shim(bin.path(), out.path(), "osascript");
+        shim(bin.path(), out.path(), "notify-send");
+        let mut n = note();
+        n.message = "-work needs login".into();
+        for macos in [true, false] {
+            SystemNotifier::new(bin.path(), macos).notify(&n).unwrap();
+        }
+        for name in ["osascript", "notify-send"] {
+            let args = args_of(out.path(), name).unwrap();
+            let (dd, text) = (&args[args.len() - 2], &args[args.len() - 1]);
+            assert_eq!(dd, "--", "{name}: {args:?}");
+            assert!(text.starts_with("-work"), "{name}: {args:?}");
+        }
+    }
+
+    /// The fallback's AppleScript compiles (never run: that would show a notification).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn osascript_lines_compile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Command::new("/usr/bin/osacompile");
+        for line in OSASCRIPT_LINES {
+            c.args(["-e", line]);
+        }
+        let st = c
+            .arg("-o")
+            .arg(dir.path().join("x.scpt"))
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "osacompile failed: {st}");
+        assert!(dir.path().join("x.scpt").exists());
     }
 }
