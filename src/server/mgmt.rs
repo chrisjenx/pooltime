@@ -844,18 +844,24 @@ async fn delete_account(State(app): State<Arc<AppState>>, Path(raw): Path<String
         Ok(id) => id,
         Err(r) => return r,
     };
+    // A pending sign-in would otherwise finish later and write credentials into a recreated
+    // account dir.
+    app.signins.supersede_account(&id);
     let (a, rid) = (app.clone(), id.clone());
-    let removed = blocking(move || {
+    let removed = blocking(move || -> anyhow::Result<bool> {
         if a.registry.get(&rid).is_none() {
             return Ok(false);
         }
-        a.registry.remove(&rid).map(|()| true)
+        a.registry.remove(&rid)?;
+        // In the blocking task, so a cancelled request cannot skip the cleanup.
+        a.signins.supersede_account(&rid);
+        a.sessions.evict_account(&rid);
+        a.state.forget(&rid);
+        Ok(true)
     })
     .await;
     match removed {
         Ok(Ok(true)) => {
-            app.sessions.evict_account(&id);
-            app.state.forget(&id);
             tracing::info!(account = %id, "account removed");
             ok(json!({ "ok": true, "id": id.as_str() }))
         }

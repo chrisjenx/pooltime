@@ -273,6 +273,27 @@ impl Registry {
         Ok(())
     }
 
+    /// Like [`Registry::lock`], for an account that must still exist: never creates the dir, and
+    /// errors when `account.toml` is gone (checked again once the lock is held, so a concurrent
+    /// [`Registry::remove`] is seen).
+    pub fn lock_existing(&self, id: &AccountId) -> anyhow::Result<FileLock> {
+        let dir = self.dir(id);
+        let meta = dir.join("account.toml");
+        let gone = || anyhow::anyhow!("account {id} no longer exists");
+        if !meta.exists() {
+            return Err(gone());
+        }
+        let guard = match FileLock::acquire(&dir.join("lock")) {
+            Ok(g) => g,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(gone()),
+            Err(e) => return Err(e.into()),
+        };
+        if !meta.exists() {
+            return Err(gone());
+        }
+        Ok(guard)
+    }
+
     /// Blocking exclusive lock on `accounts/<id>/lock` (creates the dir, 0700).
     pub fn lock(&self, id: &AccountId) -> io::Result<FileLock> {
         let dir = self.ensure_dir(id)?;
@@ -495,5 +516,18 @@ mod tests {
             .unwrap()
             .is_some());
         reg.write_creds(&id("work"), &creds()).unwrap();
+    }
+
+    #[test]
+    fn lock_existing_refuses_a_removed_account_and_creates_nothing() {
+        let (_d, paths, reg) = setup();
+        reg.upsert(meta("work")).unwrap();
+        drop(reg.lock_existing(&id("work")).unwrap());
+        reg.remove(&id("work")).unwrap();
+        let err = reg.lock_existing(&id("work")).unwrap_err();
+        assert!(err.to_string().contains("no longer exists"), "{err}");
+        assert!(!paths.accounts.join("work").exists());
+        assert!(reg.lock_existing(&id("never")).is_err());
+        assert!(!paths.accounts.join("never").exists());
     }
 }

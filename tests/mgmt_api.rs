@@ -2084,6 +2084,47 @@ mod mgmt {
     }
 
     #[tokio::test]
+    async fn delete_account_cancels_pending_signin() {
+        let fake = oauth_fake(UUID).await;
+        let pool = Pool::new();
+        with_baseline(&pool, UUID, "me@example.com");
+        let srv = pool.boot(boot_against(&fake)).await;
+        let r = call(
+            &srv,
+            "POST",
+            "/api/v1/accounts/work/login",
+            Some(json!({"mode": "callback"})),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let v = r.json();
+        let signin_id = v["signin_id"].as_str().unwrap().to_string();
+        let url = v["authorize_url"].as_str().unwrap().to_string();
+        let state = param(&url, "state").unwrap();
+        let port = reqwest::Url::parse(&param(&url, "redirect_uri").unwrap())
+            .unwrap()
+            .port()
+            .unwrap();
+
+        let r = call(&srv, "DELETE", "/api/v1/accounts/work", None).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let done = wait_signin(&srv, &signin_id, "pending").await;
+        assert_eq!(done["status"], "failed", "{done}");
+
+        // The browser comes back late: nothing is exchanged, nothing recreated.
+        let late = reqwest::get(format!(
+            "http://127.0.0.1:{port}/callback?code=late-code&state={state}"
+        ))
+        .await;
+        assert!(late.map_or(true, |r| r.status() != 200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(fake.requests_to(TOKEN).is_empty());
+        let dir = pool.dir.path().join("accounts").join("work");
+        assert!(!dir.exists(), "account dir recreated");
+        assert!(pool.reg.get(&id("work")).is_none());
+    }
+
+    #[tokio::test]
     async fn openai_login_with_both_ports_busy_is_409() {
         let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let held_port = held.local_addr().unwrap().port();
