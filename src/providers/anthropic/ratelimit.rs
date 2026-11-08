@@ -122,7 +122,10 @@ fn error_message(body: &str) -> String {
         .unwrap_or_else(|| body.chars().take(500).collect())
 }
 
-fn has_rate_limit_wording(text: &str) -> bool {
+/// Rate-limit wording (bro `isRateLimit`, case-insensitive): `rate_limit`, `rate limit`,
+/// `usage limit`, `limit reached`, `too many requests`. For a non-429 response bro applies it to
+/// `"{error.type}\n{error.message}"`.
+pub fn has_rate_limit_wording(text: &str) -> bool {
     let t = text.to_lowercase();
     [
         "rate_limit",
