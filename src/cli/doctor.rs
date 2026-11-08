@@ -8,10 +8,10 @@
 //! - **health**: what answers `/health` on the configured address (pooltime `✓`; bro, another
 //!   server, a hung listener or nothing `✗`).
 //! - **profile <id>**, per profile recorded in `config.toml`: still connected (a profile
-//!   snapshot plus the base URL), pointing at this pool, pins current. Connected while the pool
-//!   is down (nothing pooltime answers, or the status cache the status line reads is missing or
-//!   older than [`STALE_AFTER`]) is `✗` ("connected, pool down"): Claude Code has no fallback for
-//!   an unreachable base URL. Pins are compared with the pins derived from the live Anthropic
+//!   snapshot plus the base URL), pointing at this pool, pins current. Connected while nothing
+//!   pooltime answers is `✗` ("connected, pool down"): Claude Code has no fallback for an
+//!   unreachable base URL. A pool that answers but whose status cache is missing or older than
+//!   [`STALE_AFTER`] is one `!` **status cache** line (status lines then say `pool down`). Pins are compared with the pins derived from the live Anthropic
 //!   rows of the pool's `/v1/models` listing (see [`live_rows`]); with no live rows they are not
 //!   compared. Stale pins are `!` (the pool re-syncs connected profiles every minute). A foreign
 //!   base URL is shown as its origin only.
@@ -27,7 +27,8 @@
 //!   the largest `alerts.warn_days` `!`.
 //! - **errors**: the pool's journal stats over the last 24 h; an account with at least
 //!   [`ERROR_MIN_ATTEMPTS`] attempts and an error rate of [`ERROR_RATE_WARN`] or more is `!`
-//!   (with its most frequent error and latency), else one `✓` summary. No pool: `i`.
+//!   (with its most frequent error class and latency), else one `✓` summary. Failover hand-overs
+//!   and `invalid_request` attempts are not counted. No pool: `i`.
 //! - **upstream <origin>**: `HEAD` to the Anthropic API and token origins, plus the OpenAI/Codex
 //!   API and token origins when an OpenAI account exists (all from config, so tests point them at
 //!   local fakes). Any HTTP answer is reachable; a timeout is `!` (slow or offline network); a
@@ -37,15 +38,17 @@
 //!   `--no-version-check` or `POOLTIME_NO_VERSION_CHECK=1`; `POOLTIME_RELEASES_API` points it
 //!   elsewhere (tests).
 //! - **clock**: skew against the `Date` header of the first upstream answer, else of the release
-//!   check's answer (`!` over 60 s, `✗` over 5 min: sign-in and token expiry depend on it).
+//!   check's answer (`!` over 60 s, `✗` over 5 min: sign-in and token expiry depend on it); `i`
+//!   when no server sent one.
 //! - **notifications**: the desktop notifier alerts would use (`i` when `alerts.notify` is off;
 //!   `!` when none is installed).
 //! - **permissions**: data dir and its subdirs without group/other access (0700), config,
 //!   database, management and MCP keys, profile snapshots and account files likewise (0600); each
 //!   offender is a `✗` line with its `chmod`.
-//! - **storage**: database (against `retention.journal_max_mb`, `!` above 80 %), logs, and
-//!   journal rows against `retention.journal_max_requests` (from the pool, when it runs); `!`
-//!   above 1 GiB in all. **retention**: the settings (`i`).
+//! - **storage**: database against `retention.journal_max_mb` (at the cap is normal; `!` only
+//!   above 125 % of it, when pruning is not keeping up; with no cap, `!` above 1 GiB with the
+//!   logs), logs, and journal rows against `retention.journal_max_requests` (from the pool, when
+//!   it runs). **retention**: the settings (`i`).
 //!
 //! Every call to the pool is bounded by 5 s, as is each upstream `HEAD`; the release check by
 //! 3 s. The doctor only reads: it never creates a file, and it never prints a credential.
@@ -133,7 +136,7 @@ impl fmt::Display for Check {
 /// Clock skew bounds.
 const SKEW_WARN: i64 = 60;
 const SKEW_FAIL: i64 = 5 * 60;
-/// Database plus logs above this is `!`.
+/// With no database cap, database plus logs above this is `!`.
 const DISK_WARN: u64 = 1 << 30;
 /// Per upstream `HEAD`.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -143,8 +146,9 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const ERROR_MIN_ATTEMPTS: u64 = 20;
 /// ...and is `!` at this rate or above.
 pub const ERROR_RATE_WARN: f64 = 0.10;
-/// The database is `!` above this share of `retention.journal_max_mb`.
-const DB_CAP_WARN: f64 = 0.80;
+/// The database is `!` above this multiple of `retention.journal_max_mb` (pruning to the cap is
+/// the steady state; this far past it, pruning is not keeping up).
+const DB_OVER_CAP: f64 = 1.25;
 
 /// The latest release of pooltime.
 pub const RELEASES_API: &str = "https://api.github.com/repos/chrisjenx/pooltime/releases/latest";
@@ -237,6 +241,7 @@ pub async fn checks(paths: &Paths, opts: &Options) -> Vec<Check> {
     } else {
         PoolState::Up
     };
+    out.extend(status_cache_check(pool));
     out.extend(profile_checks(
         paths,
         &cfg.profiles,
@@ -395,6 +400,22 @@ enum PoolState {
     CacheStale,
 }
 
+/// `!` when the pool answers but its status cache is missing or stale; `None` otherwise (a pool
+/// that does not answer is the health line's).
+fn status_cache_check(pool: PoolState) -> Option<Check> {
+    (pool == PoolState::CacheStale).then(|| {
+        Check::new(
+            Level::Warn,
+            "status cache",
+            format!(
+                "missing or older than {} s (status lines show \"pool down\")",
+                STALE_AFTER.as_secs()
+            ),
+        )
+        .hint("`pooltime logs` / `pooltime service status`")
+    })
+}
+
 fn profile_checks(
     paths: &Paths,
     profiles: &[ProfileRef],
@@ -427,26 +448,12 @@ fn profile_checks(
                 )
                 .hint(format!("`pooltime connect {}`", r.id));
             }
-            match pool {
-                PoolState::Up => {}
-                PoolState::Down => {
-                    return Check::new(Level::Fail, label, "connected, pool down").hint(
-                        "Claude Code can't reach the pool: check `pooltime service status` \
-                         or run `pooltime serve`, else `pooltime disconnect`",
-                    )
-                }
-                PoolState::CacheStale => {
-                    return Check::new(
-                        Level::Fail,
-                        label,
-                        format!(
-                            "connected, pool down (its status cache is missing or older than \
-                             {} s)",
-                            STALE_AFTER.as_secs()
-                        ),
-                    )
-                    .hint("check `pooltime service status` and `pooltime logs`")
-                }
+            // A stale status cache alone is not "down": the pool answers ([`status_cache_check`]).
+            if pool == PoolState::Down {
+                return Check::new(Level::Fail, label, "connected, pool down").hint(
+                    "Claude Code can't reach the pool: check `pooltime service status` \
+                     or run `pooltime serve`, else `pooltime disconnect`",
+                );
             }
             let env = settings_env(&p.settings_json);
             let url = env
@@ -496,11 +503,20 @@ fn profile_checks(
         .collect()
 }
 
-/// The `settings.json` of a profile, parsed (`None` when unreadable).
+/// A JSON file (`settings.json`, `.claude.json`), parsed; `None` when missing or unreadable.
 fn read_json(p: &Path) -> Option<Value> {
     std::fs::read(p)
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+}
+
+/// Whether `a` and `b` name the same directory: canonical paths when both resolve (symlinks,
+/// `..`), else the paths as written.
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
 }
 
 fn is_executable(p: &Path) -> bool {
@@ -550,7 +566,7 @@ fn statusline_checks(
                 }
             }
             let reads = parts.home.as_deref().or(default_home);
-            if reads != Some(paths.home.as_path()) {
+            if !reads.is_some_and(|h| same_path(h, &paths.home)) {
                 let shown = reads.map_or("an unknown data dir".to_string(), |h| {
                     h.display().to_string()
                 });
@@ -684,21 +700,31 @@ fn error_checks(stats: Option<&Result<Value, String>>) -> Vec<Check> {
     let mut out = Vec::new();
     let (mut attempts, mut errors) = (0u64, 0u64);
     for a in &rows {
-        let n = a["attempts"].as_u64().unwrap_or(0);
-        let e = a["errors"].as_u64().unwrap_or(0);
+        // Failover hand-overs and the client's invalid requests are not the account's failures
+        // (`rated_*`; a pool without them: everything).
+        let n = a["rated_attempts"]
+            .as_u64()
+            .or_else(|| a["attempts"].as_u64())
+            .unwrap_or(0);
+        let e = a["rated_errors"]
+            .as_u64()
+            .or_else(|| a["errors"].as_u64())
+            .unwrap_or(0)
+            .min(n);
         attempts += n;
         errors += e;
-        let rate = a["error_rate"].as_f64().unwrap_or(0.0);
+        let rate = if n == 0 { 0.0 } else { e as f64 / n as f64 };
         if n < ERROR_MIN_ATTEMPTS || rate < ERROR_RATE_WARN {
             continue;
         }
         let id = a["account"].as_str().unwrap_or("?");
         let mut detail = format!(
-            "{:.0}% of attempts failed in the last {hours} h ({e} of {n})",
+            "{:.0}% of attempts failed in the last {hours} h ({e} of {n}, not counting failovers \
+             or invalid requests)",
             rate * 100.0
         );
         if let Some(top) = a["top_error"].as_str() {
-            detail.push_str(&format!(", mostly {top}"));
+            detail.push_str(&format!(", most common error {top}"));
         }
         if let (Some(p50), Some(p95)) = (a["p50_ms"].as_i64(), a["p95_ms"].as_i64()) {
             detail.push_str(&format!("; latency p50 {p50} ms, p95 {p95} ms"));
@@ -713,8 +739,8 @@ fn error_checks(stats: Option<&Result<Value, String>>) -> Vec<Check> {
             Level::Ok,
             label,
             format!(
-                "{attempts} attempts in the last {hours} h, {errors} failed; no account at \
-                 {:.0}% or more",
+                "{attempts} attempts in the last {hours} h, {errors} failed (not counting \
+                 failovers or invalid requests); no account at {:.0}% or more",
                 ERROR_RATE_WARN * 100.0
             ),
         ));
@@ -722,7 +748,7 @@ fn error_checks(stats: Option<&Result<Value, String>>) -> Vec<Check> {
     out
 }
 
-/// A release version: `major.minor.patch[-pre]` (a leading `v` and any `+build` ignored).
+/// A release version: `major.minor.patch[-pre]` (a leading `v`/`V` and any `+build` ignored).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Version {
     core: [u64; 3],
@@ -732,7 +758,7 @@ struct Version {
 impl Version {
     fn parse(s: &str) -> Option<Version> {
         let s = s.trim();
-        let s = s.strip_prefix('v').unwrap_or(s);
+        let s = s.strip_prefix(['v', 'V']).unwrap_or(s);
         let s = s.split('+').next()?;
         let (core, pre) = match s.split_once('-') {
             Some((c, p)) => (c, Some(p)),
@@ -1194,9 +1220,9 @@ fn clock_check(date: Option<(String, OffsetDateTime)>, now: OffsetDateTime) -> C
     let label = "clock";
     let Some((from, server)) = date else {
         return Check::new(
-            Level::Warn,
+            Level::Info,
             label,
-            "not checked (no upstream answered with a Date header)",
+            "not checked (no server answered with a Date header)",
         );
     };
     let skew = (now - server).whole_seconds().abs();
@@ -1342,11 +1368,17 @@ fn storage_check(paths: &Paths, ret: &RetentionCfg, journal_rows: Option<u64>) -
             max => detail.push_str(&format!(", journal {n} of {max} requests")),
         }
     }
-    let near_cap = cap > 0 && db as f64 > cap as f64 * DB_CAP_WARN;
-    if near_cap || db + logs > DISK_WARN {
+    // At the cap is the steady state (the pool prunes the oldest rows); well past it means the
+    // pruning is not keeping up. With no cap, only a large total is worth a look.
+    let over = if cap > 0 {
+        db as f64 > cap as f64 * DB_OVER_CAP
+    } else {
+        db + logs > DISK_WARN
+    };
+    if over {
         Check::new(Level::Warn, label, detail).hint(
-            "the pool prunes the oldest journal rows past the cap; lower or raise [retention] in \
-             config.toml, or delete old files in logs/",
+            "the pool prunes the oldest journal rows past the cap hourly; if this persists see \
+             `pooltime logs`, or delete old files in logs/",
         )
     } else {
         Check::new(Level::Ok, label, detail)
@@ -1394,7 +1426,7 @@ mod tests {
         assert_eq!(clock_check(at(5), now).level, Level::Ok);
         assert_eq!(clock_check(at(-90), now).level, Level::Warn);
         assert_eq!(clock_check(at(600), now).level, Level::Fail);
-        assert_eq!(clock_check(None, now).level, Level::Warn);
+        assert_eq!(clock_check(None, now).level, Level::Info);
     }
 
     #[test]
@@ -1492,6 +1524,7 @@ mod tests {
         assert!(v("1.0.0-beta") > v("1.0.0-alpha.1"));
         assert!(v("1.0.0-alpha.1") > v("1.0.0-alpha"));
         assert_eq!(v("v1.2.3+build.5"), v("1.2.3"));
+        assert_eq!(v("V1.2.3"), v("1.2.3"));
         assert_eq!(v("v1.2.3-rc.1").to_string(), "1.2.3-rc.1");
         for bad in ["", "1.2", "1.2.3.4", "x.y.z", "1.2.3-", "1..3", "1.2.3-a$b"] {
             assert!(Version::parse(bad).is_none(), "{bad}");
@@ -1573,12 +1606,29 @@ mod tests {
         let url = "http://127.0.0.1:3460";
         let one = |pool| profile_checks(&paths, std::slice::from_ref(&r), url, pool, None);
         assert_eq!(one(PoolState::Up)[0].level, Level::Ok);
-        for pool in [PoolState::Down, PoolState::CacheStale] {
-            let c = &one(pool)[0];
-            assert_eq!(c.level, Level::Fail);
-            assert!(c.detail.starts_with("connected, pool down"), "{c}");
-            assert!(c.to_string().contains("pooltime service status"), "{c}");
-        }
+        assert!(status_cache_check(PoolState::Up).is_none());
+        // Nothing answers: the connected profile is broken.
+        let c = &one(PoolState::Down)[0];
+        assert_eq!(c.level, Level::Fail);
+        assert!(c.detail.starts_with("connected, pool down"), "{c}");
+        assert!(c.to_string().contains("pooltime service status"), "{c}");
+        assert!(
+            status_cache_check(PoolState::Down).is_none(),
+            "the health line's"
+        );
+        // The pool answers but its cache is stale: one warning, the profile still verified.
+        let mut checks = one(PoolState::CacheStale);
+        assert_eq!(checks[0].level, Level::Ok, "{}", checks[0]);
+        assert!(!checks[0].to_string().contains("pool down"));
+        let cache = status_cache_check(PoolState::CacheStale).unwrap();
+        assert_eq!(cache.level, Level::Warn);
+        assert_eq!(
+            cache.to_string(),
+            "! status cache: missing or older than 150 s (status lines show \"pool down\") — \
+             `pooltime logs` / `pooltime service status`"
+        );
+        checks.push(cache);
+        assert_eq!(exit_code(&checks), 0);
     }
 
     #[test]
@@ -1607,6 +1657,11 @@ mod tests {
         // Another data dir: the status line shows that pool's state, not this one's.
         set(&ours(&bin, Some(Path::new("/elsewhere"))));
         assert_eq!(check()[0].level, Level::Warn);
+        // The same dir by another name (a symlink) is this one.
+        let link = d.path().join("pt-link");
+        std::os::unix::fs::symlink(&paths.home, &link).unwrap();
+        set(&ours(&bin, Some(&link)));
+        assert_eq!(check()[0].level, Level::Ok, "{}", check()[0]);
         // No prefix: reads the default dir, which here is not this one.
         set(&ours(&bin, None));
         assert_eq!(check()[0].level, Level::Warn);
@@ -1665,17 +1720,43 @@ mod tests {
         assert_eq!((ok.level, ok.label.as_str()), (Level::Ok, "errors"));
         assert_eq!(error_checks(None)[0].level, Level::Info);
         assert_eq!(one(Err("boom".into()))[0].level, Level::Info);
+        // Failovers and invalid requests (excluded from `rated_*`) do not count.
+        let rated = Ok(serde_json::json!({"accounts": [{
+            "account": "a", "attempts": 100, "errors": 60, "error_rate": 0.6,
+            "rated_attempts": 50, "rated_errors": 2,
+        }]}));
+        let c = &one(rated)[0];
+        assert_eq!(c.level, Level::Ok, "{c}");
+        assert!(
+            c.detail
+                .contains("not counting failovers or invalid requests"),
+            "{c}"
+        );
+        let rated = Ok(serde_json::json!({"accounts": [{
+            "account": "a", "attempts": 100, "errors": 60, "rated_attempts": 40,
+            "rated_errors": 10, "top_error": "quota",
+        }]}));
+        let c = &one(rated)[0];
+        assert_eq!(c.level, Level::Warn, "{c}");
+        assert!(c.detail.contains("(10 of 40, not counting"), "{c}");
+        assert!(c.detail.contains("most common error quota"), "{c}");
     }
 
     #[test]
-    fn storage_near_the_cap() {
+    fn storage_against_the_cap() {
         let d = tempfile::tempdir().unwrap();
         let paths = Paths::under(d.path());
-        std::fs::write(&paths.db, vec![0u8; 900 * 1024]).unwrap();
         let ret = |mb| RetentionCfg {
             journal_max_mb: mb,
             ..RetentionCfg::default()
         };
+        // At (even a little past) the cap is the pruned steady state.
+        std::fs::write(&paths.db, vec![0u8; 1100 * 1024]).unwrap();
+        let c = storage_check(&paths, &ret(1), None);
+        assert_eq!(c.level, Level::Ok, "{c}");
+        assert!(c.detail.contains("of 1.0 MiB cap"), "{c}");
+        // Well past it: pruning is not keeping up.
+        std::fs::write(&paths.db, vec![0u8; 1300 * 1024]).unwrap();
         assert_eq!(storage_check(&paths, &ret(1), None).level, Level::Warn);
         assert_eq!(storage_check(&paths, &ret(2), None).level, Level::Ok);
         assert_eq!(

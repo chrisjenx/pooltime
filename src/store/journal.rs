@@ -110,8 +110,14 @@ pub struct AccountStats {
     /// Attempt latency (start to outcome) percentiles, over attempts that have one.
     pub p50_ms: Option<i64>,
     pub p95_ms: Option<i64>,
-    /// The most frequent error outcome (ties: the alphabetically first); `None` without errors.
+    /// The most frequent error class among the errors: the classified `reason`, else the
+    /// outcome (ties: the alphabetically first); `None` without errors.
     pub top_error: Option<String>,
+    /// Attempts and errors that say something about the account's health: without `failover`
+    /// hand-overs (the request went on to another account) and `invalid_request` (the client's
+    /// fault).
+    pub rated_attempts: u64,
+    pub rated_errors: u64,
 }
 
 // ---- SQL ---------------------------------------------------------------------------------------
@@ -253,7 +259,7 @@ pub fn get(conn: &Connection, id: &str) -> anyhow::Result<Option<(RequestRow, Ve
 /// (unix seconds), ordered by account.
 pub fn account_stats(conn: &Connection, since: i64) -> anyhow::Result<Vec<AccountStats>> {
     let mut st = conn.prepare(
-        "SELECT a.account, a.provider, a.outcome, a.ms FROM journal_attempts a
+        "SELECT a.account, a.provider, a.outcome, a.ms, a.reason FROM journal_attempts a
          JOIN journal_requests r ON r.id = a.request_id
          WHERE r.ts >= ?1 ORDER BY a.account",
     )?;
@@ -263,11 +269,12 @@ pub fn account_stats(conn: &Connection, since: i64) -> anyhow::Result<Vec<Accoun
             row.get::<_, Option<String>>(1)?.unwrap_or_default(),
             row.get::<_, Option<String>>(2)?.unwrap_or_default(),
             row.get::<_, Option<i64>>(3)?,
+            row.get::<_, Option<String>>(4)?,
         ))
     })?;
     let mut out: Vec<(AccountStats, Vec<i64>, BTreeMap<String, u64>)> = Vec::new();
     for row in rows {
-        let (account, provider, outcome, ms) = row?;
+        let (account, provider, outcome, ms, reason) = row?;
         if out.last().is_none_or(|(s, _, _)| s.account != account) {
             out.push((
                 AccountStats {
@@ -279,6 +286,8 @@ pub fn account_stats(conn: &Connection, since: i64) -> anyhow::Result<Vec<Accoun
                     p50_ms: None,
                     p95_ms: None,
                     top_error: None,
+                    rated_attempts: 0,
+                    rated_errors: 0,
                 },
                 Vec::new(),
                 BTreeMap::new(),
@@ -286,9 +295,12 @@ pub fn account_stats(conn: &Connection, since: i64) -> anyhow::Result<Vec<Accoun
         }
         let (s, lat, kinds) = out.last_mut().expect("pushed above");
         s.attempts += 1;
+        let rated = outcome != FAILOVER && reason.as_deref() != Some("invalid_request");
+        s.rated_attempts += u64::from(rated);
         if outcome != "completed" && outcome != "client_cancelled" {
             s.errors += 1;
-            *kinds.entry(outcome).or_default() += 1;
+            s.rated_errors += u64::from(rated);
+            *kinds.entry(reason.unwrap_or(outcome)).or_default() += 1;
         }
         lat.extend(ms);
     }

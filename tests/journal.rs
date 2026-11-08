@@ -263,8 +263,13 @@ async fn journal_row_per_request_with_attempt_chain() {
     };
     assert_eq!(acct("a1")["attempts"], 1);
     assert_eq!(acct("a1")["error_rate"], 1.0);
-    assert!(acct("a1")["top_error"].is_string(), "{st}");
+    // The class is the classified reason (the outcome was `failover`).
+    assert_eq!(acct("a1")["top_error"], "quota", "{st}");
     assert!(acct("a2")["top_error"].is_null(), "{st}");
+    // A failover hand-over is not held against the account's health rating.
+    assert_eq!(acct("a1")["rated_attempts"], 0);
+    assert_eq!(acct("a1")["rated_errors"], 0);
+    assert_eq!(acct("a2")["rated_attempts"], 2);
     assert_eq!(acct("a2")["attempts"], 2);
     assert_eq!(acct("a2")["errors"], 0);
     assert!(acct("a2")["p50_ms"].as_i64().is_some() && acct("a2")["p95_ms"].as_i64().is_some());

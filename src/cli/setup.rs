@@ -66,6 +66,22 @@ pub struct SetupArgs {
 
 /// How long to wait for a freshly installed service to answer `/health`.
 const SERVICE_BOOT: Duration = Duration::from_secs(20);
+/// How long to wait for a running pool's first status cache write before the doctor runs.
+const CACHE_WAIT: Duration = Duration::from_secs(5);
+
+/// Until the status cache is fresh, or `budget` passes (then the doctor reports it).
+async fn wait_for_status_cache(paths: &Paths, budget: Duration) {
+    let start = Instant::now();
+    let fresh = || {
+        crate::claude_code::statusline::cache_is_fresh(
+            paths,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        )
+    };
+    while !fresh() && start.elapsed() < budget {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
@@ -107,6 +123,11 @@ pub async fn run(paths: &Paths, args: SetupArgs) -> anyhow::Result<i32> {
     report(&mut steps, c);
 
     println!();
+    if daemon.is_some() {
+        // A pool that has just booted writes its status cache within moments: give it that
+        // long, so the doctor does not report a cache that is merely not written yet.
+        wait_for_status_cache(paths, CACHE_WAIT).await;
+    }
     let checks = doctor::checks(paths, &doctor::Options::from_env(false)).await;
     doctor::print(&checks);
     println!();

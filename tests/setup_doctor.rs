@@ -404,6 +404,8 @@ async fn setup_noninteractive_full_path() {
             "{out}"
         );
         assert!(!out.lines().any(|l| l.starts_with('✗')), "{out}");
+        // Setup waits for the pool's first status cache write.
+        assert!(!out.contains("status cache:"), "{out}");
         assert!(
             out.contains(&format!("http://127.0.0.1:{}/?k=", m.port)),
             "{out}"
@@ -636,12 +638,15 @@ async fn doctor_reports_recent_error_rate() {
                 "window_secs": 86400,
                 "accounts": [
                     {"account": "home", "provider": "anthropic", "attempts": 5, "errors": 5,
-                     "error_rate": 1.0, "p50_ms": 300, "p95_ms": 900},
-                    {"account": "quiet", "provider": "anthropic", "attempts": 50, "errors": 1,
-                     "error_rate": 0.02, "p50_ms": 400, "p95_ms": 1200},
-                    {"account": "work", "provider": "anthropic", "attempts": 40, "errors": 8,
-                     "error_rate": 0.2, "p50_ms": 500, "p95_ms": 2500,
-                     "top_error": "upstream_overloaded"},
+                     "error_rate": 1.0, "p50_ms": 300, "p95_ms": 900, "top_error": "quota",
+                     "rated_attempts": 5, "rated_errors": 5},
+                    // Many failovers, but few errors of its own: not flagged.
+                    {"account": "quiet", "provider": "anthropic", "attempts": 50, "errors": 26,
+                     "error_rate": 0.52, "p50_ms": 400, "p95_ms": 1200, "top_error": "quota",
+                     "rated_attempts": 25, "rated_errors": 1},
+                    {"account": "work", "provider": "anthropic", "attempts": 50, "errors": 18,
+                     "error_rate": 0.36, "p50_ms": 500, "p95_ms": 2500,
+                     "top_error": "quota", "rated_attempts": 40, "rated_errors": 8},
                 ],
                 "journal_requests": 1234,
                 "storage": {"db_bytes": 0, "logs_bytes": 0},
@@ -659,7 +664,7 @@ async fn doctor_reports_recent_error_rate() {
     let l = line_with(&out, "errors work:");
     assert!(l.starts_with('!'), "{out}");
     assert!(l.contains("20%") && l.contains("8 of 40"), "{out}");
-    assert!(l.contains("upstream_overloaded"), "{out}");
+    assert!(l.contains("most common error quota"), "{out}");
     // Under 20 attempts: too few to judge, however bad.
     assert!(!out.contains("errors home:"), "{out}");
     assert!(!out.contains("errors quiet:"), "{out}");
