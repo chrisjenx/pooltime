@@ -30,6 +30,8 @@ use tokio::time::{Instant, MissedTickBehavior};
 use super::AnthropicProvider;
 use crate::accounts::status::window_duration;
 use crate::accounts::{AccountMeta, AccountStatus, RateLimitSnapshot, Window, WindowStatus};
+// Families with a top-level `seven_day_<family>` object / scoped limits.
+use crate::models::{family_of as model_family_of, MODEL_FAMILIES};
 use crate::providers::{is_entitlement_message, ProviderId, UsageError};
 use crate::upstream::Limits;
 
@@ -37,13 +39,6 @@ use crate::upstream::Limits;
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Lower bound for the fetch timeout (config floor).
 const MIN_FETCH_TIMEOUT: Duration = Duration::from_millis(250);
-/// Model families that have a top-level `seven_day_<family>` object / scoped limits.
-const MODEL_FAMILIES: [&str; 5] = ["fable", "mythos", "opus", "sonnet", "haiku"];
-
-fn model_family_of(display_name: &str) -> Option<&'static str> {
-    let lower = display_name.to_ascii_lowercase();
-    MODEL_FAMILIES.into_iter().find(|f| lower.contains(f))
-}
 
 fn parse_reset(raw: Option<&str>) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(raw?, &Rfc3339).ok()
