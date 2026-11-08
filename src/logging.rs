@@ -44,6 +44,39 @@ pub struct PruneStats {
     pub deleted_bytes: u64,
 }
 
+/// Route panics into the log too (the default hook, which prints to stderr, still runs). Only
+/// the location and the panic message are logged. Install once, after [`init`].
+pub fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        tracing::error!(%location, %message, "panic");
+        default(info);
+    }));
+}
+
+/// Run `fut`, turning a panic into `None` (logged with `task`), so a background loop survives
+/// one bad iteration instead of dying silently.
+pub async fn catch_panic<F: std::future::Future>(task: &'static str, fut: F) -> Option<F::Output> {
+    use futures_util::FutureExt;
+    match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::error!(task, "background task iteration panicked; it keeps running");
+            None
+        }
+    }
+}
+
 /// Install the global tracing subscriber.
 ///
 /// - JSON lines to `<logs>/pooltime.log.<date>` (daily rotation, non-blocking), always.
@@ -311,6 +344,13 @@ mod tests {
     use filetime::{set_file_mtime, FileTime};
     use http::HeaderValue;
     use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn catch_panic_contains_the_panic() {
+        assert_eq!(catch_panic("t", async { 7 }).await, Some(7));
+        let r: Option<()> = catch_panic("t", async { panic!("boom") }).await;
+        assert_eq!(r, None);
+    }
     use std::time::Duration;
 
     fn get<'a>(v: &'a [(String, String)], k: &str) -> &'a str {

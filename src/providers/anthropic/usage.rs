@@ -342,7 +342,7 @@ pub fn spawn_usage_sweeper(provider: Arc<AnthropicProvider>, every: Duration) ->
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tick.tick().await; // the first tick is immediate: the startup sweep
-            sweep_once(&provider).await;
+            crate::logging::catch_panic("anthropic usage sweep", sweep_once(&provider)).await;
         }
     })
 }

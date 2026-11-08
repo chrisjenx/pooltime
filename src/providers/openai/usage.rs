@@ -265,15 +265,18 @@ pub fn spawn_usage_sweeper(provider: Arc<OpenAiProvider>, every: Duration) -> Jo
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tick.tick().await; // the first tick is immediate: the startup sweep
-            let accounts: Vec<AccountMeta> = provider
-                .reg
-                .list()
-                .into_iter()
-                .filter(|a| a.provider == ProviderId::OpenAi)
-                .filter(|a| matches!(provider.reg.read_creds(&a.id), Ok(Some(_))))
-                .collect();
-            // Failures are logged and recorded inside poll_usage.
-            join_all(accounts.iter().map(|a| provider.poll_usage(a))).await;
+            let sweep = async {
+                let accounts: Vec<AccountMeta> = provider
+                    .reg
+                    .list()
+                    .into_iter()
+                    .filter(|a| a.provider == ProviderId::OpenAi)
+                    .filter(|a| matches!(provider.reg.read_creds(&a.id), Ok(Some(_))))
+                    .collect();
+                // Failures are logged and recorded inside poll_usage.
+                join_all(accounts.iter().map(|a| provider.poll_usage(a))).await;
+            };
+            crate::logging::catch_panic("codex usage sweep", sweep).await;
         }
     })
 }

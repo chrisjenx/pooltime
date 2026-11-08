@@ -187,8 +187,20 @@ pub fn spawn_status_cache(app: Arc<AppState>) -> StatusCache {
             }
             last_read = Some(Instant::now());
             let now = OffsetDateTime::now_utc();
-            let inputs = match crate::server::mgmt::try_gather(&app, now).await {
-                Ok(i) => i,
+            let read = async {
+                let inputs = crate::server::mgmt::try_gather(&app, now)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<_, String>(cache_body(
+                    &crate::server::mgmt::build_status(&inputs, now),
+                    app.cfg.port,
+                ))
+            };
+            let read = crate::logging::catch_panic("status cache", read)
+                .await
+                .unwrap_or_else(|| Err("reading the pool panicked".into()));
+            let body = match read {
+                Ok(b) => b,
                 Err(e) => {
                     if !failing {
                         tracing::warn!(error = %e, "status cache: could not read the pool");
@@ -201,10 +213,6 @@ pub fn spawn_status_cache(app: Arc<AppState>) -> StatusCache {
                 tracing::info!("status cache: reading the pool works again");
                 failing = false;
             }
-            let body = cache_body(
-                &crate::server::mgmt::build_status(&inputs, now),
-                app.cfg.port,
-            );
             if !heartbeat && last_body.as_ref() == Some(&body) {
                 continue;
             }

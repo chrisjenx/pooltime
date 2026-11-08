@@ -3,9 +3,9 @@
 //! A sample is taken when the window's utilization or `resets_at` changes, at most one row per
 //! account per [`MIN_GAP_SECS`]. A detected reset ([`usage_history::is_reset`]) bypasses the
 //! throttle: the last pre-reset reading (when it was throttled away) and the new one are both
-//! recorded at once, so the consumption before the reset is not lost. The background task
-//! A reading held back by the throttle is written (with its own time) once the gap has passed,
-//! even with no further change. The background task ([`spawn_sampler`]) wakes on
+//! recorded at once, so the consumption before the reset is not lost. A reading held back by the
+//! throttle is written (with its own time) once the gap has passed, even with no further change.
+//! The background task ([`spawn_sampler`]) wakes on
 //! [`StateBook::changes`] and at least every [`MIN_GAP_SECS`], and queues rows on the store
 //! writer; the request path never waits on it.
 
@@ -152,6 +152,24 @@ fn sample_all(sampler: &mut Sampler, registry: &Registry, state: &StateBook, sto
     }
 }
 
+/// A sampler seeded with the latest stored sample of every account.
+async fn seeded(store: &Arc<Store>) -> Sampler {
+    let seed_store = store.clone();
+    let latest = tokio::task::spawn_blocking(move || {
+        seed_store.read(|c| usage_history::latest_points(c, WINDOW_7D))
+    })
+    .await;
+    let latest = match latest {
+        Ok(Ok(l)) => l,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %format!("{e:#}"), "reading the latest usage samples failed");
+            HashMap::new()
+        }
+        Err(_) => HashMap::new(),
+    };
+    Sampler::seed(latest)
+}
+
 /// Sample on every state change until aborted.
 pub fn spawn_sampler(
     registry: Arc<Registry>,
@@ -160,20 +178,7 @@ pub fn spawn_sampler(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut changes = state.changes();
-        let seed_store = store.clone();
-        let latest = tokio::task::spawn_blocking(move || {
-            seed_store.read(|c| usage_history::latest_points(c, WINDOW_7D))
-        })
-        .await;
-        let latest = match latest {
-            Ok(Ok(l)) => l,
-            Ok(Err(e)) => {
-                tracing::warn!(error = %format!("{e:#}"), "reading the latest usage samples failed");
-                HashMap::new()
-            }
-            Err(_) => HashMap::new(),
-        };
-        let mut sampler = Sampler::seed(latest);
+        let mut sampler = seeded(&store).await;
         loop {
             // The registry listing reads account files: keep it off the async threads.
             let (r, s, st) = (registry.clone(), state.clone(), store.clone());
@@ -184,9 +189,13 @@ pub fn spawn_sampler(
             .await
             {
                 Ok(s) => s,
-                Err(_) => {
-                    tracing::warn!("usage sampling task failed; sampling stopped");
-                    return;
+                Err(e) => {
+                    // The sampler went down with the task: start again from the stored samples.
+                    tracing::error!(
+                        panic = e.is_panic(),
+                        "usage sampling round failed; sampling continues"
+                    );
+                    seeded(&store).await
                 }
             };
             // Wake on a change, or after MIN_GAP_SECS anyway to flush a held reading.
