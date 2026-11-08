@@ -4,9 +4,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 
-use super::{run_checked, stable_bin, Env, Runner, Status};
+use super::{run_checked, stable_bin, CmdOutput, Env, Runner, Status};
 use crate::config::Paths;
 use crate::fsutil::atomic_write;
 
@@ -100,10 +100,44 @@ pub fn install(env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Stop, disable and delete the unit. `Ok(false)` when there was no unit file.
+fn is_active(r: &dyn Runner) -> bool {
+    r.run("systemctl", &["--user", "is-active", UNIT])
+        .is_ok_and(|o| o.success)
+}
+
+/// `systemctl disable` says there is no such unit.
+fn unit_absent(out: &CmdOutput) -> bool {
+    out.code == Some(5)
+        || ["not loaded", "does not exist", "not found", "No such file"]
+            .iter()
+            .any(|m| out.stderr.contains(m))
+}
+
+/// Stop and disable the unit. Anything but "no such unit" is an error unless the unit turns out
+/// not to be running, so a still-running daemon is never mistaken for a stopped one.
+fn unload(r: &dyn Runner) -> anyhow::Result<()> {
+    if is_active(r) {
+        eprintln!("stopping the running service...");
+    }
+    let out = r
+        .run("systemctl", &["--user", "disable", "--now", UNIT])
+        .context("running `systemctl`: is it on PATH?")?;
+    if out.success || unit_absent(&out) || !is_active(r) {
+        return Ok(());
+    }
+    let why = out.stderr.trim();
+    Err(anyhow!(
+        "`systemctl --user disable --now {UNIT}` failed ({}) and the unit is still active{}{}",
+        out.code.map_or("signal".into(), |c| format!("exit {c}")),
+        if why.is_empty() { "" } else { ": " },
+        why
+    ))
+}
+
+/// Stop, disable and delete the unit. `Ok(false)` when there was no unit file. If the unit cannot
+/// be stopped the file is kept and this is an error.
 pub fn uninstall(env: &Env, r: &dyn Runner) -> anyhow::Result<bool> {
-    // Fails when the unit is unknown; either way it is gone afterwards.
-    let _ = r.run("systemctl", &["--user", "disable", "--now", UNIT]);
+    unload(r)?;
     let path = unit_path(env);
     let removed = match fs::remove_file(&path) {
         Ok(()) => true,

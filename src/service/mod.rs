@@ -12,6 +12,7 @@ pub mod systemd;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 
@@ -75,6 +76,53 @@ pub(crate) fn run_checked(
     Ok(out)
 }
 
+/// Tries at `launchctl bootstrap` (it can race the teardown of the job it replaces).
+pub(crate) const BOOTSTRAP_ATTEMPTS: u32 = 3;
+
+/// How long to wait for a job to unload, and how often to look; and the pause between retries of
+/// a failed load. Injectable so tests need not sleep.
+#[derive(Debug, Clone, Copy)]
+pub struct Timing {
+    pub poll_step: Duration,
+    pub unload_timeout: Duration,
+    pub retry_delay: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Timing {
+        Timing {
+            poll_step: Duration::from_millis(200),
+            unload_timeout: Duration::from_secs(15),
+            retry_delay: Duration::from_secs(1),
+        }
+    }
+}
+
+impl Timing {
+    /// Check once, never sleep.
+    pub fn instant() -> Timing {
+        Timing {
+            poll_step: Duration::ZERO,
+            unload_timeout: Duration::ZERO,
+            retry_delay: Duration::ZERO,
+        }
+    }
+
+    /// Poll `present` until it is false; `false` if it is still true after `unload_timeout`.
+    pub(crate) fn wait_until_gone(&self, mut present: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        loop {
+            if !present() {
+                return true;
+            }
+            if start.elapsed() >= self.unload_timeout {
+                return false;
+            }
+            std::thread::sleep(self.poll_step);
+        }
+    }
+}
+
 /// Everything the service commands need to know about the user's machine, resolved once so the
 /// flows can be tested against temp directories.
 #[derive(Debug, Clone)]
@@ -87,6 +135,7 @@ pub struct Env {
     /// `$XDG_CONFIG_HOME` when set (and absolute).
     pub xdg_config_home: Option<PathBuf>,
     pub uid: u32,
+    pub timing: Timing,
 }
 
 impl Env {
@@ -107,12 +156,22 @@ impl Env {
             xdg_config_home: var("XDG_CONFIG_HOME").filter(|p| p.is_absolute()),
             // SAFETY: getuid has no preconditions and cannot fail.
             uid: unsafe { libc::getuid() },
+            timing: Timing::default(),
         })
     }
 
     /// The binary path the service definition will name: [`stable_bin`] of [`Env::bin`], which
     /// must exist (a Homebrew keg that is not linked has no stable path to point at).
     pub(crate) fn service_bin(&self) -> anyhow::Result<PathBuf> {
+        // A newline in a path would split a unit-file line or smuggle in one more.
+        for p in [&self.bin, &self.paths.home] {
+            if p.to_string_lossy().contains(['\n', '\r']) {
+                return Err(anyhow!(
+                    "a newline in the path {:?} cannot be written to a service definition",
+                    p
+                ));
+            }
+        }
         let bin = stable_bin(&self.bin);
         if bin != self.bin && !bin.exists() {
             return Err(anyhow!(
