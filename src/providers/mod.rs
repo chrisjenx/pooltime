@@ -85,11 +85,16 @@ pub enum UsageError {
     Refresh(RefreshErrorKind),
     #[error("usage polling not supported")]
     NotSupported,
+    /// Skipped: the account was polled (or failed a poll) too recently and has no fresh
+    /// successful snapshot to return.
+    #[error("usage poll throttled")]
+    Throttled,
 }
 
 impl UsageError {
     /// Classified label for `usage_check.error` and logs: `transport:<kind>`, `status:<code>`,
-    /// `entitlement`, `parse:<class>`, `refresh:<kind>`, `not_supported`. Never upstream text.
+    /// `entitlement`, `parse:<class>`, `refresh:<kind>`, `not_supported`, `throttled`. Never
+    /// upstream text.
     pub fn label(&self) -> String {
         match self {
             UsageError::Transport(k) => format!("transport:{}", k.as_str()),
@@ -98,6 +103,7 @@ impl UsageError {
             UsageError::Parse(class) => format!("parse:{class}"),
             UsageError::Refresh(k) => format!("refresh:{}", k.detail()),
             UsageError::NotSupported => "not_supported".into(),
+            UsageError::Throttled => "throttled".into(),
         }
     }
 }

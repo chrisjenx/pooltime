@@ -1,6 +1,7 @@
 //! Fake ChatGPT Codex backend on 127.0.0.1:0, in the style of [`super::fake_anthropic`] (it is
 //! the same scriptable hyper server): `POST /responses` and the OAuth token endpoint
-//! `POST /oauth/token`, plus Codex SSE event builders and `x-codex-*` rate-limit headers.
+//! `POST /oauth/token`, `GET /models` (catalog) and `GET /wham/usage` (usage poll), plus Codex
+//! SSE event builders, catalog entry builders and `x-codex-*` rate-limit headers.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +19,8 @@ use super::Pool;
 
 pub const RESPONSES: &str = "/responses";
 pub const OAUTH_TOKEN: &str = "/oauth/token";
+pub const MODELS: &str = "/models";
+pub const USAGE: &str = "/wham/usage";
 pub const CODEX_REFRESH: &str = "codex-refresh-token-SECRET";
 
 /// Provider pointed at `fake` (Responses and token endpoint), with `policy` and `keepalive`.
@@ -30,6 +33,7 @@ pub fn codex_provider(
     let cfg = OpenAiCfg {
         api_base: fake.url(),
         token_url: format!("{}{}", fake.url(), OAUTH_TOKEN),
+        usage_url: format!("{}{}", fake.url(), USAGE),
         ..OpenAiCfg::default()
     };
     OpenAiProvider::new(cfg, pool.reg.clone(), pool.state.clone(), pool.up.clone())
@@ -132,6 +136,65 @@ pub fn window(
         r = r.header(&format!("x-codex-{slot}-reset-at"), &t.to_string());
     }
     r
+}
+
+/// One `codex/models` catalog entry: `slug`, `visibility`, reasoning levels `efforts`, and the
+/// context windows when given.
+pub fn model_entry(
+    slug: &str,
+    visibility: &str,
+    efforts: &[&str],
+    context: Option<u64>,
+    max_context: Option<u64>,
+) -> Value {
+    let mut m = json!({
+        "slug": slug,
+        "display_name": slug,
+        "visibility": visibility,
+        "supported_reasoning_levels": efforts
+            .iter()
+            .map(|e| json!({"effort": e, "description": "x"}))
+            .collect::<Vec<_>>(),
+    });
+    if let Some(c) = context {
+        m["context_window"] = json!(c);
+    }
+    if let Some(c) = max_context {
+        m["max_context_window"] = json!(c);
+    }
+    m
+}
+
+/// A `200` catalog body with `entries`.
+pub fn catalog(entries: Vec<Value>) -> Reply {
+    Reply::json(200, &json!({ "models": entries }))
+}
+
+/// A `200` `wham/usage` body: `(used_percent, limit_window_seconds, reset_at)` per slot.
+pub fn usage(
+    allowed: bool,
+    limit_reached: bool,
+    primary: Option<(f64, u64, i64)>,
+    secondary: Option<(f64, u64, i64)>,
+) -> Reply {
+    let w = |s: Option<(f64, u64, i64)>| match s {
+        Some((u, secs, reset)) => {
+            json!({"used_percent": u, "limit_window_seconds": secs, "reset_at": reset})
+        }
+        None => Value::Null,
+    };
+    Reply::json(
+        200,
+        &json!({
+            "plan_type": "plus",
+            "rate_limit": {
+                "allowed": allowed,
+                "limit_reached": limit_reached,
+                "primary_window": w(primary),
+                "secondary_window": w(secondary),
+            }
+        }),
+    )
 }
 
 /// Wrap a provider for [`super::Boot::provider`].
