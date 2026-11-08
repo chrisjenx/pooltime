@@ -591,6 +591,15 @@ impl StateBook {
         });
     }
 
+    /// Whether `token` is the refresh token last rejected for `id` (fingerprint compare), so
+    /// callers can skip a POST that is known to fail.
+    pub fn is_refresh_dead(&self, id: &AccountId, token: &str) -> bool {
+        self.lock()
+            .get(id)
+            .and_then(|e| e.state.dead_refresh_fp.as_deref())
+            .is_some_and(|fp| fp == fingerprint(token))
+    }
+
     /// A fresh login replaced the dead token.
     pub fn clear_refresh_dead(&self, id: &AccountId, now: OffsetDateTime) {
         self.mutate(id, now, "refresh_token_replaced", |s| {

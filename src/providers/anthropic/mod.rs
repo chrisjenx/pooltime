@@ -30,8 +30,10 @@ pub struct AnthropicProvider {
     skew: time::Duration,
     /// Bound for one token-endpoint call (config default 30 s).
     refresh_timeout: Duration,
-    /// One in-flight refresh per account within this process.
+    /// Serialises refresh tasks of one account within this process.
     gates: Mutex<HashMap<AccountId, Arc<tokio::sync::Mutex<()>>>>,
+    /// Shared spawned refresh task per (account, force) (see [`oauth`]).
+    inflight: oauth::InFlightMap,
     /// One in-flight usage poll per account within this process (see [`usage`]).
     usage_gates: Mutex<HashMap<AccountId, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -53,6 +55,7 @@ impl AnthropicProvider {
             skew: time::Duration::seconds(300),
             refresh_timeout: Duration::from_secs(30),
             gates: Mutex::new(HashMap::new()),
+            inflight: Arc::default(),
             usage_gates: Mutex::new(HashMap::new()),
         }
     }
