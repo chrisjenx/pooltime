@@ -1,14 +1,15 @@
 //! Pure scoring pieces of the weighted strategy (INV §2, port of bro `manager.ts`
 //! `scoreWeightedRows` / `candidateExpiryReset` / `candidateGateHeadroom`).
 //!
-//! Only account-wide windows (`model == None`) are considered; model-scoped windows are
-//! handled by `usable` (spent family) and never influence the score. Windows whose reset
-//! is already in the past are treated as refreshed and ignored, as in bro.
+//! Binding windows for a request are the account-wide ones (`model == None`) plus those
+//! scoped to the requested `family` (bro `bindingWindows`); windows of other families never
+//! influence the score. Windows whose reset is already in the past are treated as
+//! refreshed and ignored, as in bro.
 
 use time::{Duration, OffsetDateTime};
 
 use super::tuning::Tuning;
-use crate::accounts::status::window_duration;
+use crate::accounts::status::{is_spent, window_duration};
 use crate::accounts::{AccountMeta, RateLimitSnapshot, Window, WindowStatus};
 
 /// Where an account sits in the 7d-expiry ordering. Derived `Ord`: `Unknown` (probe it
@@ -20,32 +21,32 @@ pub enum ExpiryRank {
     Spent,
 }
 
-/// Mirrors the (private) `is_spent` in `accounts::status`: explicitly rejected, or fully
-/// used without an explicit `allowed` (Codex reports 100% + allowed while unenforced).
-fn is_spent(w: &Window) -> bool {
-    match w.status {
-        WindowStatus::Rejected => true,
-        WindowStatus::Allowed => false,
-        WindowStatus::AllowedWarning | WindowStatus::Unknown => w.utilization >= 1.0,
-    }
-}
-
-/// Live account-wide windows: no model scope, and reset unknown or still in the future.
-fn binding_windows(
-    snap: &RateLimitSnapshot,
+/// Live windows that bind a request for `family`: account-wide, or scoped to `family`;
+/// reset unknown or still in the future.
+fn binding_windows<'a>(
+    snap: &'a RateLimitSnapshot,
+    family: Option<&'a str>,
     now: OffsetDateTime,
-) -> impl Iterator<Item = &Window> + '_ {
+) -> impl Iterator<Item = &'a Window> + 'a {
     snap.windows
         .iter()
-        .filter(|w| w.model.is_none())
+        .filter(move |w| match (&w.model, family) {
+            (None, _) => true,
+            (Some(m), Some(f)) => m == f,
+            (Some(_), None) => false,
+        })
         .filter(move |w| w.reset.is_none_or(|r| r > now))
 }
 
-/// 5h gate headroom (0-1). Only live 5h windows count; a window that is `allowed` at
+/// 5h gate headroom (0-1) for a request of `family`. Only live 5h windows count; a window that is `allowed` at
 /// >=100% is unenforced and ignored; no data means full headroom (1.0).
-pub fn gate_headroom(snap: Option<&RateLimitSnapshot>, now: OffsetDateTime) -> f64 {
+pub fn gate_headroom(
+    snap: Option<&RateLimitSnapshot>,
+    family: Option<&str>,
+    now: OffsetDateTime,
+) -> f64 {
     let Some(snap) = snap else { return 1.0 };
-    let max_util = binding_windows(snap, now)
+    let max_util = binding_windows(snap, family, now)
         .filter(|w| window_duration(&w.key) == Some(Duration::hours(5)))
         .filter(|w| !(w.status == WindowStatus::Allowed && w.utilization >= 1.0))
         .map(|w| w.utilization)
@@ -56,14 +57,18 @@ pub fn gate_headroom(snap: Option<&RateLimitSnapshot>, now: OffsetDateTime) -> f
     }
 }
 
-/// Expiry ordering key from the longest-duration live account-wide window(s) (normally
-/// `7d`): the soonest future reset among those not spent; else `Spent` if any of them is
+/// Expiry ordering key from the longest-duration live binding window(s) (normally
+/// `7d`, or `7d-<family>` when that is the longest): the soonest future reset among those not spent; else `Spent` if any of them is
 /// spent; else `Unknown` (no data, or only already-passed resets).
-pub fn expiry_rank(snap: Option<&RateLimitSnapshot>, now: OffsetDateTime) -> ExpiryRank {
+pub fn expiry_rank(
+    snap: Option<&RateLimitSnapshot>,
+    family: Option<&str>,
+    now: OffsetDateTime,
+) -> ExpiryRank {
     let Some(snap) = snap else {
         return ExpiryRank::Unknown;
     };
-    let timed: Vec<(Duration, &Window)> = binding_windows(snap, now)
+    let timed: Vec<(Duration, &Window)> = binding_windows(snap, family, now)
         .filter_map(|w| window_duration(&w.key).map(|d| (d, w)))
         .collect();
     let Some(longest) = timed.iter().map(|(d, _)| *d).max() else {
