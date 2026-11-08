@@ -355,8 +355,11 @@ async fn sweep_once(provider: &AnthropicProvider) {
         .filter(|a| a.provider == ProviderId::Anthropic)
         .filter(|a| {
             let creds_ok = matches!(provider.reg.read_creds(&a.id), Ok(Some(_)));
-            let needs_login =
-                provider.state.status(&a.id, creds_ok, now) == AccountStatus::NeedsLogin;
+            // An account whose stored state was unreadable (INV §10.9) reads `NeedsLogin` but is
+            // still polled: the poll or its token refresh is what proves it healthy again.
+            let needs_login = provider.state.status(&a.id, creds_ok, now)
+                == AccountStatus::NeedsLogin
+                && !(creds_ok && provider.state.is_unverified(&a.id));
             if needs_login {
                 tracing::debug!(account = %a.id, "usage sweep: skipping account that needs login");
             }
@@ -939,6 +942,60 @@ mod tests {
         );
         assert!(fx.usage_check(&ready.id).unwrap().ok);
         assert!(fx.usage_check(&dead.id).is_none());
+    }
+
+    /// INV §10.9 recovery: an account whose persisted state was corrupt reads `needs_login` but
+    /// the sweeper still polls it, and the successful poll returns it to `ready`.
+    #[tokio::test]
+    async fn sweeper_polls_unverified_account_and_recovers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        paths.ensure().unwrap();
+        let reg = Arc::new(Registry::load(&paths).unwrap());
+        let store = Arc::new(Store::open(&dir.path().join("pooltime.db")).unwrap());
+        store
+            .exec(|c| {
+                c.execute(
+                    "INSERT INTO account_state(account, json) VALUES ('flaky', '{corrupt')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(StateBook::load(store).unwrap());
+        let fx = Fx {
+            _dir: dir,
+            reg,
+            state,
+        };
+        let flaky = fx.account("flaky", ProviderId::Anthropic);
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            fx.state.status(&flaky.id, true, now),
+            AccountStatus::NeedsLogin
+        );
+
+        let fake = fake_usage(|_| ok_usage(20)).await;
+        let handle =
+            spawn_usage_sweeper(Arc::new(fx.provider(&fake.base)), Duration::from_secs(60));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while fake.hits_for("token-flaky") == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "unverified not polled"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while fx.state.is_unverified(&flaky.id) {
+            assert!(std::time::Instant::now() < deadline, "never verified");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
+        assert_eq!(
+            fx.state.status(&flaky.id, true, OffsetDateTime::now_utc()),
+            AccountStatus::Ready
+        );
     }
 
     #[tokio::test]
