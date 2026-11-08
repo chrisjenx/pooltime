@@ -621,13 +621,35 @@ async fn state_survives_restart() {
     assert!(!json.contains("rt-very-secret"));
 }
 
+fn quarantine_rows(store: &Store) -> Vec<(String, Option<String>)> {
+    store
+        .read(|c| {
+            let mut st =
+                c.prepare("SELECT account, json FROM account_state_quarantine ORDER BY rowid")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .unwrap()
+}
+
+/// INV §10.9: a corrupt row may have held the dead-token marker, so it must never read as
+/// Ready. It is quarantined (raw bytes kept), the account fails closed as `needs_login`, and
+/// the next proof of health (a successful poll or refresh, or a re-login) restores it.
 #[tokio::test]
-async fn load_skips_corrupt_rows_without_failing() {
+async fn corrupt_row_fails_closed_and_is_quarantined() {
     let f = fixture();
+    let (good, bad, bad2) = (id("good"), id("bad"), id("bad2"));
+    f.book
+        .mark_rate_limited(&good, t(7200), Some("7d".into()), t(0));
+    f.book.flush().await.unwrap();
     f.store
         .exec(|c| {
             c.execute(
-                "INSERT INTO account_state(account, json) VALUES ('bad', '{not json')",
+                "INSERT INTO account_state(account, json) VALUES ('bad', '{not json dead_refresh_fp')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO account_state(account, json) VALUES ('bad2', '[1,2')",
                 [],
             )?;
             c.execute(
@@ -638,8 +660,117 @@ async fn load_skips_corrupt_rows_without_failing() {
         })
         .await
         .unwrap();
+
+    crate::test_support::ensure_callsites_stay_enabled();
+    let buf = SharedBuf::default();
+    let sub = {
+        let buf = buf.clone();
+        tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || buf.clone())
+            .finish()
+    };
+    let book = tracing::subscriber::with_default(sub, || {
+        StateBook::load_at(f.store.clone(), t(100)).unwrap()
+    });
+    book.flush().await.unwrap();
+
+    // Load succeeded, the healthy row is intact, the corrupt accounts are not routable.
+    assert!(matches!(
+        book.status(&good, true, t(100)),
+        AccountStatus::RateLimited { .. }
+    ));
+    for a in [&bad, &bad2] {
+        assert_eq!(book.status(a, true, t(100)), AccountStatus::NeedsLogin);
+        assert!(book.is_unverified(a));
+    }
+    assert!(!book.is_unverified(&good));
+    // Loading is not a transition.
+    assert!(book.transitions().try_recv().is_err());
+
+    // Raw bytes preserved, one row per corrupt account (the invalid id has no account).
+    assert_eq!(
+        quarantine_rows(&f.store),
+        vec![
+            (
+                "bad".to_string(),
+                Some("{not json dead_refresh_fp".to_string())
+            ),
+            ("bad2".to_string(), Some("[1,2".to_string())),
+        ]
+    );
+
+    // A warn per corrupt account names only the account id, never row content.
+    let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    let mut warned: Vec<String> = text
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|l| l["level"] == "WARN")
+        .filter_map(|l| l["fields"]["account"].as_str().map(str::to_string))
+        .collect();
+    warned.sort();
+    assert_eq!(warned, ["bad", "bad2"], "{text}");
+    assert!(
+        !text.contains("dead_refresh_fp") && !text.contains("[1,2"),
+        "{text}"
+    );
+
+    // The unverified flag is persisted, so a restart keeps failing closed without
+    // quarantining the replacement row again.
+    let book2 = StateBook::load_at(f.store.clone(), t(200)).unwrap();
+    book2.flush().await.unwrap();
+    assert_eq!(book2.status(&bad, true, t(200)), AccountStatus::NeedsLogin);
+    assert_eq!(quarantine_rows(&f.store).len(), 2);
+
+    // Recovery 1: a successful usage poll proves the account healthy.
+    book.replace_poll_snapshot(
+        &bad,
+        snap(
+            vec![win("5h", None, WindowStatus::Allowed, 0.1, Some(t(900)))],
+            t(300),
+        ),
+        t(299),
+    );
+    assert_eq!(book.status(&bad, true, t(300)), AccountStatus::Ready);
+    assert!(!book.is_unverified(&bad));
+    // Recovery 2: a successful token refresh.
+    book.mark_verified(&bad2, t(301));
+    assert_eq!(book.status(&bad2, true, t(301)), AccountStatus::Ready);
+    book.flush().await.unwrap();
+    let book3 = StateBook::load_at(f.store.clone(), t(400)).unwrap();
+    assert_eq!(book3.status(&bad, true, t(400)), AccountStatus::Ready);
+    assert_eq!(book3.status(&bad2, true, t(400)), AccountStatus::Ready);
+    assert_eq!(quarantine_rows(&f.store).len(), 2);
+}
+
+/// A rejected refresh token supersedes the unreadable-state marker (the sweeper then stops
+/// re-trying it); a re-login also clears it.
+#[tokio::test]
+async fn unverified_is_superseded_by_dead_marker_and_relogin() {
+    let f = fixture();
+    f.store
+        .exec(|c| {
+            c.execute(
+                "INSERT INTO account_state(account, json) VALUES ('a', 'x')",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO account_state(account, json) VALUES ('b', 'x')",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
     let book = StateBook::load_at(f.store.clone(), t(0)).unwrap();
-    assert_eq!(book.status(&id("bad"), true, t(0)), AccountStatus::Ready);
+    let (a, b) = (id("a"), id("b"));
+    book.mark_refresh_dead(&a, "rt", t(1));
+    assert!(!book.is_unverified(&a));
+    assert!(book.is_refresh_dead(&a, "rt"));
+    assert_eq!(book.status(&a, true, t(1)), AccountStatus::NeedsLogin);
+    book.clear_refresh_dead(&b, t(1));
+    assert!(!book.is_unverified(&b));
+    assert_eq!(book.status(&b, true, t(1)), AccountStatus::Ready);
 }
 
 #[test]

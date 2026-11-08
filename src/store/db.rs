@@ -183,11 +183,11 @@ mod tests {
     }
 
     #[test]
-    fn open_creates_schema_v1_with_0600() {
+    fn open_creates_current_schema_with_0600() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pooltime.db");
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
         assert_eq!(mode_of(&path), 0o600);
         for suffix in ["-wal", "-shm"] {
             let mut p = path.clone().into_os_string();
@@ -207,6 +207,7 @@ mod tests {
             .unwrap();
         for t in [
             "account_state",
+            "account_state_quarantine",
             "alerts_sent",
             "journal_attempts",
             "journal_requests",
@@ -235,7 +236,41 @@ mod tests {
         let path = dir.path().join("pooltime.db");
         drop(Store::open(&path).unwrap());
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 1);
+        assert_eq!(store.schema_version().unwrap(), 2);
+    }
+
+    #[test]
+    fn v1_database_upgrades_to_v2_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pooltime.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE account_state (account TEXT PRIMARY KEY, json TEXT);
+                 INSERT INTO account_state VALUES ('a', '{}');
+                 CREATE TABLE sessions (key_hash TEXT PRIMARY KEY, account TEXT, provider TEXT, last_seen INTEGER);
+                 CREATE TABLE journal_requests (id TEXT PRIMARY KEY, ts INTEGER, model TEXT, provider TEXT, status INTEGER, outcome TEXT, ttfb_ms INTEGER, total_ms INTEGER, input_tokens INTEGER, output_tokens INTEGER, cache_read INTEGER, cache_write INTEGER, session_hash TEXT);
+                 CREATE TABLE journal_attempts (request_id TEXT, n INTEGER, account TEXT, provider TEXT, outcome TEXT, reason TEXT, upstream_status INTEGER, upstream_request_id TEXT, ms INTEGER);
+                 CREATE TABLE timeline (ts INTEGER, account TEXT, from_state TEXT, to_state TEXT, reason TEXT);
+                 CREATE TABLE usage_samples (ts INTEGER, account TEXT, window TEXT, utilization REAL, reset INTEGER, granularity TEXT);
+                 CREATE TABLE alerts_sent (key TEXT PRIMARY KEY, ts INTEGER);",
+            )
+            .unwrap();
+            c.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 2);
+        let (kept, quarantined): (i64, i64) = store
+            .read(|c| {
+                Ok((
+                    c.query_row("SELECT count(*) FROM account_state", [], |r| r.get(0))?,
+                    c.query_row("SELECT count(*) FROM account_state_quarantine", [], |r| {
+                        r.get(0)
+                    })?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((kept, quarantined), (1, 0));
     }
 
     #[test]

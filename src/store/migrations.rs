@@ -1,7 +1,7 @@
 use anyhow::{bail, Context};
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Schema v1. Timestamps are unix seconds. `utilization` is a 0-1 fraction.
 /// `usage_samples.granularity` is `hourly` (raw) | `daily` | `weekly`.
@@ -67,6 +67,16 @@ CREATE TABLE alerts_sent (
 );
 ";
 
+/// Schema v2 (INV §10.9): raw `account_state` rows that failed to parse are copied here before the
+/// account is reset, so a corrupt row is recoverable by hand. `ts` is unix seconds.
+const V2: &str = "
+CREATE TABLE account_state_quarantine (
+    account TEXT,
+    ts      INTEGER,
+    json    TEXT
+);
+";
+
 /// Bring the database to [`SCHEMA_VERSION`]. Each step runs in one transaction
 /// together with its `user_version` bump.
 pub(super) fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
@@ -78,6 +88,12 @@ pub(super) fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         let tx = conn.transaction()?;
         tx.execute_batch(V1).context("apply schema v1")?;
         tx.pragma_update(None, "user_version", 1)?;
+        tx.commit()?;
+    }
+    if current < 2 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(V2).context("apply schema v2")?;
+        tx.pragma_update(None, "user_version", 2)?;
         tx.commit()?;
     }
     Ok(())

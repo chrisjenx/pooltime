@@ -330,6 +330,7 @@ fn reason_of(v: &AccountView, now: OffsetDateTime) -> Option<String> {
                 CredsInfo::Present { .. } if v.state.dead_refresh_fp.is_some() => {
                     "refresh_token_dead"
                 }
+                CredsInfo::Present { .. } if v.state.unverified => "state_unreadable",
                 CredsInfo::Present {
                     refresh_expires_at: Some(t),
                     ..

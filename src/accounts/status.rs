@@ -296,6 +296,10 @@ pub struct AccountState {
     pub billing_blocked_at: Option<OffsetDateTime>,
     /// `sha256(rejected refresh token)[..16]` (hex); a re-login clears it.
     pub dead_refresh_fp: Option<String>,
+    /// Set when this account's persisted row was unreadable at load (INV §10.9): the lost row may
+    /// have held `dead_refresh_fp`, so the account fails closed (`NeedsLogin`) until a successful
+    /// poll, token refresh, or re-login clears it, or a rejected refresh token replaces it.
+    pub unverified: bool,
     /// Bumped on success only.
     #[serde(with = "time::serde::rfc3339::option")]
     pub last_used_at: Option<OffsetDateTime>,
@@ -319,7 +323,7 @@ fn fingerprint(token: &str) -> String {
 
 /// Derive the status of `s` at `now`.
 fn derive(s: &AccountState, creds_ok: bool, now: OffsetDateTime) -> AccountStatus {
-    if !creds_ok || s.dead_refresh_fp.is_some() {
+    if !creds_ok || s.dead_refresh_fp.is_some() || s.unverified {
         return AccountStatus::NeedsLogin;
     }
     if let Some(until) = s.access_denied_until.filter(|u| *u > now) {
@@ -397,8 +401,12 @@ pub struct StateBook {
 }
 
 impl StateBook {
-    /// Load every persisted row. Rows that fail to parse are skipped with an `error` log
-    /// (the account then starts from empty state) rather than failing startup.
+    /// Load every persisted row. A row that fails to parse never fails startup, but it also
+    /// never yields `Ready` (it may have held the dead-token marker, INV §10.9): its raw text is
+    /// copied to `account_state_quarantine`, the row is replaced with an `unverified` state
+    /// (status `NeedsLogin`, reason `state_unreadable`), and a `warn` names the account id only.
+    /// The account recovers on its next successful usage poll or token refresh (the sweeper still
+    /// polls unverified accounts; `POST /api/v1/accounts/{id}/recheck` forces one) or a re-login.
     pub fn load(store: Arc<Store>) -> anyhow::Result<StateBook> {
         Self::load_at(store, OffsetDateTime::now_utc())
     }
@@ -411,6 +419,7 @@ impl StateBook {
             Ok(rows.collect::<Result<_, _>>()?)
         })?;
         let mut map = HashMap::new();
+        let mut quarantined = Vec::new();
         for (account, json) in rows {
             let Ok(id) = account.parse::<AccountId>() else {
                 tracing::error!(account = %account, "skipping persisted state for invalid account id");
@@ -418,22 +427,58 @@ impl StateBook {
             };
             let state = match json.as_deref().map(serde_json::from_str::<AccountState>) {
                 Some(Ok(s)) => s,
-                Some(Err(e)) => {
-                    tracing::error!(account = %id, error = %e, "corrupt persisted account state; starting empty");
-                    continue;
+                // Unparseable (or NULL): fail closed. Never log the error text or row content.
+                _ => {
+                    tracing::warn!(account = %id, "unreadable persisted account state; quarantined, account needs a health re-check");
+                    quarantined.push((id.clone(), json));
+                    AccountState {
+                        unverified: true,
+                        ..AccountState::default()
+                    }
                 }
-                None => continue,
             };
             map.insert(id, Entry::new(state, now));
         }
         let (tx, _) = broadcast::channel(TRANSITION_CHANNEL_CAPACITY);
-        Ok(StateBook {
+        let book = StateBook {
             store,
             inner: Mutex::new(map),
             tx,
             access_denied_cooldown: DEFAULT_ACCESS_DENIED_COOLDOWN,
             usage_window: DEFAULT_USAGE_WINDOW,
-        })
+        };
+        for (id, raw) in quarantined {
+            book.quarantine(&id, raw, now);
+        }
+        Ok(book)
+    }
+
+    /// Copy the unreadable raw row aside and overwrite it with the account's `unverified` state
+    /// (one transaction on the writer thread), so a restart neither re-quarantines nor forgets.
+    fn quarantine(&self, id: &AccountId, raw: Option<String>, now: OffsetDateTime) {
+        let state = AccountState {
+            unverified: true,
+            ..AccountState::default()
+        };
+        let Ok(json) = serde_json::to_string(&state) else {
+            return;
+        };
+        let (account, ts) = (id.to_string(), now.unix_timestamp());
+        let queued = self.store.submit(move |c| {
+            let tx = c.transaction()?;
+            tx.execute(
+                "INSERT INTO account_state_quarantine(account, ts, json) VALUES (?1, ?2, ?3)",
+                rusqlite::params![account, ts, raw],
+            )?;
+            tx.execute(
+                "UPDATE account_state SET json = ?2 WHERE account = ?1",
+                rusqlite::params![account, json],
+            )?;
+            Ok(tx.commit()?)
+        });
+        if let Err(err) = queued {
+            tracing::error!(account = %id, error = %err, "could not queue account state quarantine");
+        }
     }
 
     /// Cooldown applied by `mark_access_denied` / `mark_billing` (default 1 h).
@@ -616,6 +661,24 @@ impl StateBook {
         let fp = fingerprint(rejected_refresh_token);
         self.mutate(id, now, "refresh_token_dead", |s| {
             s.dead_refresh_fp = Some(fp);
+            s.unverified = false; // the marker is known again; stop re-probing
+        });
+    }
+
+    /// Whether this account's persisted state was unreadable at load and nothing has proven it
+    /// healthy since (INV §10.9). The usage sweeper keeps polling such accounts so they recover.
+    pub fn is_unverified(&self, id: &AccountId) -> bool {
+        self.lock().get(id).is_some_and(|e| e.state.unverified)
+    }
+
+    /// A token refresh or usage poll succeeded: the credentials work, so the account is no
+    /// longer unverified. No-op (no transition, no write) for a verified account.
+    pub fn mark_verified(&self, id: &AccountId, now: OffsetDateTime) {
+        if !self.is_unverified(id) {
+            return;
+        }
+        self.mutate(id, now, "state_verified", |s| {
+            s.unverified = false;
         });
     }
 
@@ -632,6 +695,7 @@ impl StateBook {
     pub fn clear_refresh_dead(&self, id: &AccountId, now: OffsetDateTime) {
         self.mutate(id, now, "refresh_token_replaced", |s| {
             s.dead_refresh_fp = None;
+            s.unverified = false; // a fresh login proves the account healthy
         });
     }
 
@@ -668,6 +732,7 @@ impl StateBook {
         let now = s.updated_at;
         self.mutate(id, now, "poll_snapshot", |st| {
             let snap = replace_snapshot(st.snapshot.as_ref(), s);
+            st.unverified = false; // the token worked: unreadable-state quarantine is over
             st.usage_check = Some(UsageCheck {
                 at: now,
                 ok: true,

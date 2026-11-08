@@ -499,6 +499,8 @@ impl Ctx {
         if self.state.is_refresh_dead(id, &old_rt) {
             self.state.clear_refresh_dead(id, now);
         }
+        // A refresh that works also settles an account whose stored state was unreadable.
+        self.state.mark_verified(id, now);
         tracing::info!(account = %id, request_id = request_id.as_deref().unwrap_or("-"), "openai oauth refresh ok");
         Ok(access)
     }
