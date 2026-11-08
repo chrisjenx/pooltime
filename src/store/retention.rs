@@ -21,7 +21,8 @@ const VACUUM_FREE_FRACTION: f64 = 0.10;
 pub struct PruneReport {
     /// Journal requests deleted for exceeding `journal_days`.
     pub journal_requests_by_age: u64,
-    /// Journal requests deleted (oldest first) to get under `journal_max_mb`.
+    /// Journal requests deleted (oldest first) to get under `journal_max_mb` and
+    /// `journal_max_requests`.
     pub journal_requests_by_size: u64,
     /// Journal attempt rows deleted along with their requests.
     pub journal_attempts: u64,
@@ -94,6 +95,22 @@ fn prune_journal(
     rep.timeline = tx.execute("DELETE FROM timeline WHERE ts < ?1", [cutoff])? as u64;
     rep.alerts_sent = tx.execute("DELETE FROM alerts_sent WHERE ts < ?1", [cutoff])? as u64;
     tx.commit()?;
+
+    // Row ceiling: drop everything older than the newest `journal_max_requests` rows.
+    let max_rows = i64::from(cfg.journal_max_requests);
+    let keep_from = "SELECT id FROM journal_requests ORDER BY ts DESC, id DESC LIMIT -1 OFFSET ?1";
+    let tx = conn.transaction()?;
+    let attempts = tx.execute(
+        &format!("DELETE FROM journal_attempts WHERE request_id IN ({keep_from})"),
+        [max_rows],
+    )?;
+    let requests = tx.execute(
+        &format!("DELETE FROM journal_requests WHERE id IN ({keep_from})"),
+        [max_rows],
+    )?;
+    tx.commit()?;
+    rep.journal_attempts += attempts as u64;
+    rep.journal_requests_by_size += requests as u64;
 
     let cap = i64::from(cfg.journal_max_mb) * MIB;
     while live_bytes(conn)? > cap {

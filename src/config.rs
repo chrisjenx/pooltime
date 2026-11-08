@@ -230,8 +230,13 @@ impl Default for RoutingCfg {
 pub struct RetentionCfg {
     pub logs_days: u32,
     pub logs_max_mb: u32,
+    /// Request journal: rows older than this are pruned (hourly)...
     pub journal_days: u32,
+    /// ...and the oldest rows go first while the database holds more live data than this...
     pub journal_max_mb: u32,
+    /// ...or the journal holds more requests than this (~100k requests is a few weeks of heavy
+    /// use, tens of MB).
+    pub journal_max_requests: u32,
     /// Usage history: hourly rows kept this long, then rolled up to daily...
     pub history_hourly_days: u32,
     /// ...kept this long, then rolled up to weekly...
@@ -247,6 +252,7 @@ impl Default for RetentionCfg {
             logs_max_mb: 50,
             journal_days: 30,
             journal_max_mb: 200,
+            journal_max_requests: 100_000,
             history_hourly_days: 30,
             history_daily_days: 365,
             history_weekly_days: 730,

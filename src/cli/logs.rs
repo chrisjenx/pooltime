@@ -1,8 +1,10 @@
 //! `pooltime logs [--follow] [--request <id>]`: read the daemon's JSON-lines log files
 //! (`<logs>/pooltime.log.<date>`, oldest first) without needing the daemon.
 //!
-//! `--request <id>` keeps the lines carrying that request id anywhere in the event (its own
-//! fields or an enclosing span). Lines are shown as `<time> <LEVEL> <message> k=v…` (`--json`
+//! `--request <id>` prints that request's attempt chain from the daemon's journal
+//! (`GET /api/v1/requests/{id}`, one line per attempt; exit 1 for an unknown id). With
+//! `--follow`, or when no daemon runs, it keeps the log lines carrying that request id anywhere
+//! in the event (its own fields or an enclosing span). Lines are shown as `<time> <LEVEL> <message> k=v…` (`--json`
 //! prints them verbatim); `--follow` keeps polling for new lines, across daily rotation.
 
 use std::fs::File;
@@ -13,6 +15,7 @@ use std::time::Duration;
 use clap::Args;
 use serde_json::Value;
 
+use super::client;
 use crate::config::Paths;
 use crate::logging::LOG_PREFIX;
 
@@ -131,7 +134,129 @@ impl Tail {
     }
 }
 
-pub fn run(paths: &Paths, args: LogsArgs) -> anyhow::Result<i32> {
+/// What the daemon's journal says about one request.
+pub enum ChainLookup {
+    /// `{request, attempts}` from `GET /api/v1/requests/{id}`.
+    Found(Value),
+    NotFound,
+    /// No daemon answers on the configured address.
+    NoDaemon,
+}
+
+/// Ask the running daemon for request `id`'s journal entry.
+pub async fn lookup(paths: &Paths, id: &str) -> anyhow::Result<ChainLookup> {
+    let Some(client) = client::find(paths).await? else {
+        return Ok(ChainLookup::NoDaemon);
+    };
+    Ok(
+        match client
+            .get_authed_opt(&format!("/api/v1/requests/{}", client::seg(id)))
+            .await?
+        {
+            Some(v) => ChainLookup::Found(v),
+            None => ChainLookup::NotFound,
+        },
+    )
+}
+
+fn field(v: &Value, k: &str) -> Option<String> {
+    match &v[k] {
+        Value::Null => None,
+        other => Some(scalar(other)),
+    }
+}
+
+/// The request line, then one line per attempt:
+/// `#n <account> <provider> <outcome> [reason=..] [upstream=<status>] [upstream_id=..] [<ms>ms]`.
+pub fn chain_lines(doc: &Value) -> Vec<String> {
+    let r = &doc["request"];
+    let mut head = format!(
+        "{} {} {} {}",
+        r["id"].as_str().unwrap_or("-"),
+        r["time"].as_str().unwrap_or("-"),
+        field(r, "model")
+            .or_else(|| field(r, "path"))
+            .unwrap_or_else(|| "-".into()),
+        r["outcome"].as_str().unwrap_or("-"),
+    );
+    for (label, key) in [
+        ("status", "status"),
+        ("reason", "reason"),
+        ("provider", "provider"),
+    ] {
+        if let Some(v) = field(r, key) {
+            head.push_str(&format!(" {label}={v}"));
+        }
+    }
+    if let Some(v) = field(r, "ttfb_ms") {
+        head.push_str(&format!(" ttfb={v}ms"));
+    }
+    if let Some(v) = field(r, "total_ms") {
+        head.push_str(&format!(" total={v}ms"));
+    }
+    if let (Some(i), Some(o)) = (field(r, "input_tokens"), field(r, "output_tokens")) {
+        head.push_str(&format!(" tokens={i}/{o}"));
+    }
+    let mut out = vec![head];
+    let attempts = doc["attempts"].as_array().cloned().unwrap_or_default();
+    if attempts.is_empty() {
+        out.push("  (no upstream attempt)".into());
+    }
+    for a in &attempts {
+        let mut l = format!(
+            "  #{} {} {} {}",
+            scalar(&a["n"]),
+            a["account"].as_str().unwrap_or("-"),
+            a["provider"].as_str().unwrap_or("-"),
+            a["outcome"].as_str().unwrap_or("-"),
+        );
+        if let Some(v) = field(a, "reason") {
+            l.push_str(&format!(" reason={v}"));
+        }
+        if let Some(v) = field(a, "upstream_status") {
+            l.push_str(&format!(" upstream={v}"));
+        }
+        if let Some(v) = field(a, "upstream_request_id") {
+            l.push_str(&format!(" upstream_id={v}"));
+        }
+        if let Some(v) = field(a, "ms") {
+            l.push_str(&format!(" {v}ms"));
+        }
+        out.push(l);
+    }
+    out
+}
+
+/// `pooltime logs`. With `--request <id>` (and no `--follow`) the attempt chain comes from the
+/// daemon's journal (exit 1 when the id is unknown); without a running daemon it falls back to
+/// the log lines carrying that id.
+pub async fn run(paths: &Paths, args: LogsArgs) -> anyhow::Result<i32> {
+    if let (Some(id), false) = (args.request.as_deref(), args.follow) {
+        match lookup(paths, id).await? {
+            ChainLookup::Found(v) => {
+                if args.json {
+                    println!("{v}");
+                } else {
+                    for l in chain_lines(&v) {
+                        println!("{l}");
+                    }
+                }
+                return Ok(0);
+            }
+            ChainLookup::NotFound => {
+                eprintln!("no journal entry for request {id}");
+                return Ok(1);
+            }
+            ChainLookup::NoDaemon => {
+                eprintln!("pooltime is not running; showing log lines for {id}");
+            }
+        }
+    }
+    log_lines(paths, args)
+}
+
+/// Print (and with `--follow`, keep printing) the log lines that pass the filter.
+fn log_lines(paths: &Paths, args: LogsArgs) -> anyhow::Result<i32> {
     let request = args.request.as_deref();
     let show = |line: &str| {
         if args.json {
@@ -205,6 +330,29 @@ mod tests {
         assert!(!has_request(&v, "r2"));
         assert!(!matches("plain text", Some("r1")));
         assert!(matches("plain text", None));
+    }
+
+    #[test]
+    fn chain_is_one_line_per_attempt() {
+        let doc = json!({
+            "request": {"id": "req_1", "time": "2026-11-08T10:00:00Z", "model": "claude-sonnet-5",
+                        "outcome": "completed", "status": 200, "reason": null, "provider": "anthropic",
+                        "ttfb_ms": 120, "total_ms": 900, "input_tokens": 3, "output_tokens": 4},
+            "attempts": [
+                {"n": 1, "account": "a1", "provider": "anthropic", "outcome": "failover",
+                 "reason": "quota", "upstream_status": 429, "upstream_request_id": "req_u1", "ms": 40},
+                {"n": 2, "account": "a2", "provider": "anthropic", "outcome": "completed",
+                 "reason": null, "upstream_status": 200, "upstream_request_id": null, "ms": 80}
+            ]
+        });
+        assert_eq!(
+            chain_lines(&doc),
+            [
+                "req_1 2026-11-08T10:00:00Z claude-sonnet-5 completed status=200 provider=anthropic ttfb=120ms total=900ms tokens=3/4",
+                "  #1 a1 anthropic failover reason=quota upstream=429 upstream_id=req_u1 40ms",
+                "  #2 a2 anthropic completed upstream=200 80ms",
+            ]
+        );
     }
 
     #[test]

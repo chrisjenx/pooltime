@@ -348,6 +348,7 @@ pub fn inbound(body: &serde_json::Value, headers: HeaderMap) -> InboundRequest {
         session_user_id: None,
         affinity: true,
         request_id: "req_testinbound".into(),
+        journal: Default::default(),
     }
 }
 

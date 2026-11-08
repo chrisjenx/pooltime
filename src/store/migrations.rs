@@ -1,7 +1,7 @@
 use anyhow::{bail, Context};
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Schema v1. Timestamps are unix seconds. `utilization` is a 0-1 fraction.
 /// `usage_samples.granularity` is `hourly` (raw) | `daily` | `weekly`.
@@ -77,6 +77,13 @@ CREATE TABLE account_state_quarantine (
 );
 ";
 
+/// Schema v3 (spec §6/§16, Task F4): the request journal also keeps the inbound `path` (query
+/// string stripped; set for unknown endpoints) and the request-level classified `reason`.
+const V3: &str = "
+ALTER TABLE journal_requests ADD COLUMN path TEXT;
+ALTER TABLE journal_requests ADD COLUMN reason TEXT;
+";
+
 /// Bring the database to [`SCHEMA_VERSION`]. Each step runs in one transaction
 /// together with its `user_version` bump.
 pub(super) fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
@@ -94,6 +101,12 @@ pub(super) fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         let tx = conn.transaction()?;
         tx.execute_batch(V2).context("apply schema v2")?;
         tx.pragma_update(None, "user_version", 2)?;
+        tx.commit()?;
+    }
+    if current < 3 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(V3).context("apply schema v3")?;
+        tx.pragma_update(None, "user_version", 3)?;
         tx.commit()?;
     }
     Ok(())

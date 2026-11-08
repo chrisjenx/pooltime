@@ -4,6 +4,7 @@ use crate::accounts::AccountId;
 use crate::errors::TransportKind;
 use crate::providers::ProviderId;
 use crate::routing::reserve::Reservation;
+use crate::store::journal::Journal;
 
 /// How a committed stream ended (the `outcome` field of the `<provider> stream finished` event).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,15 +40,16 @@ impl StreamOutcome {
 
 /// Owned by the task pumping a committed stream. Dropping it (normal end, failure, client
 /// disconnect, task abort or panic) emits one structured `<label> stream finished` event (request
-/// id, account, outcome; label `anthropic` / `codex`) and releases the in-flight reservation.
-///
-/// TODO(F4): also write the journal row here once the journal exists.
+/// id, account, outcome; label `anthropic` / `codex`), reports the stream end to the request's
+/// journal entry (whose clone it holds, so the row is written once the stream is over) and
+/// releases the in-flight reservation.
 pub struct StreamGuard {
     reservation: Option<Reservation>,
     provider: ProviderId,
     account: AccountId,
     request_id: String,
     outcome: StreamOutcome,
+    journal: Journal,
 }
 
 impl StreamGuard {
@@ -57,6 +59,7 @@ impl StreamGuard {
         reservation: Option<Reservation>,
         account: AccountId,
         request_id: String,
+        journal: Journal,
     ) -> Self {
         StreamGuard {
             reservation,
@@ -64,6 +67,7 @@ impl StreamGuard {
             account,
             request_id,
             outcome: StreamOutcome::Error,
+            journal,
         }
     }
 
@@ -97,6 +101,7 @@ impl Drop for StreamGuard {
                 "{label} stream finished"
             ),
         }
+        self.journal.stream_end(outcome);
         drop(self.reservation.take());
     }
 }

@@ -280,6 +280,17 @@ td.barcell { width: 34%; }
 .form-grid { display: grid; grid-template-columns: 200px 120px 1fr; gap: 8px 12px; align-items: center; }
 .form-grid .help { color: var(--muted); font-size: 12.5px; }
 
+/* ---- requests / events ---- */
+
+tr.clickable { cursor: pointer; }
+tr.clickable:hover, tr.clickable.open { background: var(--track); }
+tr.clickable:focus-visible { outline: 2px solid var(--info); outline-offset: -2px; }
+td.num.bad { color: var(--bad); }
+tr.chain-row > td { background: var(--track); padding: 6px 12px 10px; }
+.chain p { margin: 0 0 6px; font-size: 12.5px; }
+.chain ol { margin: 0; padding-left: 22px; }
+.chain li { margin: 3px 0; }
+
 /* ---- dialog ---- */
 
 dialog {

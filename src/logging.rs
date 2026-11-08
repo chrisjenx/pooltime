@@ -2,11 +2,13 @@
 
 use std::io::{self, IsTerminal};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use http::HeaderMap;
 use rand::RngExt;
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter};
@@ -182,14 +184,103 @@ pub fn redact_headers(h: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Replace the value of any `code=` / `state=` parameter (at string start or after `?`, `&`, `#`).
+/// A URI (or path and query) safe to log: `code=` / `state=` / `k=` query values masked.
+pub fn redact_uri(uri: &str) -> String {
+    redact_oauth_params(uri)
+}
+
+/// One debug-mode header line: `name: value` pairs after [`redact_headers`], joined by `; `.
+pub fn debug_headers(h: &HeaderMap) -> String {
+    redact_headers(h)
+        .into_iter()
+        .map(|(k, v)| format!("{k}: {v}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Source of "now" for [`DebugMode`] (injectable for tests).
+pub type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
+
+/// Longest debug-mode window, in minutes.
+pub const DEBUG_MAX_MINUTES: u32 = 60;
+
+/// Time-boxed debug mode (spec §6/§16): while active, inbound and upstream request/response
+/// *headers* are logged at `info` with the request id, redacted by [`redact_headers`]. Never
+/// bodies. Held in memory only, so a restart ends it. Cheap to clone (shared state).
+#[derive(Clone)]
+pub struct DebugMode {
+    until: Arc<Mutex<Option<OffsetDateTime>>>,
+    clock: Clock,
+}
+
+impl Default for DebugMode {
+    fn default() -> Self {
+        DebugMode::with_clock(Arc::new(OffsetDateTime::now_utc))
+    }
+}
+
+impl std::fmt::Debug for DebugMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DebugMode")
+            .field("until", &self.until())
+            .finish()
+    }
+}
+
+impl DebugMode {
+    pub fn with_clock(clock: Clock) -> DebugMode {
+        DebugMode {
+            until: Arc::new(Mutex::new(None)),
+            clock,
+        }
+    }
+
+    pub fn now(&self) -> OffsetDateTime {
+        (self.clock)()
+    }
+
+    /// Turn on for `minutes` (1..=60) from now; returns the expiry. `None` when out of range.
+    pub fn enable(&self, minutes: u32) -> Option<OffsetDateTime> {
+        if !(1..=DEBUG_MAX_MINUTES).contains(&minutes) {
+            return None;
+        }
+        let until = self.now() + time::Duration::minutes(i64::from(minutes));
+        *self.until.lock().unwrap_or_else(|e| e.into_inner()) = Some(until);
+        tracing::info!(until = %until, "debug mode on: request/response headers are logged (redacted)");
+        Some(until)
+    }
+
+    pub fn disable(&self) {
+        let was = self.until.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if was.is_some() {
+            tracing::info!("debug mode off");
+        }
+    }
+
+    /// The expiry while active, else `None` (an expired window reads as off).
+    pub fn until(&self) -> Option<OffsetDateTime> {
+        let now = self.now();
+        let mut g = self.until.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_some_and(|u| u <= now) {
+            *g = None;
+        }
+        *g
+    }
+
+    pub fn active(&self) -> bool {
+        self.until().is_some()
+    }
+}
+
+/// Replace the value of any `code=` / `state=` parameter, and the dashboard's `k=` (management
+/// key), at string start or after `?`, `&`, `#`.
 fn redact_oauth_params(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     let mut at_param_start = true;
     let mut rest = v;
     while !rest.is_empty() {
         if at_param_start {
-            let hit = ["code=", "state="]
+            let hit = ["code=", "state=", "k="]
                 .into_iter()
                 .find_map(|key| rest.strip_prefix(key).map(|after| (key, after)));
             if let Some((key, after)) = hit {
@@ -277,6 +368,23 @@ mod tests {
         assert_eq!(
             get(&r, "location"),
             "/x?a=1&state=<redacted>#code=<redacted>"
+        );
+    }
+
+    #[test]
+    fn debug_header_line_and_uri_are_redacted() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_static("Bearer tok"));
+        h.insert("chatgpt-account-id", HeaderValue::from_static("acct-9"));
+        h.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        let line = debug_headers(&h);
+        assert!(line.contains("authorization: <redacted>"), "{line}");
+        assert!(line.contains("chatgpt-account-id: <redacted>"), "{line}");
+        assert!(line.contains("anthropic-version: 2023-06-01"), "{line}");
+        assert!(!line.contains("tok") && !line.contains("acct-9"));
+        assert_eq!(
+            redact_uri("/cb?code=abc&state=xyz&x=1&k=mgmtkey"),
+            "/cb?code=<redacted>&state=<redacted>&x=1&k=<redacted>"
         );
     }
 

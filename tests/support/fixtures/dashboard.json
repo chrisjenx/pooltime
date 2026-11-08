@@ -185,5 +185,65 @@
     "logs_bytes": 4194304
   },
   "version": "0.1.0",
-  "now": "2026-11-07T12:00:00Z"
+  "now": "2026-11-07T12:00:00Z",
+  "journal": {
+    "requests": [
+      { "id": "req_fx5completedstreamaa", "ts": 1794052740, "time": "2026-11-07T11:59:00Z", "path": "/v1/messages", "model": "claude-opus-4-5", "provider": "anthropic", "status": 200, "outcome": "completed", "reason": null, "ttfb_ms": 840, "total_ms": 41250, "input_tokens": 1820, "output_tokens": 2310, "cache_read": 96000, "cache_write": 1200, "session_hash": "3fa2c91d0b7e4a65", "attempts": 2, "account": "personal" },
+      { "id": "req_fx4crossprovidersbb", "ts": 1794052620, "time": "2026-11-07T11:57:00Z", "path": "/v1/messages", "model": "claude-sonnet-4-5", "provider": "openai", "status": 200, "outcome": "completed", "reason": null, "ttfb_ms": 2210, "total_ms": 18400, "input_tokens": 900, "output_tokens": 640, "cache_read": 0, "cache_write": 0, "session_hash": "3fa2c91d0b7e4a65", "attempts": 2, "account": "codex-1" },
+      { "id": "req_fx3idletimeoutcccc", "ts": 1794052500, "time": "2026-11-07T11:55:00Z", "path": "/v1/messages", "model": "claude-opus-4-5", "provider": "anthropic", "status": 200, "outcome": "idle_timeout", "reason": "stream:idle_timeout", "ttfb_ms": 1310, "total_ms": 612000, "input_tokens": null, "output_tokens": null, "cache_read": null, "cache_write": null, "session_hash": "9c01d7e2aa5b3f18", "attempts": 1, "account": "personal" },
+      { "id": "req_fx2cancelleddddddd", "ts": 1794052380, "time": "2026-11-07T11:53:00Z", "path": "/v1/messages", "model": "claude-opus-4-5", "provider": "anthropic", "status": 200, "outcome": "client_cancelled", "reason": null, "ttfb_ms": 950, "total_ms": 7300, "input_tokens": null, "output_tokens": null, "cache_read": null, "cache_write": null, "session_hash": "9c01d7e2aa5b3f18", "attempts": 1, "account": "team-1" },
+      { "id": "req_fx1unknownpatheeee", "ts": 1794052200, "time": "2026-11-07T11:50:00Z", "path": "/v1/messages/count_tokens", "model": null, "provider": null, "status": 404, "outcome": "error", "reason": "unknown_path", "ttfb_ms": 0, "total_ms": 0, "input_tokens": null, "output_tokens": null, "cache_read": null, "cache_write": null, "session_hash": null, "attempts": 0, "account": null }
+    ],
+    "details": {
+      "req_fx5completedstreamaa": {
+        "request": { "id": "req_fx5completedstreamaa", "ts": 1794052740, "time": "2026-11-07T11:59:00Z", "path": "/v1/messages", "model": "claude-opus-4-5", "provider": "anthropic", "status": 200, "outcome": "completed", "reason": null, "ttfb_ms": 840, "total_ms": 41250, "input_tokens": 1820, "output_tokens": 2310, "cache_read": 96000, "cache_write": 1200, "session_hash": "3fa2c91d0b7e4a65" },
+        "attempts": [
+          { "n": 1, "account": "team-2", "provider": "anthropic", "outcome": "failover", "reason": "quota", "upstream_status": 429, "upstream_request_id": "req_011CVfx0aaaa", "ms": 310 },
+          { "n": 2, "account": "personal", "provider": "anthropic", "outcome": "completed", "reason": null, "upstream_status": 200, "upstream_request_id": "req_011CVfx0bbbb", "ms": 520 }
+        ]
+      },
+      "req_fx4crossprovidersbb": {
+        "request": { "id": "req_fx4crossprovidersbb", "ts": 1794052620, "time": "2026-11-07T11:57:00Z", "path": "/v1/messages", "model": "claude-sonnet-4-5", "provider": "openai", "status": 200, "outcome": "completed", "reason": null, "ttfb_ms": 2210, "total_ms": 18400, "input_tokens": 900, "output_tokens": 640, "cache_read": 0, "cache_write": 0, "session_hash": "3fa2c91d0b7e4a65" },
+        "attempts": [
+          { "n": 1, "account": "personal", "provider": "anthropic", "outcome": "error", "reason": "overloaded", "upstream_status": 529, "upstream_request_id": "req_011CVfx0cccc", "ms": 1500 },
+          { "n": 2, "account": "codex-1", "provider": "openai", "outcome": "completed", "reason": null, "upstream_status": 200, "upstream_request_id": "a1b2c3d4-0000", "ms": 690 }
+        ]
+      },
+      "req_fx3idletimeoutcccc": {
+        "request": { "id": "req_fx3idletimeoutcccc", "ts": 1794052500, "time": "2026-11-07T11:55:00Z", "path": "/v1/messages", "model": "claude-opus-4-5", "provider": "anthropic", "status": 200, "outcome": "idle_timeout", "reason": "stream:idle_timeout", "ttfb_ms": 1310, "total_ms": 612000, "input_tokens": null, "output_tokens": null, "cache_read": null, "cache_write": null, "session_hash": "9c01d7e2aa5b3f18" },
+        "attempts": [
+          { "n": 1, "account": "personal", "provider": "anthropic", "outcome": "idle_timeout", "reason": null, "upstream_status": 200, "upstream_request_id": "req_011CVfx0dddd", "ms": 1290 }
+        ]
+      },
+      "req_fx2cancelleddddddd": {
+        "request": { "id": "req_fx2cancelleddddddd", "ts": 1794052380, "time": "2026-11-07T11:53:00Z", "path": "/v1/messages", "model": "claude-opus-4-5", "provider": "anthropic", "status": 200, "outcome": "client_cancelled", "reason": null, "ttfb_ms": 950, "total_ms": 7300, "input_tokens": null, "output_tokens": null, "cache_read": null, "cache_write": null, "session_hash": "9c01d7e2aa5b3f18" },
+        "attempts": [
+          { "n": 1, "account": "team-1", "provider": "anthropic", "outcome": "client_cancelled", "reason": null, "upstream_status": 200, "upstream_request_id": "req_011CVfx0eeee", "ms": 930 }
+        ]
+      },
+      "req_fx1unknownpatheeee": {
+        "request": { "id": "req_fx1unknownpatheeee", "ts": 1794052200, "time": "2026-11-07T11:50:00Z", "path": "/v1/messages/count_tokens", "model": null, "provider": null, "status": 404, "outcome": "error", "reason": "unknown_path", "ttfb_ms": 0, "total_ms": 0, "input_tokens": null, "output_tokens": null, "cache_read": null, "cache_write": null, "session_hash": null },
+        "attempts": []
+      }
+    },
+    "timeline": [
+      { "ts": 1794052440, "time": "2026-11-07T11:54:00Z", "account": "team-2", "from_state": "ready", "to_state": "rate_limited", "reason": "quota" },
+      { "ts": 1794049200, "time": "2026-11-07T11:00:00Z", "account": "org-seat", "from_state": "ready", "to_state": "access_denied", "reason": "access_denied" },
+      { "ts": 1794038400, "time": "2026-11-07T08:00:00Z", "account": "lapsed", "from_state": "ready", "to_state": "billing", "reason": "billing" },
+      { "ts": 1793952000, "time": "2026-11-06T08:00:00Z", "account": "spare", "from_state": "expiring", "to_state": "needs_login", "reason": "refresh_token_dead" },
+      { "ts": 1793944800, "time": "2026-11-06T06:00:00Z", "account": "team-1", "from_state": "ready", "to_state": "expiring", "reason": "refresh_token_expiring" }
+    ],
+    "stats": {
+      "window_secs": 86400,
+      "since": "2026-11-06T12:00:00Z",
+      "accounts": [
+        { "account": "codex-1", "provider": "openai", "attempts": 41, "errors": 1, "error_rate": 0.024390243902439025, "p50_ms": 640, "p95_ms": 2100 },
+        { "account": "personal", "provider": "anthropic", "attempts": 312, "errors": 9, "error_rate": 0.028846153846153848, "p50_ms": 610, "p95_ms": 1900 },
+        { "account": "team-1", "provider": "anthropic", "attempts": 128, "errors": 2, "error_rate": 0.015625, "p50_ms": 700, "p95_ms": 2400 },
+        { "account": "team-2", "provider": "anthropic", "attempts": 57, "errors": 14, "error_rate": 0.24561403508771928, "p50_ms": 380, "p95_ms": 1300 }
+      ],
+      "journal_requests": 18342,
+      "storage": { "home": "/Users/example/.pooltime", "db_bytes": 13631488, "logs_bytes": 4194304 }
+    }
+  }
 }

@@ -113,6 +113,33 @@ impl Client {
         self.send(reqwest::Method::DELETE, path, None, true).await
     }
 
+    /// An authenticated `GET`; `None` on 404.
+    pub async fn get_authed_opt(&self, path: &str) -> anyhow::Result<Option<Value>> {
+        let resp = self
+            .http
+            .get(format!("{}{path}", self.base()))
+            .bearer_auth(self.mgmt_key()?)
+            .send()
+            .await
+            .with_context(|| format!("calling pooltime at {}", self.addr))?;
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .context("reading the pooltime response")?;
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if status.is_success() {
+            return Ok(Some(v));
+        }
+        match v["error"]["message"].as_str() {
+            Some(m) => bail!("{m}"),
+            None => bail!("pooltime answered HTTP {status}"),
+        }
+    }
+
     async fn send(
         &self,
         method: reqwest::Method,

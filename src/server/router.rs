@@ -23,8 +23,11 @@ use serde_json::Value;
 
 use super::inference::{self, RequestId, REQUEST_ID_HEADER};
 use super::{auth, dashboard, health, mgmt, models_route, AppState, PendingGuard};
-use crate::logging::new_request_id;
+use crate::logging::{debug_headers, new_request_id, redact_uri};
 use crate::providers::anthropic::anthropic_error;
+use crate::store::journal::Journal;
+use axum::Extension;
+use time::OffsetDateTime;
 
 /// Largest accepted request body (Claude Code sends whole conversations).
 pub const BODY_LIMIT: usize = 64 * 1024 * 1024;
@@ -61,16 +64,48 @@ pub fn routes(state: Arc<AppState>) -> Router {
 /// accounting, the request id, then the Host/Origin guard.
 pub fn finish(app: Router, state: Arc<AppState>) -> Router {
     app.layer(from_fn_with_state(state.clone(), auth::host_origin_guard))
-        .layer(axum::middleware::from_fn(assign_request_id))
+        .layer(from_fn_with_state(state.clone(), assign_request_id))
         .layer(from_fn_with_state(state, track_pending))
 }
 
 /// Give every request an id (request extension [`RequestId`]) and return it as the
 /// `x-pooltime-request-id` header on every response, errors and 404s included.
-async fn assign_request_id(mut req: Request, next: Next) -> Response {
+///
+/// In debug mode (`/api/v1/debug`) the inbound request and response *headers* are logged at
+/// `info` with the request id, redacted ([`redact_headers`](crate::logging::redact_headers));
+/// the query string is redacted too. Never bodies.
+async fn assign_request_id(
+    State(app): State<Arc<AppState>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     let id = new_request_id();
     req.extensions_mut().insert(RequestId(id.clone()));
+    let debug = app.debug.active();
+    if debug {
+        let uri = req.uri().path_and_query().map_or_else(
+            || req.uri().path().to_string(),
+            |pq| pq.as_str().to_string(),
+        );
+        tracing::info!(
+            request_id = %id,
+            direction = "inbound_request",
+            method = %req.method(),
+            uri = %redact_uri(&uri),
+            headers = %debug_headers(req.headers()),
+            "debug headers"
+        );
+    }
     let mut resp = next.run(req).await;
+    if debug {
+        tracing::info!(
+            request_id = %id,
+            direction = "inbound_response",
+            status = resp.status().as_u16(),
+            headers = %debug_headers(resp.headers()),
+            "debug headers"
+        );
+    }
     if let Ok(v) = HeaderValue::from_str(&id) {
         resp.headers_mut().insert(REQUEST_ID_HEADER, v);
     }
@@ -81,8 +116,19 @@ async fn assign_request_id(mut req: Request, next: Next) -> Response {
 
 /// Unknown endpoint: Anthropic-shaped 404. Logs method and path only, never the query string
 /// (it can carry `code=`/`state=`/keys).
-async fn not_found(method: Method, uri: Uri) -> Response {
+/// Journaled as an `error` with reason `unknown_path` and the path (so new Claude Code endpoints
+/// such as `count_tokens` are visible).
+async fn not_found(
+    State(app): State<Arc<AppState>>,
+    method: Method,
+    uri: Uri,
+    id: Option<Extension<RequestId>>,
+) -> Response {
     tracing::info!(method = %method, path = uri.path(), "unknown endpoint");
+    let id = id.map_or_else(new_request_id, |Extension(r)| r.0);
+    let journal = Journal::start(app.store.clone(), &id, OffsetDateTime::now_utc());
+    journal.set_path(uri.path());
+    journal.respond(404, "error", Some("unknown_path".into()));
     anthropic_error(
         404,
         "not_found_error",

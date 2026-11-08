@@ -19,6 +19,7 @@ use crate::accounts::{AccountMeta, RateLimitSnapshot, StateBook, TokenUsage};
 use crate::errors::{FailReason, RefreshErrorKind, TransportKind};
 use crate::models::{Route, RouteDef};
 use crate::routing::reserve::Reservation;
+use crate::store::journal::Journal;
 use crate::upstream::{Limits, Upstream};
 
 /// Resolves once the response stream ends, with the final token usage. The
@@ -38,6 +39,9 @@ pub struct InboundRequest {
     /// requests, which never read or write per-session state.
     pub affinity: bool,
     pub request_id: String,
+    /// The request's live journal entry. Providers note each upstream answer on it
+    /// ([`Journal::note_upstream`]); a committed stream's guard reports the stream end.
+    pub journal: Journal,
 }
 
 /// Everything one upstream attempt needs.
