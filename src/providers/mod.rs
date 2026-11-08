@@ -139,6 +139,8 @@ pub trait Provider: Send + Sync {
     async fn refresh_live_models(&self) -> anyhow::Result<Vec<serde_json::Value>> {
         self.live_models().await
     }
+    /// Wait for the token refreshes running now (shutdown; bounded by the caller).
+    async fn drain_refreshes(&self) {}
 }
 
 /// True when an upstream 403/error message indicates an entitlement problem

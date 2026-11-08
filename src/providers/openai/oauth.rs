@@ -300,6 +300,18 @@ impl OpenAiProvider {
         map.insert(key, fut.clone());
         fut
     }
+
+    /// Wait for the refreshes running now (shutdown: a rotated refresh token must reach disk).
+    pub async fn drain_refreshes(&self) {
+        let running: Vec<InFlight> = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        futures_util::future::join_all(running).await;
+    }
 }
 
 /// `Some(result)` when no refresh is needed (or possible) for `creds`.

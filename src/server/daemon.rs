@@ -31,6 +31,8 @@ use crate::upstream::Upstream;
 
 /// How often idle sticky-session pins are dropped.
 const SESSION_PRUNE_EVERY: Duration = Duration::from_secs(60);
+/// How long shutdown waits for in-flight token refreshes.
+const REFRESH_DRAIN: Duration = Duration::from_secs(30);
 /// How often journal/usage-history retention runs.
 const RETENTION_EVERY: Duration = Duration::from_secs(60 * 60);
 
@@ -198,10 +200,20 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
 
     // run/status-cache.json for `pooltime statusline` (spec §16).
     let cache = crate::claude_code::statusline::spawn_status_cache(app.clone());
-    let outcome = serve_until_signal(app).await;
+    let outcome = serve_until_signal(app.clone()).await;
     drop(tasks);
     // Status lines say `pool down` right away instead of once the cache goes stale.
     cache.shutdown().await;
+    // A refresh that already spent a rotating refresh token must get the new one to disk.
+    let refreshes = app.providers.values().map(|p| {
+        let p = p.clone();
+        Box::pin(async move { p.drain_refreshes().await }) as _
+    });
+    if !drain_within(refreshes.collect(), REFRESH_DRAIN).await {
+        tracing::warn!("token refreshes still running at exit");
+    }
+    // Journal, state and session writes queued so far.
+    flush_store(&app.store).await;
     match outcome? {
         Outcome::Drained => tracing::info!("pooltime stopped"),
         Outcome::TimedOut | Outcome::Forced => {
@@ -209,6 +221,23 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Wait for every future in `futs`, at most `within`. False when the bound cut it short.
+async fn drain_within(
+    futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+    within: Duration,
+) -> bool {
+    tokio::time::timeout(within, futures_util::future::join_all(futs))
+        .await
+        .is_ok()
+}
+
+/// Wait until every write queued on the store so far is on disk (the writer is FIFO).
+async fn flush_store(store: &Store) {
+    if let Err(e) = store.exec(|_| Ok(())).await {
+        tracing::warn!(error = %format!("{e:#}"), "could not flush the database writes");
+    }
 }
 
 /// Aborts the background tasks when dropped (on shutdown or a failed bind).
@@ -291,5 +320,33 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn refresh_drain_is_bounded() {
+        let started = tokio::time::Instant::now();
+        let stuck = std::future::pending::<()>();
+        let done = drain_within(vec![Box::pin(stuck) as _], Duration::from_millis(50)).await;
+        assert!(!done);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let quick = async {};
+        assert!(drain_within(vec![Box::pin(quick) as _], Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn store_flush_waits_for_queued_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("pooltime.db")).unwrap();
+        let written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let w = written.clone();
+        store
+            .submit(move |_| {
+                std::thread::sleep(Duration::from_millis(200));
+                w.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        flush_store(&store).await;
+        assert!(written.load(Ordering::SeqCst), "queued write lost at exit");
     }
 }

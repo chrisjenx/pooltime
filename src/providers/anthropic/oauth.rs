@@ -144,6 +144,18 @@ impl AnthropicProvider {
         fut
     }
 
+    /// Wait for the refreshes running now (shutdown: a rotated refresh token must reach disk).
+    pub async fn drain_refreshes(&self) {
+        let running: Vec<InFlight> = self
+            .inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        futures_util::future::join_all(running).await;
+    }
+
     fn gate(&self, id: &AccountId) -> Arc<tokio::sync::Mutex<()>> {
         let mut m = self.gates.lock().unwrap_or_else(|e| e.into_inner());
         m.entry(id.clone()).or_default().clone()
@@ -1049,6 +1061,31 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(p.inflight.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_refreshes_waits_for_the_running_refresh() {
+        let fx = fx(creds_expiring_in(10));
+        let fake = fake_token_endpoint(|_| Reply {
+            delay: Duration::from_millis(300),
+            ..reply(200, &ok_body("drained", Some("rt-drained"), 3600))
+        })
+        .await;
+        let p = Arc::new(fx.provider(&fake.url));
+        let caller = {
+            let (p, meta) = (p.clone(), fx.meta.clone());
+            tokio::spawn(async move { p.access_token(&meta, false).await })
+        };
+        for _ in 0..200 {
+            if fake.hits.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        caller.abort();
+        // Shutdown: the rotated refresh token is on disk once the drain returns.
+        p.drain_refreshes().await;
+        assert_eq!(fx.creds().refresh_token.as_deref(), Some("rt-drained"));
     }
 
     #[tokio::test]
