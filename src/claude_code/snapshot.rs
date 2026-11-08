@@ -42,6 +42,10 @@ pub(crate) struct Snapshot {
     /// the wrapper (`null` = there was none); see [`super::statusline`].
     /// Preserved across rewrites.
     pub statusline_prior: Value,
+    /// Whether `connect --mcp` registered the pool in the profile's `.claude.json`; the
+    /// background sync only opens that file to refresh the entry when this is set. Written only
+    /// when true.
+    pub mcp_registered: bool,
     /// Any other top-level fields, kept verbatim.
     extra: Map<String, Value>,
 }
@@ -52,6 +56,7 @@ impl std::fmt::Debug for Snapshot {
             .field("managed", &self.managed)
             .field("prior_keys", &self.prior.keys().collect::<Vec<_>>())
             .field("has_statusline_prior", &!self.statusline_prior.is_null())
+            .field("mcp_registered", &self.mcp_registered)
             .field("extra_keys", &self.extra.keys().collect::<Vec<_>>())
             .finish()
     }
@@ -63,6 +68,7 @@ impl Snapshot {
             managed: true,
             prior,
             statusline_prior: Value::Null,
+            mcp_registered: false,
             extra: Map::new(),
         }
     }
@@ -77,10 +83,12 @@ impl Snapshot {
             _ => Map::new(),
         };
         let statusline_prior = obj.remove("statusline_prior").unwrap_or(Value::Null);
+        let mcp_registered = obj.remove("mcp_registered").and_then(|v| v.as_bool()) == Some(true);
         Some(Snapshot {
             managed,
             prior,
             statusline_prior,
+            mcp_registered,
             extra: obj,
         })
     }
@@ -90,6 +98,9 @@ impl Snapshot {
         obj.insert("managed".into(), Value::Bool(self.managed));
         obj.insert("prior".into(), Value::Object(self.prior.clone()));
         obj.insert("statusline_prior".into(), self.statusline_prior.clone());
+        if self.mcp_registered {
+            obj.insert("mcp_registered".into(), Value::Bool(true));
+        }
         let mut out = serde_json::to_vec_pretty(&Value::Object(obj)).expect("json value");
         out.push(b'\n');
         out

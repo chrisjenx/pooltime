@@ -42,7 +42,7 @@ use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, MethodRouter};
 use axum::{Json, Router};
-use http::header::{AUTHORIZATION, CACHE_CONTROL, COOKIE, SET_COOKIE};
+use http::header::{CACHE_CONTROL, COOKIE, SET_COOKIE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use rand::RngExt;
 use rusqlite::OptionalExtension;
@@ -51,7 +51,7 @@ use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use super::auth::keys_match;
+use super::auth::{bearer_of, keys_match};
 use super::journal_api;
 use super::models_route::build_listing;
 use super::router::{method_not_allowed, read_json_limited};
@@ -147,15 +147,7 @@ pub(crate) fn authorized(h: &HeaderMap, key: &str) -> bool {
     if key.is_empty() {
         return false; // never "open": an unset key authorizes nothing
     }
-    let bearer = h
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            let (scheme, rest) = v.split_once(' ')?;
-            scheme.eq_ignore_ascii_case("bearer").then_some(rest)
-        })
-        .is_some_and(|k| keys_match(k, key));
-    if bearer {
+    if bearer_of(h).is_some_and(|k| keys_match(k, key)) {
         return true;
     }
     let token = session_token(key);
@@ -1638,6 +1630,19 @@ impl SignIns {
         });
     }
 
+    /// End every still-pending sign-in of `account` (a new one replaces them), so repeated
+    /// starts never pile up callback listeners. Finished ones stay readable.
+    fn supersede_account(&self, account: &AccountId) {
+        let pending: Vec<SignInHandle> = lock(&self.inner)
+            .values()
+            .filter(|e| &e.account == account && e.result.is_none())
+            .map(|e| e.handle.clone())
+            .collect();
+        for h in pending {
+            h.supersede();
+        }
+    }
+
     fn handle(&self, id: &str) -> Option<SignInHandle> {
         lock(&self.inner).get(id).map(|e| e.handle.clone())
     }
@@ -1742,6 +1747,7 @@ pub(crate) async fn login(
         (None, p) => p.unwrap_or(ProviderId::Anthropic),
     };
     let created = existing.is_none();
+    app.signins.supersede_account(&id);
     if created {
         let (a, rid) = (app.clone(), id.clone());
         let saved = blocking(move || a.registry.upsert(AccountMeta::new(rid, provider))).await;

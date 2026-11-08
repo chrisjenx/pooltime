@@ -36,15 +36,19 @@ pub async fn require_proxy_key(
 /// The credentials a client sent: the bearer token (scheme matched case-insensitively) and
 /// `x-api-key`.
 fn presented_keys(h: &HeaderMap) -> impl Iterator<Item = &str> {
-    let bearer = h
-        .get(AUTHORIZATION)
+    let api_key = h.get("x-api-key").and_then(|v| v.to_str().ok());
+    bearer_of(h).into_iter().chain(api_key)
+}
+
+/// The token of `Authorization: Bearer <token>` (scheme matched case-insensitively). Shared by
+/// the proxy key, management and MCP checks.
+pub(crate) fn bearer_of(h: &HeaderMap) -> Option<&str> {
+    h.get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| {
             let (scheme, rest) = v.split_once(' ')?;
             scheme.eq_ignore_ascii_case("bearer").then_some(rest)
-        });
-    let api_key = h.get("x-api-key").and_then(|v| v.to_str().ok());
-    bearer.into_iter().chain(api_key)
+        })
 }
 
 /// Comparison whose timing does not depend on how much of the key matched (digests of equal
