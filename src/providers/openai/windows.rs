@@ -14,7 +14,7 @@
 use http::HeaderMap;
 use time::OffsetDateTime;
 
-use crate::accounts::{RateLimitSnapshot, Window, WindowStatus};
+use crate::accounts::{AccountId, RateLimitSnapshot, StateBook, Window, WindowStatus};
 use crate::providers::anthropic::retry_after_at;
 
 const DAY_MINUTES: f64 = 24.0 * 60.0;
@@ -128,6 +128,28 @@ pub fn codex_quota_reset(
             .filter(|r| *r > now)
             .map(|r| (r, None)),
     }
+}
+
+/// A rate-limit error *event* inside a 200 stream counts like a 429 (bro `markRateLimited` ->
+/// `blockingWindowReset`): the response's windows are re-applied as rejected (a full window is
+/// spent now), then the account is benched until the soonest spent window's future reset, else
+/// for `cooldown`. Returns the bench end.
+pub(crate) fn bench_for_rate_limit_event(
+    state: &StateBook,
+    id: &AccountId,
+    headers: &HeaderMap,
+    now: OffsetDateTime,
+    cooldown: time::Duration,
+) -> OffsetDateTime {
+    if let Some(s) = parse_codex_rate_limits(headers, true, now) {
+        state.replace_header_snapshot(id, s);
+    }
+    let (until, window) = match state.blocking_window(id, now) {
+        Some((r, key)) => (r, Some(key)),
+        None => (now + cooldown, None),
+    };
+    state.mark_rate_limited(id, until, window, now);
+    until
 }
 
 #[cfg(test)]

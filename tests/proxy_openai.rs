@@ -900,6 +900,91 @@ async fn context_carry_seeds_next_turn_through_proxy() {
     assert_eq!(p.context_carry().len(), 2);
 }
 
+#[tokio::test]
+async fn no_context_carry_without_affinity() {
+    let fake = FakeOpenAi::start().await;
+    fake.script(
+        RESPONSES,
+        vec![Reply::sse(frames(&text_turn(10, 5), Duration::ZERO))],
+    );
+    let (pool, meta) = codex_pool();
+    let p = provider(&pool, &fake);
+    for _ in 0..2 {
+        let mut r = codex_req(true, "req_t38_noaff");
+        r.session_user_id = Some("classifier-session".into());
+        r.affinity = false;
+        let out = run(&p, &pool, &meta, &r, None).await;
+        assert_eq!(opening_input(&body_bytes(response(out)).await), 0);
+    }
+    let mut r = codex_req(false, "req_t38_noaff_fold");
+    r.session_user_id = Some("classifier-session".into());
+    r.affinity = false;
+    assert_eq!(kind(&run(&p, &pool, &meta, &r, None).await), "done 200");
+    assert!(p.context_carry().is_empty(), "nothing seeded or recorded");
+}
+
+#[tokio::test]
+async fn rate_limit_event_benches_until_spent_window_reset() {
+    let now = OffsetDateTime::now_utc();
+    let reset = unix_in(time::Duration::hours(2));
+    let full_5h = |r: Reply| window(r, "primary", Some(100.0), Some(300), Some(reset));
+    let limited = failed("usage_limit_reached", "You have hit your usage limit");
+    let mut post = frames(
+        &[created("r"), added("message"), text_delta("par")],
+        Duration::ZERO,
+    );
+    post.push((Duration::from_millis(100), limited.clone()));
+    let fake = FakeOpenAi::start().await;
+    fake.script(
+        RESPONSES,
+        vec![
+            // Before commit.
+            full_5h(Reply::sse(frames(
+                std::slice::from_ref(&limited),
+                Duration::ZERO,
+            ))),
+            // After commit.
+            full_5h(Reply::sse(post)),
+            // No windows at all: the cooldown.
+            Reply::sse(frames(&[limited], Duration::ZERO)),
+        ],
+    );
+    let (pool, meta) = codex_pool();
+    let p = provider(&pool, &fake);
+    let bench = |pool: &Pool| {
+        let st = state(pool, &meta);
+        (st.rate_limited_until.unwrap(), st.rate_limited_window)
+    };
+
+    let out = run(&p, &pool, &meta, &codex_req(true, "req_t38_rle1"), None).await;
+    assert_eq!(kind(&out), "retry 429 quota");
+    let (until, window_key) = bench(&pool);
+    assert_eq!(until.unix_timestamp(), reset);
+    assert_eq!(window_key.as_deref(), Some("5h"));
+    let w = state(&pool, &meta).snapshot.unwrap().windows[0].clone();
+    assert_eq!(
+        w.status,
+        WindowStatus::Rejected,
+        "an error event counts as a 429"
+    );
+
+    pool.state
+        .record_success(&meta.id, Default::default(), OffsetDateTime::now_utc());
+    let out = run(&p, &pool, &meta, &codex_req(true, "req_t38_rle2"), None).await;
+    let got = body_bytes(response(out)).await;
+    assert!(contains(&got, b"event: error"));
+    let (until, window_key) = bench(&pool);
+    assert_eq!(until.unix_timestamp(), reset);
+    assert_eq!(window_key.as_deref(), Some("5h"));
+
+    // A fresh account without windows: cooldown (1 h).
+    let fresh = add_codex_account(&pool, "cx3", 1, "codex-fresh-SECRET");
+    let out = run(&p, &pool, &fresh, &codex_req(true, "req_t38_rle3"), None).await;
+    assert_eq!(kind(&out), "retry 429 quota");
+    let until = state(&pool, &fresh).rate_limited_until.unwrap();
+    assert!(near(until, now + time::Duration::hours(1)), "{until}");
+}
+
 // ---- through the real server ---------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

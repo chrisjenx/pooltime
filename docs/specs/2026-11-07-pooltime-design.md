@@ -495,7 +495,8 @@ noted.
   `content-encoding` / `transfer-encoding` on streamed responses.
 - SSE parser handles `\n`, `\r\n`, `\r`, multi-line `data:`, comment lines, 8 MiB line cap.
 - Pre-commit buffering is bounded by size (64 KiB) **and** by the idle watchdog. `message_start` commits; `ping`
-  never does.
+  never does. Codex exception: the Codex stream commits on the first content frame (not `message_start`) so a
+  created→failed upstream can fail over; see `docs/parity.md`.
 - Response bodies are produced by a spawned task feeding a channel; keep-alive pings come from an interval in that
   task and never await upstream. Client disconnect = channel send fails → `client_cancelled`: release reservation
   (via `Drop` guard), journal it, **never** record an account error. No state mutation may live after an `.await`

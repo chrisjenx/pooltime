@@ -115,12 +115,18 @@ impl WatchedBody {
         next_nonempty(&mut self.stream, self.idle, self.deadline, classify_reqwest).await
     }
 
-    /// Read the remaining body as (lossy UTF-8) text, bounded by the same limits.
-    pub async fn text(mut self) -> Result<String, TransportKind> {
+    /// Read the remaining body, bounded by the same limits.
+    pub async fn read_all(mut self) -> Result<Bytes, TransportKind> {
         let mut buf = Vec::new();
         while let Some(chunk) = self.next_chunk().await {
             buf.extend_from_slice(&chunk?);
         }
+        Ok(Bytes::from(buf))
+    }
+
+    /// Read the remaining body as (lossy UTF-8) text, bounded by the same limits.
+    pub async fn text(self) -> Result<String, TransportKind> {
+        let buf = self.read_all().await?;
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 }

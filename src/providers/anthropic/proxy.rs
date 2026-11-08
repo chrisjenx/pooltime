@@ -40,7 +40,7 @@ use super::{
     has_quota_signal, has_rate_limit_wording, parse_unified_headers, prepare_body,
     AnthropicProvider,
 };
-use crate::accounts::status::is_spent;
+
 use crate::accounts::{
     AccountId, AccountMeta, ErrorRecord, RateLimitSnapshot, StateBook, TokenUsage,
 };
@@ -226,7 +226,7 @@ impl AnthropicProvider {
             if call.req.stream || is_event_stream(&headers) {
                 return self.stream_prefix(call, status, headers, resp.body).await;
             }
-            return match read_all(resp.body).await {
+            return match resp.body.read_all().await {
                 Ok(bytes) => Step::Outcome(success(
                     call,
                     Buffered {
@@ -239,7 +239,7 @@ impl AnthropicProvider {
             };
         }
         // Like bro: an error body that dies mid-read is classified as if empty.
-        let bytes = read_all(resp.body).await.unwrap_or_default();
+        let bytes = resp.body.read_all().await.unwrap_or_default();
         self.classify_error(
             call,
             Buffered {
@@ -432,7 +432,7 @@ pub(super) fn quota_until(
 ) -> (OffsetDateTime, Option<String>) {
     match explicit_reset(headers, now).filter(|r| *r > now) {
         Some(r) => (r, None),
-        None => match blocking_window(state, id, now) {
+        None => match state.blocking_window(id, now) {
             Some((r, key)) => (r, Some(key)),
             None => (now + cooldown, None),
         },
@@ -654,29 +654,6 @@ fn record(
             upstream_request_id,
         },
     );
-}
-
-/// Earliest future reset among the account-wide windows the (just merged) snapshot reports
-/// spent, with its key (bro `blockingWindowReset`).
-fn blocking_window(
-    state: &StateBook,
-    id: &AccountId,
-    now: OffsetDateTime,
-) -> Option<(OffsetDateTime, String)> {
-    let snap = state.state(id, now).snapshot?;
-    snap.windows
-        .iter()
-        .filter(|w| w.model.is_none() && is_spent(w))
-        .filter_map(|w| w.reset.filter(|r| *r > now).map(|r| (r, w.key.clone())))
-        .min_by_key(|(r, _)| *r)
-}
-
-async fn read_all(mut body: WatchedBody) -> Result<Bytes, TransportKind> {
-    let mut buf = Vec::new();
-    while let Some(chunk) = body.next_chunk().await {
-        buf.extend_from_slice(&chunk?);
-    }
-    Ok(Bytes::from(buf))
 }
 
 pub(super) fn request_id(h: &HeaderMap) -> Option<String> {

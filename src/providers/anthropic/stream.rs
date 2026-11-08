@@ -44,7 +44,8 @@ use super::has_rate_limit_wording;
 use super::proxy::{error_fields, quota_until, request_id, response_headers};
 use crate::accounts::{AccountId, ErrorRecord, StateBook, TokenUsage};
 use crate::errors::{FailReason, TransportKind};
-use crate::providers::AttemptOutcome;
+use crate::providers::stream_guard::{StreamGuard, StreamOutcome};
+use crate::providers::{AttemptOutcome, ProviderId};
 use crate::routing::reserve::Reservation;
 use crate::sse::{SseEvent, SseParser};
 use crate::upstream::WatchedBody;
@@ -53,87 +54,6 @@ use crate::upstream::WatchedBody;
 pub const PREFIX_CAP: usize = 64 * 1024;
 /// Chunks queued towards the client before the pump waits for it.
 const CHANNEL_CAPACITY: usize = 16;
-
-/// How a committed stream ended (the `outcome` field of the `anthropic stream finished` event).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamOutcome {
-    Completed,
-    ClientCancelled,
-    UpstreamTruncated,
-    IdleTimeout,
-    Reset,
-    Error,
-}
-
-impl StreamOutcome {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            StreamOutcome::Completed => "completed",
-            StreamOutcome::ClientCancelled => "client_cancelled",
-            StreamOutcome::UpstreamTruncated => "upstream_truncated",
-            StreamOutcome::IdleTimeout => "idle_timeout",
-            StreamOutcome::Reset => "reset",
-            StreamOutcome::Error => "error",
-        }
-    }
-
-    fn of_transport(k: TransportKind) -> StreamOutcome {
-        match k {
-            TransportKind::IdleTimeout => StreamOutcome::IdleTimeout,
-            TransportKind::Reset => StreamOutcome::Reset,
-            _ => StreamOutcome::Error,
-        }
-    }
-}
-
-/// Owned by the task pumping a committed stream. Dropping it (normal end, failure, client
-/// disconnect, task abort or panic) emits one structured `anthropic stream finished` event
-/// (request id, account, outcome) and releases the in-flight reservation.
-///
-/// TODO(F4): also write the journal row here once the journal exists.
-pub struct StreamGuard {
-    reservation: Option<Reservation>,
-    account: AccountId,
-    request_id: String,
-    outcome: StreamOutcome,
-}
-
-impl StreamGuard {
-    /// Outcome reported on drop until [`StreamGuard::set`] says otherwise (`error`).
-    fn new(reservation: Option<Reservation>, account: AccountId, request_id: String) -> Self {
-        StreamGuard {
-            reservation,
-            account,
-            request_id,
-            outcome: StreamOutcome::Error,
-        }
-    }
-
-    fn set(&mut self, o: StreamOutcome) {
-        self.outcome = o;
-    }
-}
-
-impl Drop for StreamGuard {
-    fn drop(&mut self) {
-        let outcome = self.outcome.as_str();
-        match self.outcome {
-            StreamOutcome::Completed | StreamOutcome::ClientCancelled => tracing::info!(
-                request_id = %self.request_id,
-                account = %self.account,
-                outcome,
-                "anthropic stream finished"
-            ),
-            _ => tracing::warn!(
-                request_id = %self.request_id,
-                account = %self.account,
-                outcome,
-                "anthropic stream finished"
-            ),
-        }
-        drop(self.reservation.take());
-    }
-}
 
 /// Classification of an SSE `error` event (`error.type` / `error.message`, bro
 /// `classifySseError`).
@@ -336,7 +256,12 @@ pub(super) fn commit(
     let mut resp = Response::new(body);
     *resp.status_mut() = c.status;
     *resp.headers_mut() = response_headers(&c.headers, &ctx.account);
-    let guard = StreamGuard::new(reservation, ctx.account.clone(), ctx.request_id.clone());
+    let guard = StreamGuard::new(
+        ProviderId::Anthropic,
+        reservation,
+        ctx.account.clone(),
+        ctx.request_id.clone(),
+    );
     tokio::spawn(pump(c, ctx, guard, tx, usage_tx));
     AttemptOutcome::Done(resp, Some(usage_rx))
 }
@@ -540,33 +465,5 @@ mod tests {
         assert_eq!((k, t), (SseErrorKind::RateLimit, None));
         let (k, _) = classify_sse_error("not json");
         assert_eq!(k, SseErrorKind::Other);
-    }
-
-    #[test]
-    fn outcome_labels() {
-        let all = [
-            StreamOutcome::Completed,
-            StreamOutcome::ClientCancelled,
-            StreamOutcome::UpstreamTruncated,
-            StreamOutcome::IdleTimeout,
-            StreamOutcome::Reset,
-            StreamOutcome::Error,
-        ];
-        let got: Vec<_> = all.iter().map(|o| o.as_str()).collect();
-        assert_eq!(
-            got,
-            [
-                "completed",
-                "client_cancelled",
-                "upstream_truncated",
-                "idle_timeout",
-                "reset",
-                "error"
-            ]
-        );
-        assert_eq!(
-            StreamOutcome::of_transport(TransportKind::Deadline),
-            StreamOutcome::Error
-        );
     }
 }

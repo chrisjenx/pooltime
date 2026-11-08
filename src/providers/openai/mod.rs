@@ -33,7 +33,7 @@ pub use oauth::{
 };
 pub(crate) use oauth::{token_expiry, TokenResponse};
 pub use proxy::{describe_codex_error, RESPONSES_PATH};
-pub use stream::{CodexStreamGuard, PREFIX_CAP};
+pub use stream::PREFIX_CAP;
 pub use translate_req::{clamp_effort, derive_effort_tier, to_codex_request};
 pub use translate_stream::{anthropic_error_type, CodexToAnthropic, Finished, StreamError};
 

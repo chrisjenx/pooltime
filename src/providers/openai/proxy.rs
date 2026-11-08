@@ -51,7 +51,7 @@ use crate::providers::anthropic::{
 use crate::providers::{
     AttemptCtx, AttemptOutcome, InboundRequest, Provider, ProviderId, UsageError,
 };
-use crate::upstream::{join_url, UpstreamResponse, WatchedBody};
+use crate::upstream::{join_url, UpstreamResponse};
 
 /// Path of the Responses endpoint under `openai.api_base`.
 pub const RESPONSES_PATH: &str = "/responses";
@@ -221,7 +221,7 @@ impl OpenAiProvider {
             return stream::read_prefix(self, call, headers, body).await;
         }
         // Like bro: an error body that dies mid-read is classified as if empty.
-        let bytes = read_all(resp.body).await.unwrap_or_default();
+        let bytes = resp.body.read_all().await.unwrap_or_default();
         let b = Buffered {
             status,
             headers: resp.headers,
@@ -551,14 +551,6 @@ pub(super) fn record(
             upstream_request_id,
         },
     );
-}
-
-async fn read_all(mut body: WatchedBody) -> Result<Bytes, TransportKind> {
-    let mut buf = Vec::new();
-    while let Some(chunk) = body.next_chunk().await {
-        buf.extend_from_slice(&chunk?);
-    }
-    Ok(Bytes::from(buf))
 }
 
 /// Upstream request id (`x-request-id`, else `request-id`), for logs. Only token-safe characters

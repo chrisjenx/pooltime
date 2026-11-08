@@ -17,7 +17,7 @@
 //! | Pre-commit end | Outcome |
 //! |---|---|
 //! | clean terminal | the whole translated stream as one `Done` |
-//! | `error` / `response.failed`, rate-limit type or wording | bench (cooldown), `Retry(Quota)`, 429 |
+//! | `error` / `response.failed`, rate-limit type or wording | bench until the soonest spent window reset (windows re-read as a 429), else the cooldown, `Retry(Quota)`, 429 |
 //! | ... overloaded type | same-account backoff (like an Anthropic `overloaded_error` event), then 529 |
 //! | ... any other type | `Terminal(Status(502))`, the mapped Anthropic type and the upstream message |
 //! | malformed tool arguments | `Terminal(Status(502))` (another account would not do better) |
@@ -35,8 +35,8 @@
 //!
 //! | End | Account | Response body | outcome |
 //! |---|---|---|---|
-//! | clean terminal | `record_success(usage)`, context carried, usage future resolves | closing frames, clean end | `completed` |
-//! | upstream error event | rate limit: bench + `Quota`; overloaded: `Overloaded`; else `Status(502)` | `error` frame, clean end | `error` |
+//! | clean terminal | `record_success(usage)` (before the closing frames), context carried, usage future resolves | closing frames, clean end | `completed` |
+//! | upstream error event | rate limit: bench (as above) + `Quota`; overloaded: `Overloaded`; else `Status(502)` | `error` frame, clean end | `error` |
 //! | malformed tool arguments | `Status(502)` | `error` frame, clean end | `error` |
 //! | EOF before a terminal event | `Transport(Reset)` | `error` frame, clean end | `upstream_truncated` |
 //! | transport fault / idle / deadline | `Transport(kind)` | errors (no clean end) | per kind |
@@ -47,11 +47,12 @@
 //! [`CodexToAnthropic::into_message`]; errors settle exactly like the pre-commit table.
 //!
 //! Context carry: `message_start.usage.input_tokens` is seeded from the provider's
-//! [`super::ContextCarry`] under (session, route id); only a successful finish records.
+//! [`super::ContextCarry`] under (session, route id); only a successful finish records. Requests
+//! without session affinity (`InboundRequest::affinity == false`, classifier) never seed or record.
 //! Post-commit recording uses the provider's own `Arc<StateBook>`: it must be the book the caller
 //! passes to `attempt`.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -63,11 +64,13 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::proxy::{record, request_id, transport_outcome, Buffered, Call, Step};
+use super::windows::bench_for_rate_limit_event;
 use super::{CodexToAnthropic, ContextCarry, OpenAiProvider, StreamError};
 use crate::accounts::{AccountId, StateBook, TokenUsage};
 use crate::errors::{FailReason, TransportKind};
-use crate::providers::anthropic::{anthropic_error, StreamOutcome, POOL_ACCOUNT_HEADER};
-use crate::providers::AttemptOutcome;
+use crate::providers::anthropic::{anthropic_error, POOL_ACCOUNT_HEADER};
+use crate::providers::stream_guard::{StreamGuard, StreamOutcome};
+use crate::providers::{AttemptOutcome, ProviderId};
 use crate::routing::reserve::Reservation;
 use crate::sse::{encode, SseParser};
 use crate::upstream::WatchedBody;
@@ -79,8 +82,11 @@ const CHANNEL_CAPACITY: usize = 16;
 
 type Chunk = Result<Bytes, std::io::Error>;
 
+/// The Anthropic `ping` frame (encoded once; clones share the buffer).
 fn ping_frame() -> Bytes {
-    encode("ping", r#"{"type":"ping"}"#)
+    static PING: OnceLock<Bytes> = OnceLock::new();
+    PING.get_or_init(|| encode("ping", r#"{"type":"ping"}"#))
+        .clone()
 }
 
 /// A frame that commits the response: anything but `ping` and `message_start`.
@@ -143,6 +149,8 @@ impl Reader {
 pub(super) struct Committed {
     pending: Vec<Bytes>,
     reader: Reader,
+    /// The 2xx response headers (their `x-codex-*` windows decide a rate-limit event's bench).
+    headers: HeaderMap,
     upstream_request_id: Option<String>,
 }
 
@@ -155,11 +163,11 @@ pub(super) async fn read_prefix(
     body: WatchedBody,
 ) -> Step {
     let route_id = &call.route.def.id;
-    let seed = p.carry.seed(call.req.session_user_id.as_deref(), route_id);
+    let seed = p.carry.seed(carry_session(call), route_id);
     let mut rd = Reader::new(body, CodexToAnthropic::new(route_id, seed));
     let rid = request_id(&headers);
     if !call.req.stream {
-        return fold(p, call, rd, rid).await;
+        return fold(p, call, rd, &headers, rid).await;
     }
     let mut pending: Vec<Bytes> = Vec::new();
     let mut committed = false;
@@ -183,7 +191,7 @@ pub(super) async fn read_prefix(
                     Some(usage),
                 ))
             }
-            Err(e) => settle_unsent(p, call, e, rid),
+            Err(e) => settle_unsent(p, call, e, &headers, rid),
         };
     }
     if !rd.t.is_started() {
@@ -194,12 +202,27 @@ pub(super) async fn read_prefix(
     Step::Stream(Box::new(Committed {
         pending,
         reader: rd,
+        headers,
         upstream_request_id: rid,
     }))
 }
 
+/// The session the context carry is keyed by: none for affinity-less (classifier) requests.
+fn carry_session<'a>(call: &Call<'a>) -> Option<&'a str> {
+    call.req
+        .affinity
+        .then_some(call.req.session_user_id.as_deref())
+        .flatten()
+}
+
 /// Non-streaming client: read everything, fold one message.
-async fn fold(p: &OpenAiProvider, call: &Call<'_>, mut rd: Reader, rid: Option<String>) -> Step {
+async fn fold(
+    p: &OpenAiProvider,
+    call: &Call<'_>,
+    mut rd: Reader,
+    headers: &HeaderMap,
+    rid: Option<String>,
+) -> Step {
     while !rd.done() {
         if let Err(k) = rd.step().await {
             return Step::Outcome(transport_outcome(call, k, rid));
@@ -218,7 +241,7 @@ async fn fold(p: &OpenAiProvider, call: &Call<'_>, mut rd: Reader, rid: Option<S
             tag_account(&mut r, call.acct);
             Step::Outcome(AttemptOutcome::Done(r, Some(usage)))
         }
-        Err(e) => settle_unsent(p, call, e, rid),
+        Err(e) => settle_unsent(p, call, e, headers, rid),
     }
 }
 
@@ -233,11 +256,8 @@ fn served(
     call.state
         .record_success(call.acct, usage, OffsetDateTime::now_utc());
     if let Some(tokens) = context {
-        p.carry.record(
-            call.req.session_user_id.as_deref(),
-            &call.route.def.id,
-            tokens,
-        );
+        p.carry
+            .record(carry_session(call), &call.route.def.id, tokens);
     }
     tracing::info!(
         account = %call.acct,
@@ -253,7 +273,13 @@ fn served(
 }
 
 /// The response failed before anything reached the client (bro `failedBeforeCommit`).
-fn settle_unsent(p: &OpenAiProvider, call: &Call<'_>, e: StreamError, rid: Option<String>) -> Step {
+fn settle_unsent(
+    p: &OpenAiProvider,
+    call: &Call<'_>,
+    e: StreamError,
+    headers: &HeaderMap,
+    rid: Option<String>,
+) -> Step {
     let now = OffsetDateTime::now_utc();
     let kind = e.anthropic_type();
     let log = |outcome: &str| {
@@ -272,8 +298,13 @@ fn settle_unsent(p: &OpenAiProvider, call: &Call<'_>, e: StreamError, rid: Optio
         }
         StreamError::Upstream { message, .. } if kind == "rate_limit_error" => {
             log("quota");
-            let until = now + p.rate_limit_cooldown();
-            call.state.mark_rate_limited(call.acct, until, None, now);
+            let until = bench_for_rate_limit_event(
+                call.state,
+                call.acct,
+                headers,
+                now,
+                p.rate_limit_cooldown(),
+            );
             let reason = FailReason::Quota { reset: Some(until) };
             record(call.state, call.acct, reason, rid);
             Step::Outcome(AttemptOutcome::Retry {
@@ -325,57 +356,12 @@ fn sse_response(body: Body, acct: &AccountId) -> Response {
     r
 }
 
-/// Owned by the task pumping a committed Codex stream. Dropping it (normal end, failure, client
-/// disconnect, task abort or panic) emits one `codex stream finished` event (request id,
-/// account, outcome) and releases the in-flight reservation.
-pub struct CodexStreamGuard {
-    reservation: Option<Reservation>,
-    account: AccountId,
-    request_id: String,
-    outcome: StreamOutcome,
-}
-
-impl CodexStreamGuard {
-    fn new(reservation: Option<Reservation>, account: AccountId, request_id: String) -> Self {
-        CodexStreamGuard {
-            reservation,
-            account,
-            request_id,
-            outcome: StreamOutcome::Error,
-        }
-    }
-
-    fn set(&mut self, o: StreamOutcome) {
-        self.outcome = o;
-    }
-}
-
-impl Drop for CodexStreamGuard {
-    fn drop(&mut self) {
-        let outcome = self.outcome.as_str();
-        match self.outcome {
-            StreamOutcome::Completed | StreamOutcome::ClientCancelled => tracing::info!(
-                request_id = %self.request_id,
-                account = %self.account,
-                outcome,
-                "codex stream finished"
-            ),
-            _ => tracing::warn!(
-                request_id = %self.request_id,
-                account = %self.account,
-                outcome,
-                "codex stream finished"
-            ),
-        }
-        drop(self.reservation.take());
-    }
-}
-
 /// What the pump needs to record outcomes on the account.
 struct StreamCtx {
     account: AccountId,
     request_id: String,
     state: Arc<StateBook>,
+    headers: HeaderMap,
     cooldown: time::Duration,
     keepalive: Duration,
     carry: ContextCarry,
@@ -396,18 +382,25 @@ pub(super) fn commit(
         rx.recv().await.map(|item| (item, rx))
     }));
     let resp = sse_response(body, call.acct);
+    let mut c = *c;
     let ctx = StreamCtx {
         account: call.acct.clone(),
         request_id: call.req.request_id.clone(),
         state: p.state.clone(),
+        headers: std::mem::take(&mut c.headers),
         cooldown: p.rate_limit_cooldown(),
         keepalive: p.keepalive,
         carry: p.carry.clone(),
-        session: call.req.session_user_id.clone(),
+        session: carry_session(call).map(str::to_string),
         route_id: call.route.def.id.clone(),
     };
-    let guard = CodexStreamGuard::new(reservation, ctx.account.clone(), ctx.request_id.clone());
-    tokio::spawn(pump(*c, ctx, guard, tx, usage_tx));
+    let guard = StreamGuard::new(
+        ProviderId::OpenAi,
+        reservation,
+        ctx.account.clone(),
+        ctx.request_id.clone(),
+    );
+    tokio::spawn(pump(c, ctx, guard, tx, usage_tx));
     AttemptOutcome::Done(resp, Some(usage_rx))
 }
 
@@ -449,7 +442,7 @@ impl Out {
 async fn pump(
     c: Committed,
     ctx: StreamCtx,
-    mut guard: CodexStreamGuard,
+    mut guard: StreamGuard,
     tx: mpsc::Sender<Chunk>,
     usage_tx: oneshot::Sender<TokenUsage>,
 ) {
@@ -457,6 +450,7 @@ async fn pump(
         pending,
         reader: mut rd,
         upstream_request_id: rid,
+        ..
     } = c;
     let mut out = Out {
         tx,
@@ -515,7 +509,7 @@ async fn pump(
 
 async fn finalize(
     ctx: &StreamCtx,
-    guard: &mut CodexStreamGuard,
+    guard: &mut StreamGuard,
     t: CodexToAnthropic,
     eof: bool,
     mut out: Out,
@@ -525,14 +519,17 @@ async fn finalize(
     let now = OffsetDateTime::now_utc();
     let e = match t.finish() {
         Ok(f) => {
-            if out.send_all(f.frames).await.is_err() {
-                guard.set(StreamOutcome::ClientCancelled);
-                return;
-            }
+            // Upstream served (and billed) the turn: count it before the closing frames, so a
+            // client that drops during them does not undercount the account's usage.
             ctx.state.record_success(&ctx.account, f.usage, now);
             if let Some(tokens) = f.context_tokens {
                 ctx.carry
                     .record(ctx.session.as_deref(), &ctx.route_id, tokens);
+            }
+            let _ = usage_tx.send(f.usage);
+            if out.send_all(f.frames).await.is_err() {
+                guard.set(StreamOutcome::ClientCancelled);
+                return;
             }
             tracing::info!(
                 account = %ctx.account,
@@ -542,7 +539,6 @@ async fn finalize(
                 output_tokens = f.usage.output_tokens,
                 "codex stream served"
             );
-            let _ = usage_tx.send(f.usage);
             guard.set(StreamOutcome::Completed);
             return;
         }
@@ -561,8 +557,13 @@ async fn finalize(
             StreamOutcome::UpstreamTruncated,
         ),
         StreamError::Upstream { .. } if kind == "rate_limit_error" => {
-            let until = now + ctx.cooldown;
-            ctx.state.mark_rate_limited(&ctx.account, until, None, now);
+            let until = bench_for_rate_limit_event(
+                &ctx.state,
+                &ctx.account,
+                &ctx.headers,
+                now,
+                ctx.cooldown,
+            );
             (
                 FailReason::Quota { reset: Some(until) },
                 StreamOutcome::Error,
@@ -589,7 +590,7 @@ async fn finalize(
 /// client sees a failed response, not a clean end.
 async fn fault(
     ctx: &StreamCtx,
-    guard: &mut CodexStreamGuard,
+    guard: &mut StreamGuard,
     rd: Reader,
     out: Out,
     k: TransportKind,
@@ -601,11 +602,7 @@ async fn fault(
         guard.set(StreamOutcome::ClientCancelled);
         return;
     }
-    let outcome = match k {
-        TransportKind::IdleTimeout => StreamOutcome::IdleTimeout,
-        TransportKind::Reset => StreamOutcome::Reset,
-        _ => StreamOutcome::Error,
-    };
+    let outcome = StreamOutcome::of_transport(k);
     tracing::warn!(
         account = %ctx.account,
         request_id = %ctx.request_id,
