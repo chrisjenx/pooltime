@@ -629,6 +629,17 @@ impl StateBook {
         });
     }
 
+    /// Replace the duration-keyed windows with a whole-account header snapshot (Codex
+    /// `x-codex-*`, bro replace mode): a window it no longer reports is dropped, non-duration
+    /// windows carry over. Unlike [`StateBook::replace_poll_snapshot`] nothing but the snapshot
+    /// changes. Callers skip empty snapshots (they would wipe the known windows).
+    pub fn replace_header_snapshot(&self, id: &AccountId, s: RateLimitSnapshot) {
+        let now = s.updated_at;
+        self.mutate(id, now, "header_snapshot", |st| {
+            st.snapshot = Some(replace_snapshot(st.snapshot.as_ref(), s));
+        });
+    }
+
     /// Apply a ground-truth usage poll that started at `started_at` (answered at `s.updated_at`).
     ///
     /// Replaces duration-keyed windows (keeps e.g. `overage`); a spent account-wide window
