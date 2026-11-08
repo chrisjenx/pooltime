@@ -15,6 +15,7 @@ use http::{HeaderMap, StatusCode};
 use tokio::time::{timeout_at, Instant};
 
 use crate::errors::TransportKind;
+use crate::logging::{debug_headers, redact_uri, DebugMode};
 
 type BodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
@@ -33,6 +34,8 @@ pub struct Limits {
 #[derive(Clone)]
 pub struct Upstream {
     client: reqwest::Client,
+    /// While active, request/response headers of every send are logged (redacted).
+    debug: DebugMode,
 }
 
 impl Default for Upstream {
@@ -50,7 +53,20 @@ impl Upstream {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("static reqwest client configuration is valid");
-        Self { client }
+        Self {
+            client,
+            debug: DebugMode::default(),
+        }
+    }
+
+    /// Share `debug` (the daemon hands the same switch to the management API).
+    pub fn with_debug(mut self, debug: DebugMode) -> Self {
+        self.debug = debug;
+        self
+    }
+
+    pub fn debug(&self) -> &DebugMode {
+        &self.debug
     }
 
     /// Send `req` and wait for the response headers.
@@ -63,6 +79,16 @@ impl Upstream {
         lim: &Limits,
     ) -> Result<UpstreamResponse, TransportKind> {
         let (until, expiry) = bound(lim.header_wait, lim.deadline);
+        if self.debug.active() {
+            // Inside the request span, so the line carries the request id.
+            tracing::info!(
+                direction = "upstream_request",
+                method = %req.method(),
+                url = %redact_uri(req.url().as_str()),
+                headers = %debug_headers(req.headers()),
+                "debug headers"
+            );
+        }
         let resp = match timeout_at(until, self.client.execute(req)).await {
             Err(_) => return Err(expiry),
             Ok(Err(e)) => return Err(classify_reqwest(&e)),
@@ -70,6 +96,14 @@ impl Upstream {
         };
         let status = resp.status();
         let headers = resp.headers().clone();
+        if self.debug.active() {
+            tracing::info!(
+                direction = "upstream_response",
+                status = status.as_u16(),
+                headers = %debug_headers(&headers),
+                "debug headers"
+            );
+        }
         Ok(UpstreamResponse {
             status,
             headers,

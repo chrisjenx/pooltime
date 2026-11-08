@@ -746,6 +746,56 @@ fn logs_filters_by_request_id() {
 }
 
 #[test]
+fn logs_request_prints_the_journaled_attempt_chain() {
+    let h = Home::new();
+    let _d = h.serve();
+    // An unknown endpoint is journaled (no upstream involved).
+    let addr = SocketAddr::from(([127, 0, 0, 1], h.port));
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"GET /v1/nope?state=xyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).unwrap();
+    assert!(raw.starts_with("HTTP/1.1 404"), "{raw}");
+    let id = raw
+        .split("\r\n")
+        .find_map(|l| l.strip_prefix("x-pooltime-request-id: "))
+        .expect("request id header")
+        .to_string();
+
+    // The row is queued on the store writer; give it a moment.
+    let start = Instant::now();
+    let out = loop {
+        let out = h.command(&["logs", "--request", &id]).output().unwrap();
+        if out.status.success() {
+            break String::from_utf8_lossy(&out.stdout).into_owned();
+        }
+        assert!(start.elapsed() < BOOT_BUDGET, "never journaled: {out:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(lines[0].starts_with(&id), "{out}");
+    assert!(
+        lines[0].contains("error") && lines[0].contains("reason=unknown_path"),
+        "{out}"
+    );
+    assert!(
+        lines[0].contains("/v1/nope") && !out.contains("xyz"),
+        "{out}"
+    );
+    assert_eq!(lines[1], "  (no upstream attempt)", "{out}");
+
+    let json = stdout_of(&h.cli(&["logs", "--request", &id, "--json"]).success());
+    let v: Value = serde_json::from_str(json.trim()).unwrap();
+    assert_eq!(v["request"]["path"], "/v1/nope");
+
+    h.cli(&["logs", "--request", "req_unknownunknownunkn"])
+        .code(1)
+        .stderr(predicate::str::contains("no journal entry"));
+}
+
+#[test]
 fn statusline_reads_the_daemons_cache() {
     let h = Home::new();
     // No daemon, no cache: `pool down`, exit 0, for both forms.

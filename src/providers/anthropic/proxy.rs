@@ -160,6 +160,7 @@ impl AnthropicProvider {
                         request_id: req.request_id.clone(),
                         state: self.state.clone(),
                         rate_limit_cooldown: self.rate_limit_cooldown,
+                        journal: req.journal.clone(),
                     };
                     return stream::commit(c, sc, reservation);
                 }
@@ -215,6 +216,9 @@ impl AnthropicProvider {
             };
         }
 
+        call.req
+            .journal
+            .note_upstream(resp.status.as_u16(), request_id(&resp.headers).as_deref());
         let now = OffsetDateTime::now_utc();
         if let Some(snap) = parse_unified_headers(&resp.headers, now) {
             call.state.merge_header_snapshot(call.acct, snap);

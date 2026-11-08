@@ -399,6 +399,7 @@ pub(super) fn commit(
         reservation,
         ctx.account.clone(),
         ctx.request_id.clone(),
+        call.req.journal.clone(),
     );
     tokio::spawn(pump(c, ctx, guard, tx, usage_tx));
     AttemptOutcome::Done(resp, Some(usage_rx))

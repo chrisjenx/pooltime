@@ -13,6 +13,7 @@ pub mod dashboard;
 pub mod fallback;
 pub mod health;
 pub mod inference;
+pub mod journal_api;
 pub mod mgmt;
 pub mod models_route;
 pub mod router;
@@ -24,6 +25,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::accounts::{Registry, StateBook};
 use crate::config::{Config, Paths};
+use crate::logging::DebugMode;
 use crate::models::ModelTable;
 use crate::providers::{Provider, ProviderId};
 use crate::routing::reserve::Reservations;
@@ -52,6 +54,8 @@ pub struct AppState {
     pub runtime: Runtime,
     /// Shared upstream HTTP client handed to every attempt.
     pub upstream: Arc<Upstream>,
+    /// Time-boxed header logging (`/api/v1/debug`); the same switch as `upstream.debug()`.
+    pub debug: DebugMode,
     /// Classifier marker-drift warning throttle.
     pub drift: classifier::DriftWarner,
     /// Round-robin cursor for exact score ties (shared by every pick, like bro's).
@@ -80,6 +84,7 @@ impl AppState {
         mgmt_key: String,
     ) -> AppState {
         let tuning = RwLock::new(Tuning::from(&cfg.routing));
+        let debug = DebugMode::default();
         AppState {
             cfg,
             paths,
@@ -92,7 +97,8 @@ impl AppState {
             store,
             mgmt_key,
             runtime: Runtime::default(),
-            upstream: Arc::new(Upstream::new()),
+            upstream: Arc::new(Upstream::new().with_debug(debug.clone())),
+            debug,
             drift: classifier::DriftWarner::default(),
             cursor: AtomicUsize::new(0),
             tuning,
@@ -114,6 +120,7 @@ impl AppState {
 
     /// Use this upstream client (the daemon shares one with the providers).
     pub fn with_upstream(mut self, upstream: Arc<Upstream>) -> AppState {
+        self.debug = upstream.debug().clone();
         self.upstream = upstream;
         self
     }

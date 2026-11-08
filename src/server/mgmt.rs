@@ -10,6 +10,9 @@
 //! http on localhost), no `Max-Age` (a browser session). There is no CORS: a foreign page cannot
 //! read a response, and the Host/Origin guard refuses it before auth is even consulted.
 //!
+//! The debugging views (`/requests`, `/timeline`, `/stats`, `/debug`) live in
+//! [`super::journal_api`] and need the key for reads too.
+//!
 //! # Errors
 //! Same envelope as the inference side, `{"type":"error","error":{"type","message"}}`, so
 //! clients read `.error.message` everywhere. Status words are spec §4's, one per account in
@@ -48,6 +51,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::auth::keys_match;
+use super::journal_api;
 use super::models_route::build_listing;
 use super::router::{method_not_allowed, read_json_limited};
 use super::AppState;
@@ -152,7 +156,11 @@ pub(crate) fn authorized(h: &HeaderMap, key: &str) -> bool {
         .any(|(name, value)| name == SESSION_COOKIE && keys_match(value, &token))
 }
 
-async fn require_mgmt(State(app): State<Arc<AppState>>, req: Request, next: Next) -> Response {
+pub(super) async fn require_mgmt(
+    State(app): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
     if authorized(req.headers(), &app.mgmt_key) {
         next.run(req).await
     } else {
@@ -212,6 +220,23 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/api/v1/models/refresh",
             write(post(models_refresh), "POST"),
         )
+        // Debugging views (journal_api): key or session required for reads too.
+        .route("/api/v1/requests", write(get(journal_api::requests), "GET"))
+        .route(
+            "/api/v1/requests/{id}",
+            write(get(journal_api::request), "GET"),
+        )
+        .route("/api/v1/timeline", write(get(journal_api::timeline), "GET"))
+        .route("/api/v1/stats", write(get(journal_api::stats), "GET"))
+        .route(
+            "/api/v1/debug",
+            write(
+                get(journal_api::debug_get)
+                    .post(journal_api::debug_post)
+                    .delete(journal_api::debug_delete),
+                "GET, POST, DELETE",
+            ),
+        )
 }
 
 // ---- response helpers ------------------------------------------------------------------------
@@ -223,11 +248,11 @@ fn json_response(status: StatusCode, v: Value) -> Response {
     r
 }
 
-fn ok(v: Value) -> Response {
+pub(super) fn ok(v: Value) -> Response {
     json_response(StatusCode::OK, v)
 }
 
-fn bad(msg: impl AsRef<str>) -> Response {
+pub(super) fn bad(msg: impl AsRef<str>) -> Response {
     anthropic_error(400, "invalid_request_error", msg.as_ref())
 }
 
@@ -235,7 +260,7 @@ fn unknown_account(id: &AccountId) -> Response {
     anthropic_error(404, "not_found_error", &format!("Unknown account: {id}"))
 }
 
-fn internal(what: &str) -> Response {
+pub(super) fn internal(what: &str) -> Response {
     anthropic_error(500, "api_error", &format!("pooltime: {what}"))
 }
 
@@ -243,7 +268,10 @@ fn parse_id(raw: &str) -> Result<AccountId, Response> {
     raw.parse::<AccountId>().map_err(|e| bad(e.to_string()))
 }
 
-async fn read_object(headers: &HeaderMap, body: Body) -> Result<Map<String, Value>, Response> {
+pub(super) async fn read_object(
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<Map<String, Value>, Response> {
     match read_json_limited(headers, body, BODY_LIMIT).await?.1 {
         Value::Object(m) => Ok(m),
         _ => Err(bad("request body must be a JSON object")),
@@ -251,7 +279,7 @@ async fn read_object(headers: &HeaderMap, body: Body) -> Result<Map<String, Valu
 }
 
 /// Run blocking work (disk, sqlite) off the async threads.
-async fn blocking<T: Send + 'static>(
+pub(super) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Response> {
     tokio::task::spawn_blocking(f).await.map_err(|e| {
@@ -260,7 +288,7 @@ async fn blocking<T: Send + 'static>(
     })
 }
 
-fn ts(t: OffsetDateTime) -> String {
+pub(super) fn ts(t: OffsetDateTime) -> String {
     t.format(&Rfc3339).unwrap_or_default()
 }
 
@@ -685,7 +713,7 @@ fn profiles_on_file(paths: &Paths) -> Value {
 }
 
 /// Data dir and the bytes held by the database (with its WAL/SHM files) and the logs.
-fn storage_json(paths: &Paths) -> Value {
+pub(super) fn storage_json(paths: &Paths) -> Value {
     let db: u64 = ["", "-wal", "-shm"]
         .iter()
         .map(|suffix| {

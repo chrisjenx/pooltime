@@ -238,6 +238,8 @@ pub(super) struct StreamCtx {
     pub(super) state: Arc<StateBook>,
     /// Bench length for a post-commit rate-limit error with no explicit/window reset.
     pub(super) rate_limit_cooldown: time::Duration,
+    /// The request's journal entry (handed to the stream guard).
+    pub(super) journal: crate::store::journal::Journal,
 }
 
 type Chunk = Result<Bytes, std::io::Error>;
@@ -261,6 +263,7 @@ pub(super) fn commit(
         reservation,
         ctx.account.clone(),
         ctx.request_id.clone(),
+        ctx.journal.clone(),
     );
     tokio::spawn(pump(c, ctx, guard, tx, usage_tx));
     AttemptOutcome::Done(resp, Some(usage_rx))

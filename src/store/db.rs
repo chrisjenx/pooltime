@@ -187,7 +187,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pooltime.db");
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            super::super::SCHEMA_VERSION
+        );
         assert_eq!(mode_of(&path), 0o600);
         for suffix in ["-wal", "-shm"] {
             let mut p = path.clone().into_os_string();
@@ -236,7 +239,10 @@ mod tests {
         let path = dir.path().join("pooltime.db");
         drop(Store::open(&path).unwrap());
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            super::super::SCHEMA_VERSION
+        );
     }
 
     #[test]
@@ -259,7 +265,10 @@ mod tests {
             c.pragma_update(None, "user_version", 1).unwrap();
         }
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 2);
+        assert_eq!(
+            store.schema_version().unwrap(),
+            super::super::SCHEMA_VERSION
+        );
         let (kept, quarantined): (i64, i64) = store
             .read(|c| {
                 Ok((

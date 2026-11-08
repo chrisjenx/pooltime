@@ -210,6 +210,9 @@ impl OpenAiProvider {
             };
         }
 
+        call.req
+            .journal
+            .note_upstream(resp.status.as_u16(), request_id(&resp.headers).as_deref());
         let now = OffsetDateTime::now_utc();
         let status = resp.status;
         let snap = parse_codex_rate_limits(&resp.headers, status.as_u16() == 429, now);

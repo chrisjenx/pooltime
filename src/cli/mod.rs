@@ -137,7 +137,7 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
             Command::Models(cmd) => models::run(&paths, cmd).await,
             Command::Open => open::run(&paths).await,
             // Blocking file reads; nothing else runs on this runtime meanwhile.
-            Command::Logs(args) => logs::run(&paths, args),
+            Command::Logs(args) => logs::run(&paths, args).await,
             // Short blocking calls to launchctl/systemctl.
             Command::Service(cmd) => service::run(&paths, cmd),
             // Blocking file and Keychain reads, then the identity fetches.

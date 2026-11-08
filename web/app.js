@@ -57,6 +57,8 @@
     drafts: {}, // unsaved form values, keyed per field, survive re-renders
     msgs: {}, // per-form result messages
     view: "overview",
+    // Debugging views (Requests / Events): fetched only while one of them is shown, key holders only.
+    journal: { requests: null, stats: null, events: null, errorsOnly: false, open: {}, details: {}, error: null },
   };
 
   let manage = false;
@@ -161,6 +163,45 @@
   function pill(status) {
     return h("span", { class: "pill " + status, text: WORDS[status] || status });
   }
+
+  // ---- journal helpers ----------------------------------------------------------------------
+  const OUTCOME_CLASS = { completed: "ready", client_cancelled: "badge", failover: "rate_limited" };
+  function outcomePill(o) {
+    return h("span", { class: "pill " + (OUTCOME_CLASS[o] || "erroring"), text: String(o || "—").replace(/_/g, " ") });
+  }
+  function ms(n) {
+    if (typeof n !== "number") return "—";
+    return n < 1000 ? n + " ms" : (n / 1000).toFixed(n < 10000 ? 2 : 1) + " s";
+  }
+  function lockedPanel(title) {
+    return h("div", { class: "panel" },
+      h("h2", { text: title }),
+      h("p", { class: "empty", text: "Only shown with the management key: run `pooltime open`, or unlock above." }));
+  }
+  // The attempt chain of one request (cross-provider hops show as a provider change).
+  function chainView(d) {
+    if (!d) return h("p", { class: "empty", text: "Loading…" });
+    if (d.error) return h("p", { class: "msg err", text: d.error });
+    const r = d.request || {};
+    const attempts = d.attempts || [];
+    const tokens = typeof r.input_tokens === "number"
+      ? r.input_tokens + " in / " + r.output_tokens + " out" + (r.cache_read ? " · " + r.cache_read + " cache read" : "")
+      : "—";
+    return h("div", { class: "chain" },
+      h("p", { class: "dim" },
+        h("span", { class: "mono", text: r.id }), " · ", r.provider || "—", " · tokens " + tokens,
+        r.session_hash ? h("span", null, " · session ", h("span", { class: "mono", text: r.session_hash })) : null),
+      attempts.length
+        ? h("ol", null, attempts.map((a, i) => h("li", null,
+            i > 0 && a.provider !== attempts[i - 1].provider ? h("span", { class: "pill badge warn", text: "cross-provider" }) : null,
+            " ", h("strong", { text: a.account }), " ", h("span", { class: "dim", text: a.provider }), " ",
+            outcomePill(a.outcome),
+            a.reason ? " " + a.reason : "",
+            a.upstream_status != null ? " · upstream " + a.upstream_status : "",
+            a.upstream_request_id ? h("span", null, " · ", h("span", { class: "mono", text: a.upstream_request_id })) : null,
+            " · " + ms(a.ms))))
+        : h("p", { class: "empty", text: "No upstream attempt." }));
+  }
   function bar(fraction, invert) {
     // fraction = share to fill; invert = true when the fill is "used" (high is bad)
     if (typeof fraction !== "number") return h("div", { class: "bar none", title: "unknown" });
@@ -209,6 +250,47 @@
     render();
   }
 
+  // Requests / Events data (management key required; the read-only view shows a hint instead).
+  async function loadJournal() {
+    if (!manage || (ui.view !== "requests" && ui.view !== "events")) return;
+    const j = ui.journal;
+    try {
+      if (ui.view === "requests") {
+        const [reqs, stats] = await Promise.all([
+          api("GET", "/api/v1/requests?limit=100" + (j.errorsOnly ? "&errors_only=true" : "")),
+          api("GET", "/api/v1/stats"),
+        ]);
+        j.requests = reqs.requests || [];
+        j.stats = stats;
+      } else {
+        const ev = await api("GET", "/api/v1/timeline?limit=200");
+        j.events = ev.events || [];
+      }
+      j.error = null;
+    } catch (e) {
+      j.error = e.message;
+    }
+  }
+
+  async function toggleRequest(id) {
+    const j = ui.journal;
+    if (j.open[id]) { delete j.open[id]; render(); return; }
+    j.open[id] = true;
+    render();
+    try {
+      j.details[id] = await api("GET", "/api/v1/requests/" + encodeURIComponent(id));
+    } catch (e) {
+      j.details[id] = { error: e.message };
+    }
+    render();
+  }
+
+  async function setErrorsOnly(on) {
+    ui.journal.errorsOnly = on;
+    await loadJournal();
+    render();
+  }
+
   async function poll() {
     try {
       const data = await api("GET", "/api/v1/status");
@@ -216,6 +298,7 @@
       ui.error = null;
       ui.lastOk = Date.now();
       if (data && data.now) ui.skew = Date.parse(data.now) - Date.now();
+      await loadJournal();
       render();
     } catch (e) {
       ui.error = e.message;
@@ -438,6 +521,86 @@
         h("table", null,
           h("thead", null, h("tr", null, ["From", "To", "Effort", ""].map((t) => h("th", { text: t })))),
           h("tbody", null, rows, addRow)));
+    },
+
+    requests() {
+      if (!manage) return lockedPanel("Recent requests");
+      const j = ui.journal;
+      const st = j.stats || {};
+      const statRows = (st.accounts || []).map((a) => h("tr", null,
+        h("td", { class: "nowrap" }, h("strong", { text: a.account })),
+        h("td", { class: "dim", text: a.provider }),
+        h("td", { class: "num", text: String(a.attempts) }),
+        h("td", { class: "num" + (a.errors ? " bad" : ""), text: a.errors + " (" + pct(a.error_rate || 0) + ")" }),
+        h("td", { class: "num", text: ms(a.p50_ms) }),
+        h("td", { class: "num", text: ms(a.p95_ms) })));
+      const stats = h("div", { class: "panel" },
+        h("h2", { text: "Accounts, last 24 hours" }),
+        h("p", { class: "section-note", text: "Attempts per account; latency is attempt start to first byte (or failure)." }),
+        statRows.length
+          ? h("table", null,
+            h("thead", null, h("tr", null, ["Account", "Provider", "Attempts", "Errors", "p50", "p95"].map((t) => h("th", { text: t })))),
+            h("tbody", null, statRows))
+          : h("p", { class: "empty", text: j.stats ? "No requests in the last 24 hours." : "Loading…" }));
+
+      const rows = [];
+      (j.requests || []).forEach((r) => {
+        const open = !!j.open[r.id];
+        rows.push(h("tr", { class: "clickable" + (open ? " open" : ""), tabindex: 0, title: "Show the attempt chain",
+          onclick: () => toggleRequest(r.id),
+          onkeydown: (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); toggleRequest(r.id); } } },
+          h("td", { class: "nowrap dim", text: clock(r.time) }),
+          h("td", { class: "mono", text: r.model || r.path || "—" }),
+          h("td", null, outcomePill(r.outcome)),
+          h("td", { class: "num", text: r.status == null ? "—" : String(r.status) }),
+          h("td", { class: "nowrap", text: r.account || "—" }),
+          h("td", { class: "num", text: String(r.attempts || 0) }),
+          h("td", { class: "num", text: ms(r.ttfb_ms) }),
+          h("td", { class: "num", text: ms(r.total_ms) }),
+          h("td", { class: "dim", text: r.reason || "" })));
+        if (open) rows.push(h("tr", { class: "chain-row" }, h("td", { colspan: 9 }, chainView(j.details[r.id]))));
+      });
+      const list = h("div", { class: "panel" },
+        h("h2", { text: "Recent requests" }),
+        h("div", { class: "inline" },
+          h("label", { class: "inline" },
+            h("input", { type: "checkbox", checked: j.errorsOnly, onchange: (ev) => setErrorsOnly(ev.target.checked) }),
+            "Errors only"),
+          j.error ? h("span", { class: "msg err", text: j.error }) : null),
+        rows.length
+          ? h("table", null,
+            h("thead", null, h("tr", null, ["Time", "Model", "Outcome", "Status", "Account", "Attempts", "TTFB", "Total", "Reason"].map((t) => h("th", { text: t })))),
+            h("tbody", null, rows))
+          : h("p", { class: "empty", text: j.requests ? "No requests recorded." : "Loading…" }));
+
+      const s = st.storage || {};
+      const kv = (k, v) => [h("dt", { text: k }), h("dd", null, v)];
+      const storage = h("div", { class: "panel" },
+        h("h2", { text: "Storage used" }),
+        h("dl", { class: "kv" },
+          kv("Database", bytes(s.db_bytes)),
+          kv("Logs", bytes(s.logs_bytes)),
+          kv("Journal", typeof st.journal_requests === "number" ? st.journal_requests + " requests" : "—")));
+      return [list, stats, storage];
+    },
+
+    events() {
+      if (!manage) return lockedPanel("Events");
+      const j = ui.journal;
+      const rows = (j.events || []).map((e) => h("tr", null,
+        h("td", { class: "nowrap dim", text: clock(e.time) + " (" + rel(e.time) + ")" }),
+        h("td", { class: "nowrap" }, h("strong", { text: e.account })),
+        h("td", { class: "nowrap" }, e.from_state ? pill(e.from_state) : h("span", { class: "dim", text: "—" }), " → ", e.to_state ? pill(e.to_state) : "—"),
+        h("td", { text: reasonText(e.reason) || "" })));
+      return h("div", { class: "panel" },
+        h("h2", { text: "Events" }),
+        h("p", { class: "section-note", text: "Every account state change, newest first." }),
+        j.error ? h("p", { class: "msg err", text: j.error }) : null,
+        rows.length
+          ? h("table", null,
+            h("thead", null, h("tr", null, ["When", "Account", "Change", "Reason"].map((t) => h("th", { text: t })))),
+            h("tbody", null, rows))
+          : h("p", { class: "empty", text: j.events ? "No events recorded." : "Loading…" }));
     },
 
     settings(d) {
@@ -739,6 +902,7 @@
     const v = (location.hash || "").replace(/^#/, "");
     ui.view = VIEWS[v] ? v : "overview";
     render();
+    loadJournal().then(render);
   }
 
   function init() {

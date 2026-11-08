@@ -38,10 +38,12 @@ use crate::providers::anthropic::{
     anthropic_error, refresh_failure_outcome, POOL_ACCOUNT_HEADER, RETRYABLE_TRANSPORT_HEADER,
 };
 use crate::providers::openai::derive_effort_tier;
-use crate::providers::{AttemptCtx, AttemptOutcome, InboundRequest, ProviderId};
+use crate::providers::{AttemptCtx, AttemptOutcome, InboundRequest, ProviderId, TokenUsageFuture};
 use crate::routing::reserve::WaitBudget;
 use crate::routing::{choose, usable, Candidate, Tuning};
+use crate::store::journal::{Journal, FAILOVER};
 use crate::upstream::Limits;
+use tracing::Instrument;
 
 /// Response header carrying the inbound request id (every response).
 pub const REQUEST_ID_HEADER: &str = "x-pooltime-request-id";
@@ -66,10 +68,22 @@ pub async fn messages(State(app): State<Arc<AppState>>, req: Request) -> Respons
         .get::<RequestId>()
         .map(|r| r.0.clone())
         .unwrap_or_else(new_request_id);
+    // Created before the first `.await`: if the client goes away at any point, dropping this
+    // handler drops the entry and it is written as `client_cancelled`.
+    let journal = Journal::start(app.store.clone(), &request_id, OffsetDateTime::now_utc());
+    journal.set_path(req.uri().path());
+    let span = tracing::info_span!("request", request_id = %request_id);
     let (parts, body) = req.into_parts();
     let (raw_body, json) = match read_json(&parts.headers, body).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => {
+            journal.respond(
+                resp.status().as_u16(),
+                "error",
+                Some("invalid_request".into()),
+            );
+            return resp;
+        }
     };
     let model = json
         .get("model")
@@ -82,6 +96,10 @@ pub async fn messages(State(app): State<Arc<AppState>>, req: Request) -> Respons
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    journal.set_model(&model);
+    if let Some(u) = &session_user_id {
+        journal.set_session(u);
+    }
     let req = InboundRequest {
         raw_body,
         json,
@@ -91,11 +109,25 @@ pub async fn messages(State(app): State<Arc<AppState>>, req: Request) -> Respons
         session_user_id,
         affinity: true,
         request_id,
+        journal,
     };
-    handle(&app, req).await
+    handle(&app, req).instrument(span).await
 }
 
-async fn handle(app: &Arc<AppState>, mut req: InboundRequest) -> Response {
+/// Serve `req` and record the response on its journal entry.
+async fn handle(app: &Arc<AppState>, req: InboundRequest) -> Response {
+    let journal = req.journal.clone();
+    let served = route_and_serve(app, req).await;
+    let (outcome, reason) = match served.verdict {
+        Verdict::Served => ("completed", None),
+        Verdict::Failed(r) => ("error", Some(r.detail())),
+        Verdict::NoAccount => ("error", Some("no_account".to_string())),
+    };
+    journal.respond(served.response.status().as_u16(), outcome, reason);
+    served.response
+}
+
+async fn route_and_serve(app: &Arc<AppState>, mut req: InboundRequest) -> Served {
     let (route, mapped) = {
         let table = app.models.read().unwrap_or_else(|e| e.into_inner());
         let tier = derive_effort_tier(&req.json);
@@ -113,11 +145,10 @@ async fn handle(app: &Arc<AppState>, mut req: InboundRequest) -> Response {
     };
     // One slot-wait budget for the whole request, across retries and providers.
     let budget = WaitBudget::new(app.cfg.timeouts.inflight_wait);
+    req.journal.set_provider(route.def.provider.as_str());
 
     if route.def.provider == ProviderId::OpenAi {
-        return serve_provider(app, ProviderId::OpenAi, &route, &req, &budget)
-            .await
-            .response;
+        return serve_provider(app, ProviderId::OpenAi, &route, &req, &budget).await;
     }
 
     let cr = app.cfg.routing.classifier_route;
@@ -143,7 +174,7 @@ async fn handle(app: &Arc<AppState>, mut req: InboundRequest) -> Response {
         (ProviderId::OpenAi, Some(m)) => m,
         _ => &route,
     };
-    let served = match first {
+    let mut served = match first {
         // Neither provider has a usable account: let the Anthropic path produce its 503.
         None => serve_provider(app, ProviderId::Anthropic, &route, req, &budget).await,
         Some(first) if use_fallback => {
@@ -154,12 +185,13 @@ async fn handle(app: &Arc<AppState>, mut req: InboundRequest) -> Response {
         }
         Some(first) => serve_provider(app, first, route_for(first), req, &budget).await,
     };
-    let mut resp = served.response;
     if is_classifier {
-        resp.headers_mut()
+        served
+            .response
+            .headers_mut()
             .insert(POOL_ROUTE_HEADER, HeaderValue::from_static("classifier"));
     }
-    resp
+    served
 }
 
 /// View of one account at a point in time. `creds_ok` comes from the per-pass registry read;
@@ -305,6 +337,25 @@ async fn choose_mapped_provider(app: &Arc<AppState>, req: &InboundRequest) -> Op
     None
 }
 
+/// Put the served attempt's token usage on the journal entry: at once when known (buffered
+/// responses), else from a small task that holds the entry until the stream resolves the usage
+/// (or drops it on abort), so the row is written with it.
+fn record_usage(journal: &Journal, usage: Option<TokenUsageFuture>) {
+    let Some(mut rx) = usage else { return };
+    match rx.try_recv() {
+        Ok(u) => journal.tokens(u),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+            let journal = journal.clone();
+            tokio::spawn(async move {
+                if let Ok(u) = rx.await {
+                    journal.tokens(u);
+                }
+            });
+        }
+    }
+}
+
 fn set_account_header(resp: &mut Response, acct: &AccountId) {
     if let Ok(v) = HeaderValue::from_str(acct.as_str()) {
         resp.headers_mut().insert(POOL_ACCOUNT_HEADER, v);
@@ -378,6 +429,8 @@ async fn serve_provider(
             tried.insert(acct_id);
             continue;
         };
+        let journal = &req.journal;
+        journal.begin_attempt(acct_id.as_str(), pid.as_str());
         let outcome = match provider.access_token(meta, false).await {
             Ok(token) => {
                 let limits = Limits {
@@ -402,7 +455,9 @@ async fn serve_provider(
             }
         };
         match outcome {
-            AttemptOutcome::Done(mut resp, _usage) => {
+            AttemptOutcome::Done(mut resp, usage) => {
+                journal.end_attempt("completed", None);
+                record_usage(journal, usage);
                 tracing::info!(
                     request_id = rid,
                     account = %acct_id,
@@ -422,6 +477,7 @@ async fn serve_provider(
                 };
             }
             AttemptOutcome::Terminal(mut resp, reason) => {
+                journal.end_attempt("error", Some(reason.detail()));
                 tracing::warn!(
                     request_id = rid,
                     account = %acct_id,
@@ -441,6 +497,7 @@ async fn serve_provider(
                 reason,
                 fallback_response,
             } => {
+                journal.end_attempt(FAILOVER, Some(reason.detail()));
                 tracing::warn!(
                     request_id = rid,
                     account = %acct_id,
