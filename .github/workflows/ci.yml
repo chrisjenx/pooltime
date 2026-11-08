@@ -28,3 +28,10 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test
         run: cargo test
+      - name: docs
+        run: sh scripts/check-docs.sh
+        env:
+          POOLTIME_BIN: target/debug/pooltime
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck scripts/check-docs.sh
