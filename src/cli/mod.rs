@@ -8,6 +8,7 @@ pub mod connect;
 pub mod logs;
 pub mod models;
 pub mod open;
+pub mod service;
 pub mod status;
 
 use std::ffi::OsString;
@@ -59,6 +60,9 @@ pub enum Command {
     Open,
     /// Show the daemon's logs.
     Logs(logs::LogsArgs),
+    /// Run the daemon as a background service (launchd on macOS, systemd on Linux).
+    #[command(subcommand)]
+    Service(service::ServiceCmd),
 }
 
 /// `pooltime serve` flags. `--port`/`--host` override `config.toml` and `POOLTIME_PORT`/`POOLTIME_HOST`.
@@ -105,6 +109,8 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
             Command::Open => open::run(&paths).await,
             // Blocking file reads; nothing else runs on this runtime meanwhile.
             Command::Logs(args) => logs::run(&paths, args),
+            // Short blocking calls to launchctl/systemctl.
+            Command::Service(cmd) => service::run(&paths, cmd),
         }
     })
 }
