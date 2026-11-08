@@ -4,7 +4,7 @@
 //! parsing ([`ratelimit`]) and the usage poll + sweeper ([`usage`]). `access_token` and
 //! `poll_usage` are *inherent* methods; Task 18 adds `impl Provider for AnthropicProvider`
 //! ([`proxy`]: non-stream attempt + classification, overload backoff in [`overload`]) whose trait
-//! `access_token` / `poll_usage` delegate to them.
+//! `access_token` / `poll_usage` delegate to them. Task 19 adds the streaming attempt ([`stream`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,6 +18,7 @@ mod oauth;
 mod overload;
 mod proxy;
 mod ratelimit;
+mod stream;
 pub mod strip;
 mod usage;
 
@@ -28,6 +29,7 @@ pub use proxy::{
     UPSTREAM_REJECTED_HEADER,
 };
 pub use ratelimit::{has_quota_signal, has_rate_limit_wording, parse_unified_headers};
+pub use stream::{StreamGuard, StreamOutcome, PREFIX_CAP};
 pub use strip::{
     codex_stash_signature, is_codex_stash_signature, prepare_body, CODEX_STASH_PREFIX,
 };

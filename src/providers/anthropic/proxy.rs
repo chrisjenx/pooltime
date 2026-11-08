@@ -3,7 +3,11 @@
 //!
 //! | Upstream | Outcome |
 //! |---|---|
-//! | 2xx | buffer, record usage from the JSON `usage`, `Done` |
+//! | 2xx, non-streaming | buffer, record usage from the JSON `usage`, `Done` |
+//! | 2xx, `stream: true` or `text/event-stream` | pre-commit buffering, then a pumped `Done` stream ([`super::stream`]) |
+//! | 2xx stream, initial rate-limit `error` event | as a quota 429 below (bench, `Retry(Quota)`, 429 fallback) |
+//! | 2xx stream, initial `overloaded_error` event | as a 529 below (same-account backoff, surfaced as **529**) |
+//! | 2xx stream, transport fault / EOF / idle before commit | as a transport failure below (`Retry`) |
 //! | 429 without quota signal | `Terminal(UpstreamRejected)`, replay + `x-pool-upstream-rejected: 1`, no state change |
 //! | 429 with quota signal, or any other status whose `"{type}\n{message}"` has rate-limit wording (bro) | bench (reset: explicit -> blocking window -> cooldown), `Retry(Quota)` |
 //! | 529 / 500 / 503 | same-account backoff ([`super::overload`]), then `Terminal(Overloaded)` replaying the last upstream error, recorded once, no sideline |
@@ -31,6 +35,7 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 
 use super::overload::{explicit_reset, OverloadPolicy};
+use super::stream::{self, Committed, Prefix, StreamCtx};
 use super::{
     has_quota_signal, has_rate_limit_wording, parse_unified_headers, prepare_body,
     AnthropicProvider,
@@ -97,10 +102,12 @@ impl Buffered {
     }
 }
 
-/// Result of one upstream exchange: final, or a transient overload the backoff loop handles.
+/// Result of one upstream exchange: final, a transient overload the backoff loop handles, or a
+/// committed stream for the caller of `exchange` to pump.
 enum Step {
     Outcome(AttemptOutcome),
     Overloaded(Buffered),
+    Stream(Box<Committed>),
 }
 
 /// Attempt-scoped values threaded through the helpers.
@@ -126,17 +133,12 @@ impl AnthropicProvider {
 
     async fn attempt_messages(
         &self,
-        ctx: AttemptCtx<'_>,
+        mut ctx: AttemptCtx<'_>,
         req: &InboundRequest,
         state: &StateBook,
     ) -> AttemptOutcome {
-        if req.stream {
-            // TODO(T19): streaming branch (`stream.rs`) replaces this placeholder.
-            return AttemptOutcome::Terminal(
-                anthropic_error(501, "api_error", "streaming is not implemented yet"),
-                FailReason::Status(501),
-            );
-        }
+        // Moved into the stream pump on commit; otherwise released when this attempt returns.
+        let reservation = ctx.reservation.take();
         let call = Call {
             acct: &ctx.account.id,
             state,
@@ -152,6 +154,15 @@ impl AnthropicProvider {
                 .await
             {
                 Step::Outcome(o) => return o,
+                Step::Stream(c) => {
+                    let sc = StreamCtx {
+                        account: call.acct.clone(),
+                        request_id: req.request_id.clone(),
+                        state: self.state.clone(),
+                        rate_limit_cooldown: self.rate_limit_cooldown,
+                    };
+                    return stream::commit(c, sc, reservation);
+                }
                 Step::Overloaded(b) => b,
             };
             let now = OffsetDateTime::now_utc();
@@ -212,6 +223,9 @@ impl AnthropicProvider {
         let status = resp.status;
         let headers = resp.headers;
         if status.is_success() {
+            if call.req.stream || is_event_stream(&headers) {
+                return self.stream_prefix(call, status, headers, resp.body).await;
+            }
             return match read_all(resp.body).await {
                 Ok(bytes) => Step::Outcome(success(
                     call,
@@ -322,21 +336,8 @@ impl AnthropicProvider {
                 Step::Outcome(AttemptOutcome::Terminal(r, FailReason::UpstreamRejected))
             }
             _ if quota => {
-                let (until, window) = match explicit_reset(&b.headers, now).filter(|r| *r > now) {
-                    Some(r) => (r, None),
-                    None => match blocking_window(call.state, call.acct, now) {
-                        Some((r, key)) => (r, Some(key)),
-                        None => (now + self.rate_limit_cooldown, None),
-                    },
-                };
                 log("quota");
-                call.state.mark_rate_limited(call.acct, until, window, now);
-                let reason = FailReason::Quota { reset: Some(until) };
-                record(call, reason, upstream_request_id.clone(), now);
-                Step::Outcome(AttemptOutcome::Retry {
-                    reason,
-                    fallback_response: replay(&b, call.acct),
-                })
+                Step::Outcome(self.quota_outcome(call, &b, now))
             }
             529 | 500 | 503 => Step::Overloaded(b),
             403 => {
@@ -361,6 +362,80 @@ impl AnthropicProvider {
                 Step::Outcome(AttemptOutcome::Terminal(replay(&b, call.acct), reason))
             }
         }
+    }
+}
+
+impl AnthropicProvider {
+    /// Bench (reset: explicit -> blocking window -> cooldown), record, `Retry(Quota)` replaying `b`.
+    fn quota_outcome(&self, call: &Call<'_>, b: &Buffered, now: OffsetDateTime) -> AttemptOutcome {
+        let (until, window) = quota_until(
+            call.state,
+            call.acct,
+            &b.headers,
+            now,
+            self.rate_limit_cooldown,
+        );
+        call.state.mark_rate_limited(call.acct, until, window, now);
+        let reason = FailReason::Quota { reset: Some(until) };
+        record(call, reason, b.request_id(), now);
+        AttemptOutcome::Retry {
+            reason,
+            fallback_response: replay(b, call.acct),
+        }
+    }
+
+    /// 2xx streaming response: buffer until commit, classify what happened before it.
+    async fn stream_prefix(
+        &self,
+        call: &Call<'_>,
+        status: StatusCode,
+        headers: HeaderMap,
+        body: WatchedBody,
+    ) -> Step {
+        let upstream_request_id = request_id(&headers);
+        let sse_error = |status: StatusCode, data: String| Buffered {
+            status,
+            headers: json_headers(&headers),
+            body: Bytes::from(data),
+        };
+        match stream::read_prefix(status, headers.clone(), body).await {
+            Prefix::Commit(c) => Step::Stream(c),
+            Prefix::Fault(k) => Step::Outcome(transport_outcome(call, k, upstream_request_id)),
+            Prefix::Overloaded(data) => Step::Overloaded(sse_error(
+                StatusCode::from_u16(529).expect("529 is a valid status"),
+                data,
+            )),
+            Prefix::RateLimited(data) => {
+                let b = sse_error(StatusCode::TOO_MANY_REQUESTS, data);
+                tracing::warn!(
+                    account = %call.acct,
+                    request_id = %call.req.request_id,
+                    error_type = error_fields(&String::from_utf8_lossy(&b.body)).0.as_deref().unwrap_or("-"),
+                    upstream_request_id = upstream_request_id.as_deref().unwrap_or("-"),
+                    outcome = "quota",
+                    "anthropic stream error before commit"
+                );
+                Step::Outcome(self.quota_outcome(call, &b, OffsetDateTime::now_utc()))
+            }
+        }
+    }
+}
+
+/// Reset for a quota hit on `id`: the explicit reset (`retry-after` / ratelimit-reset headers,
+/// future only), else the earliest spent account-wide window (with its key), else `now + cooldown`.
+pub(super) fn quota_until(
+    state: &StateBook,
+    id: &AccountId,
+    headers: &HeaderMap,
+    now: OffsetDateTime,
+    cooldown: time::Duration,
+) -> (OffsetDateTime, Option<String>) {
+    match explicit_reset(headers, now).filter(|r| *r > now) {
+        Some(r) => (r, None),
+        None => match blocking_window(state, id, now) {
+            Some((r, key)) => (r, Some(key)),
+            None => (now + cooldown, None),
+        },
     }
 }
 
@@ -439,12 +514,19 @@ fn upstream_headers(inbound: &HeaderMap, auth: HeaderValue) -> HeaderMap {
     h
 }
 
-/// Upstream status, headers (minus [`STRIP_RESPONSE`]) and body, tagged with the account.
+/// Upstream status, headers (see [`response_headers`]) and body.
 fn replay(b: &Buffered, acct: &AccountId) -> Response {
     let mut r = Response::new(Body::from(b.body.clone()));
     *r.status_mut() = b.status;
-    let h = r.headers_mut();
-    for (k, v) in &b.headers {
+    *r.headers_mut() = response_headers(&b.headers, acct);
+    r
+}
+
+/// Upstream response headers minus [`STRIP_RESPONSE`] (hop-by-hop, `content-length`,
+/// `content-encoding`, `transfer-encoding`), tagged with `x-pool-account`.
+pub(super) fn response_headers(upstream: &HeaderMap, acct: &AccountId) -> HeaderMap {
+    let mut h = HeaderMap::with_capacity(upstream.len() + 1);
+    for (k, v) in upstream {
         if !STRIP_RESPONSE.contains(&k.as_str()) {
             h.append(k.clone(), v.clone());
         }
@@ -452,7 +534,23 @@ fn replay(b: &Buffered, acct: &AccountId) -> Response {
     if let Ok(v) = HeaderValue::from_str(acct.as_str()) {
         h.insert(HeaderName::from_static(POOL_ACCOUNT_HEADER), v);
     }
-    r
+    h
+}
+
+/// `headers` with `content-type: application/json` (an SSE error event replayed as a JSON body).
+fn json_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut h = headers.clone();
+    h.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    h
+}
+
+fn is_event_stream(h: &HeaderMap) -> bool {
+    h.get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"))
 }
 
 /// 2xx: record usage (from the JSON body when present), commit.
@@ -572,7 +670,7 @@ async fn read_all(mut body: WatchedBody) -> Result<Bytes, TransportKind> {
     Ok(Bytes::from(buf))
 }
 
-fn request_id(h: &HeaderMap) -> Option<String> {
+pub(super) fn request_id(h: &HeaderMap) -> Option<String> {
     h.get("request-id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
@@ -581,7 +679,7 @@ fn request_id(h: &HeaderMap) -> Option<String> {
 /// `(error.type, message)`. The type is sanitized for logging (ASCII word chars, <= 64);
 /// the message (`error.message`, else the first 500 chars of the body) is for classification
 /// only and must never be logged or stored.
-fn error_fields(text: &str) -> (Option<String>, String) {
+pub(super) fn error_fields(text: &str) -> (Option<String>, String) {
     let json: serde_json::Value = serde_json::from_str(text).unwrap_or_default();
     let err = json.get("error");
     let kind = err

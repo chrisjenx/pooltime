@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub mod fake_anthropic;
+pub mod sockets;
 
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};

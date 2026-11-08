@@ -28,6 +28,7 @@ async fn run(
         route: &route,
         limits: lim,
         upstream: &pool.up,
+        reservation: None,
     };
     p.attempt(ctx, req, &pool.state).await
 }
@@ -561,6 +562,7 @@ async fn unauthorized_with_already_rotated_token_resends_without_refresh() {
         route: &route,
         limits: limits(),
         upstream: &pool.up,
+        reservation: None,
     };
     let out = p.attempt(ctx, &req, &pool.state).await;
     assert_eq!(kind(&out), "done 200 OK");
@@ -919,4 +921,718 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+// ---- streaming (Task 19) ----
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use bytes::Bytes;
+use pooltime::providers::ProviderId;
+use pooltime::routing::reserve::{Reservation, Reservations, WaitBudget};
+use support::sockets::{contains, post_json, raw_client, serve};
+
+fn stream_body() -> serde_json::Value {
+    let mut b = simple_body();
+    b["stream"] = json!(true);
+    b
+}
+
+fn stream_req(id: &str) -> InboundRequest {
+    let mut r = inbound(&stream_body(), HeaderMap::new());
+    r.request_id = id.into();
+    r
+}
+
+fn ev(name: &str, data: serde_json::Value) -> String {
+    format!("event: {name}\ndata: {data}\n\n")
+}
+
+fn ping() -> String {
+    ev("ping", json!({"type": "ping"}))
+}
+
+fn message_start() -> String {
+    ev(
+        "message_start",
+        json!({"type": "message_start", "message": {
+            "id": "msg_s", "type": "message", "role": "assistant", "content": [],
+            "usage": {"input_tokens": 10, "output_tokens": 1,
+                      "cache_read_input_tokens": 7, "cache_creation_input_tokens": 11}
+        }}),
+    )
+}
+
+fn text_delta(text: &str) -> String {
+    ev(
+        "content_block_delta",
+        json!({"type": "content_block_delta", "index": 0,
+               "delta": {"type": "text_delta", "text": text}}),
+    )
+}
+
+fn message_delta(output: u64) -> String {
+    ev(
+        "message_delta",
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+               "usage": {"output_tokens": output}}),
+    )
+}
+
+fn message_stop() -> String {
+    ev("message_stop", json!({"type": "message_stop"}))
+}
+
+fn sse_error(kind: &str, message: &str) -> String {
+    ev(
+        "error",
+        json!({"type": "error", "error": {"type": kind, "message": message}}),
+    )
+}
+
+/// A complete stream with upstream pings, one event split across two frames.
+fn full_stream() -> Vec<String> {
+    let delta = text_delta("Hello");
+    let (a, b) = delta.split_at(17);
+    vec![
+        message_start(),
+        ping(),
+        ev(
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0,
+                   "content_block": {"type": "text", "text": ""}}),
+        ),
+        a.to_string(),
+        b.to_string(),
+        ping(),
+        ev(
+            "content_block_stop",
+            json!({"type": "content_block_stop", "index": 0}),
+        ),
+        message_delta(42),
+        message_stop(),
+    ]
+}
+
+fn frames(fs: &[String], gap: Duration) -> Vec<(Duration, String)> {
+    fs.iter().map(|f| (gap, f.clone())).collect()
+}
+
+fn reservations() -> Reservations {
+    Reservations::new(HashMap::new())
+}
+
+async fn reserve(rs: &Reservations, pool: &Pool) -> Reservation {
+    let id = pool.meta.id.clone();
+    rs.reserve(
+        move |has_room| has_room(&id).then(|| id.clone()),
+        ProviderId::Anthropic,
+        &WaitBudget::new(Duration::from_secs(1)),
+    )
+    .await
+    .unwrap()
+}
+
+async fn run_stream(
+    p: &AnthropicProvider,
+    pool: &Pool,
+    req: &InboundRequest,
+    lim: Limits,
+    reservation: Option<Reservation>,
+) -> AttemptOutcome {
+    let token = p.access_token(&pool.meta, false).await.unwrap();
+    let route = route(&req.model);
+    let ctx = AttemptCtx {
+        account: &pool.meta,
+        token,
+        route: &route,
+        limits: lim,
+        upstream: &pool.up,
+        reservation,
+    };
+    p.attempt(ctx, req, &pool.state).await
+}
+
+fn limits_idle(idle: Duration) -> Limits {
+    Limits { idle, ..limits() }
+}
+
+/// Wait (up to 3 s) until the account has no reservation left.
+async fn released(rs: &Reservations, pool: &Pool) -> bool {
+    for _ in 0..300 {
+        if rs.in_flight(&pool.meta.id) == 0 {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+fn state(pool: &Pool) -> pooltime::accounts::AccountState {
+    pool.state.state(&pool.meta.id, OffsetDateTime::now_utc())
+}
+
+fn log_line_with(needles: &[&str]) -> bool {
+    captured_logs()
+        .lines()
+        .any(|l| needles.iter().all(|n| l.contains(n)))
+}
+
+#[tokio::test]
+async fn stream_bytes_forwarded_unchanged() {
+    let fake = FakeAnthropic::start().await;
+    let fs = full_stream();
+    fake.script(
+        MESSAGES,
+        vec![Reply::sse(frames(&fs, Duration::from_millis(5)))
+            .header("request-id", "req_stream_ok")
+            .header("content-encoding", "identity")],
+    );
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let p = pool.provider(&fake, policy);
+    let rs = reservations();
+    let slot = reserve(&rs, &pool).await;
+
+    let out = run_stream(
+        &p,
+        &pool,
+        &stream_req("req_t19_bytes"),
+        limits(),
+        Some(slot),
+    )
+    .await;
+    assert_eq!(kind(&out), "done 200 OK");
+    let AttemptOutcome::Done(resp, Some(usage)) = out else {
+        panic!("expected Done with usage future");
+    };
+    assert_eq!(header(&resp, "content-type"), Some("text/event-stream"));
+    assert_eq!(header(&resp, "x-pool-account"), Some("work"));
+    assert_eq!(header(&resp, "request-id"), Some("req_stream_ok"));
+    for h in ["content-length", "content-encoding", "transfer-encoding"] {
+        assert!(resp.headers().get(h).is_none(), "{h} forwarded");
+    }
+    let got = body_bytes(resp).await;
+    assert_eq!(
+        String::from_utf8_lossy(&got),
+        fs.concat(),
+        "bytes must be forwarded unchanged, pings included, nothing injected"
+    );
+    let u = usage.await.unwrap();
+    assert_eq!((u.input_tokens, u.output_tokens), (10, 42));
+    assert!(released(&rs, &pool).await, "reservation not released");
+    let st = state(&pool);
+    assert_eq!((st.lifetime.successes, st.lifetime.errors), (1, 0));
+    assert_eq!(fake.requests_to(MESSAGES)[0].json()["stream"], json!(true));
+    assert!(log_line_with(&["req_t19_bytes", "completed"]));
+}
+
+#[tokio::test]
+async fn ping_does_not_commit_then_rate_limit_error_fails_over() {
+    let fake = FakeAnthropic::start().await;
+    fake.script(
+        MESSAGES,
+        vec![Reply::sse(frames(
+            &[
+                ping(),
+                ping(),
+                sse_error("rate_limit_error", "Rate limited"),
+            ],
+            Duration::from_millis(5),
+        ))
+        .hold(Hold::Forever)],
+    );
+    let pool = Pool::new();
+    let (policy, sleeper) = fast_policy();
+    let p = pool.provider(&fake, policy);
+
+    let before = OffsetDateTime::now_utc();
+    let out = run_stream(&p, &pool, &stream_req("req_t19_rl"), limits(), None).await;
+    assert_eq!(kind(&out), "retry 429 Too Many Requests quota");
+    let resp = response(out);
+    assert_eq!(header(&resp, "content-type"), Some("application/json"));
+    assert_eq!(header(&resp, "x-pool-account"), Some("work"));
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+
+    let st = state(&pool);
+    let until = st.rate_limited_until.expect("benched");
+    assert!(near(until, before + time::Duration::hours(1)));
+    assert!(matches!(
+        st.last_error.unwrap().reason,
+        FailReason::Quota { .. }
+    ));
+    assert_eq!(st.lifetime.successes, 0);
+    assert_eq!(fake.requests_to(MESSAGES).len(), 1);
+    assert!(sleeper.slept().is_empty());
+}
+
+#[tokio::test]
+async fn initial_overload_never_clears_surfaces_529() {
+    let fake = FakeAnthropic::start().await;
+    fake.script(
+        MESSAGES,
+        vec![Reply::sse(frames(
+            &[ping(), sse_error("overloaded_error", "Overloaded")],
+            Duration::ZERO,
+        ))
+        .header("request-id", "req_ovl")
+        .hold(Hold::Forever)],
+    );
+    let pool = Pool::new();
+    let (policy, sleeper) = fast_policy();
+    let p = pool.provider(&fake, policy);
+
+    let out = run_stream(&p, &pool, &stream_req("req_t19_ovl"), limits(), None).await;
+    assert_eq!(kind(&out), "terminal 529 <unknown status code> overloaded");
+    let resp = response(out);
+    assert_eq!(header(&resp, "content-type"), Some("application/json"));
+    assert_eq!(header(&resp, "x-pool-account"), Some("work"));
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "overloaded_error");
+
+    // Same-account backoff: 1 + 4 retries, then surfaced; recorded once, never sidelined.
+    assert_eq!(fake.requests_to(MESSAGES).len(), 5);
+    assert_eq!(sleeper.slept().len(), 4);
+    let st = state(&pool);
+    assert_eq!(st.lifetime.errors, 1);
+    assert_eq!(st.last_error.unwrap().reason, FailReason::Overloaded);
+    assert_eq!(
+        pool.state
+            .status(&pool.meta.id, true, OffsetDateTime::now_utc()),
+        AccountStatus::Ready
+    );
+}
+
+#[tokio::test]
+async fn initial_overload_that_clears_streams_on_same_account() {
+    let fake = FakeAnthropic::start().await;
+    let fs = full_stream();
+    fake.script(
+        MESSAGES,
+        vec![
+            Reply::sse(frames(
+                &[sse_error("overloaded_error", "Overloaded")],
+                Duration::ZERO,
+            )),
+            Reply::sse(frames(&fs, Duration::ZERO)),
+        ],
+    );
+    let pool = Pool::new();
+    let (policy, sleeper) = fast_policy();
+    let p = pool.provider(&fake, policy);
+
+    let out = run_stream(&p, &pool, &stream_req("req_t19_ovl_ok"), limits(), None).await;
+    assert_eq!(kind(&out), "done 200 OK");
+    assert_eq!(
+        String::from_utf8_lossy(&body_bytes(response(out)).await),
+        fs.concat()
+    );
+    assert_eq!(sleeper.slept().len(), 1);
+    let st = state(&pool);
+    assert_eq!((st.lifetime.successes, st.lifetime.errors), (1, 0));
+}
+
+#[tokio::test]
+async fn pre_commit_transport_fault_fails_over() {
+    // Connection dropped after a ping (nothing committed).
+    let fake = FakeAnthropic::start().await;
+    let first = ping();
+    fake.script(
+        MESSAGES,
+        vec![
+            Reply::sse(frames(&[first.clone(), message_start()], Duration::ZERO))
+                .drop_after_bytes(first.len() + 5),
+        ],
+    );
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let p = pool.provider(&fake, policy);
+    let out = run_stream(&p, &pool, &stream_req("req_t19_drop"), limits(), None).await;
+    let k = kind(&out);
+    assert!(k.starts_with("retry 502 Bad Gateway transport:"), "{k}");
+    let resp = response(out);
+    assert_eq!(header(&resp, "x-pool-retryable-transport"), Some("1"));
+    let st = state(&pool);
+    assert!(matches!(
+        st.last_error.unwrap().reason,
+        FailReason::Transport(_)
+    ));
+    assert_eq!(st.lifetime.successes, 0);
+
+    // Headers then silence: the idle watchdog bounds pre-commit buffering.
+    let fake = FakeAnthropic::start().await;
+    fake.script(
+        MESSAGES,
+        vec![Reply::sse(frames(&[ping()], Duration::ZERO)).hold(Hold::Forever)],
+    );
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let p = pool.provider(&fake, policy);
+    let started = tokio::time::Instant::now();
+    let out = run_stream(
+        &p,
+        &pool,
+        &stream_req("req_t19_idle_pre"),
+        limits_idle(Duration::from_millis(200)),
+        None,
+    )
+    .await;
+    assert_eq!(kind(&out), "retry 502 Bad Gateway transport:idle_timeout");
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    // EOF with only pings: nothing committed, fail over.
+    let fake = FakeAnthropic::start().await;
+    fake.script(
+        MESSAGES,
+        vec![Reply::sse(frames(&[ping()], Duration::ZERO))],
+    );
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let p = pool.provider(&fake, policy);
+    let out = run_stream(&p, &pool, &stream_req("req_t19_eof_pre"), limits(), None).await;
+    assert_eq!(kind(&out), "retry 502 Bad Gateway transport:reset");
+}
+
+#[tokio::test]
+async fn terminal_event_closes_even_if_upstream_holds_socket() {
+    let fake = FakeAnthropic::start().await;
+    let fs = full_stream();
+    fake.script(
+        MESSAGES,
+        vec![Reply::sse(frames(&fs, Duration::ZERO)).hold(Hold::Forever)],
+    );
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let p = pool.provider(&fake, policy);
+    let rs = reservations();
+    let slot = reserve(&rs, &pool).await;
+
+    let out = run_stream(
+        &p,
+        &pool,
+        &stream_req("req_t19_hold"),
+        limits_idle(Duration::from_secs(30)),
+        Some(slot),
+    )
+    .await;
+    let AttemptOutcome::Done(resp, Some(usage)) = out else {
+        panic!("expected Done");
+    };
+    let got = tokio::time::timeout(Duration::from_secs(2), body_bytes(resp))
+        .await
+        .expect("response must close right after message_stop");
+    assert_eq!(String::from_utf8_lossy(&got), fs.concat());
+    assert!(usage.await.is_ok());
+    assert!(
+        released(&rs, &pool).await,
+        "reservation held by upstream socket"
+    );
+    assert_eq!(state(&pool).lifetime.successes, 1);
+}
+
+#[tokio::test]
+async fn eof_before_message_stop_is_truncation() {
+    let fake = FakeAnthropic::start().await;
+    fake.script(
+        MESSAGES,
+        vec![Reply::sse(frames(
+            // The last event even lacks its blank line: still not a terminal event.
+            &[
+                message_start(),
+                text_delta("partial"),
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n".into(),
+            ],
+            Duration::ZERO,
+        ))],
+    );
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let p = pool.provider(&fake, policy);
+    let rs = reservations();
+    let slot = reserve(&rs, &pool).await;
+
+    let out = run_stream(
+        &p,
+        &pool,
+        &stream_req("req_t19_trunc"),
+        limits(),
+        Some(slot),
+    )
+    .await;
+    let AttemptOutcome::Done(resp, Some(usage)) = out else {
+        panic!("expected Done (committed on message_start)");
+    };
+    let res = axum::body::to_bytes(resp.into_body(), usize::MAX).await;
+    assert!(
+        res.is_err(),
+        "truncated stream must end in an error, not a clean EOF"
+    );
+    assert!(usage.await.is_err(), "no usage for a truncated stream");
+    assert!(released(&rs, &pool).await);
+    let st = state(&pool);
+    assert_eq!(st.lifetime.successes, 0);
+    assert_eq!(
+        st.last_error.unwrap().reason,
+        FailReason::Transport(TransportKind::Reset)
+    );
+    assert!(log_line_with(&["req_t19_trunc", "upstream_truncated"]));
+}
+
+#[tokio::test]
+async fn post_commit_error_forwarded_and_recorded() {
+    // Rate-limit error after commit: forwarded verbatim, account benched.
+    let fake = FakeAnthropic::start().await;
+    let fs = vec![
+        message_start(),
+        text_delta("a"),
+        sse_error("rate_limit_error", "Rate limited"),
+    ];
+    fake.script(
+        MESSAGES,
+        vec![Reply::sse(frames(&fs, Duration::ZERO))
+            .header("request-id", "req_post_err")
+            .hold(Hold::Forever)],
+    );
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let p = pool.provider(&fake, policy);
+    let before = OffsetDateTime::now_utc();
+    let out = run_stream(&p, &pool, &stream_req("req_t19_post_rl"), limits(), None).await;
+    assert_eq!(kind(&out), "done 200 OK");
+    let got = tokio::time::timeout(Duration::from_secs(2), body_bytes(response(out)))
+        .await
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&got), fs.concat());
+    let st = state(&pool);
+    assert!(near(
+        st.rate_limited_until.unwrap(),
+        before + time::Duration::hours(1)
+    ));
+    let err = st.last_error.unwrap();
+    assert!(matches!(err.reason, FailReason::Quota { .. }));
+    assert_eq!(err.upstream_request_id.as_deref(), Some("req_post_err"));
+    assert_eq!(st.lifetime.successes, 0);
+
+    // Any other error type after commit: forwarded, recorded, not benched.
+    let fake = FakeAnthropic::start().await;
+    let fs = vec![message_start(), sse_error("api_error", "Internal error")];
+    fake.script(MESSAGES, vec![Reply::sse(frames(&fs, Duration::ZERO))]);
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let p = pool.provider(&fake, policy);
+    let out = run_stream(&p, &pool, &stream_req("req_t19_post_api"), limits(), None).await;
+    let got = body_bytes(response(out)).await;
+    assert_eq!(String::from_utf8_lossy(&got), fs.concat());
+    let st = state(&pool);
+    assert_eq!(st.rate_limited_until, None);
+    assert_eq!(st.last_error.unwrap().reason, FailReason::Status(502));
+    assert_eq!((st.lifetime.successes, st.lifetime.errors), (0, 1));
+}
+
+#[tokio::test]
+async fn usage_tap_counts_cache_tokens() {
+    let fake = FakeAnthropic::start().await;
+    fake.script(
+        MESSAGES,
+        vec![Reply::sse(frames(&full_stream(), Duration::ZERO))],
+    );
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let p = pool.provider(&fake, policy);
+    let out = run_stream(&p, &pool, &stream_req("req_t19_usage"), limits(), None).await;
+    let AttemptOutcome::Done(resp, Some(usage)) = out else {
+        panic!("expected Done");
+    };
+    body_bytes(resp).await;
+    assert_eq!(
+        usage.await.unwrap(),
+        TokenUsage {
+            input_tokens: 10,
+            output_tokens: 42,
+            cache_read: 7,
+            cache_write: 11,
+        }
+    );
+    let st = state(&pool);
+    assert_eq!(
+        (
+            st.lifetime.input_tokens,
+            st.lifetime.output_tokens,
+            st.lifetime.cache_read,
+            st.lifetime.cache_write
+        ),
+        (10, 42, 7, 11)
+    );
+}
+
+#[tokio::test]
+async fn prefix_cap_64kib_commits() {
+    // 64 KiB of pings (which never commit) and then silence: the cap commits anyway.
+    let pings: String = std::iter::repeat_n(ping(), 64 * 1024 / ping().len() + 1).collect();
+    assert!(pings.len() >= 64 * 1024);
+    let fake = FakeAnthropic::start().await;
+    fake.script(
+        MESSAGES,
+        vec![Reply::sse(vec![(Duration::ZERO, pings.clone())]).hold(Hold::Forever)],
+    );
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let p = pool.provider(&fake, policy);
+    let out = tokio::time::timeout(
+        Duration::from_secs(3),
+        run_stream(
+            &p,
+            &pool,
+            &stream_req("req_t19_cap"),
+            limits_idle(Duration::from_secs(30)),
+            None,
+        ),
+    )
+    .await
+    .expect("64 KiB of prefix must commit without waiting for more");
+    assert_eq!(kind(&out), "done 200 OK");
+    let mut body = response(out).into_body();
+    let mut got = Vec::new();
+    while got.len() < pings.len() {
+        use http_body_util::BodyExt;
+        let frame = body.frame().await.unwrap().unwrap();
+        got.extend_from_slice(&frame.into_data().unwrap());
+    }
+    assert_eq!(String::from_utf8_lossy(&got), pings);
+
+    // Below the cap, pings alone never commit: the idle watchdog ends the wait.
+    let fake = FakeAnthropic::start().await;
+    fake.script(
+        MESSAGES,
+        vec![Reply::sse(frames(&[ping(), ping()], Duration::ZERO)).hold(Hold::Forever)],
+    );
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let p = pool.provider(&fake, policy);
+    let out = run_stream(
+        &p,
+        &pool,
+        &stream_req("req_t19_cap_small"),
+        limits_idle(Duration::from_millis(200)),
+        None,
+    )
+    .await;
+    assert_eq!(kind(&out), "retry 502 Bad Gateway transport:idle_timeout");
+}
+
+#[tokio::test]
+async fn idle_watchdog_mid_stream_records_idle_timeout() {
+    let fake = FakeAnthropic::start().await;
+    fake.script(
+        MESSAGES,
+        vec![
+            Reply::sse(frames(&[message_start(), text_delta("a")], Duration::ZERO))
+                .hold(Hold::Forever),
+        ],
+    );
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let p = pool.provider(&fake, policy);
+    let rs = reservations();
+    let slot = reserve(&rs, &pool).await;
+    let idle = Duration::from_millis(300);
+    let out = run_stream(
+        &p,
+        &pool,
+        &stream_req("req_t19_idle"),
+        limits_idle(idle),
+        Some(slot),
+    )
+    .await;
+    assert_eq!(kind(&out), "done 200 OK");
+    let started = tokio::time::Instant::now();
+    let res = axum::body::to_bytes(response(out).into_body(), usize::MAX).await;
+    let waited = started.elapsed();
+    assert!(res.is_err(), "idle stream must end in an error");
+    assert!(waited >= idle - Duration::from_millis(50), "{waited:?}");
+    assert!(waited < Duration::from_secs(3), "{waited:?}");
+    assert!(released(&rs, &pool).await);
+    let st = state(&pool);
+    assert_eq!(
+        st.last_error.unwrap().reason,
+        FailReason::Transport(TransportKind::IdleTimeout)
+    );
+    assert_eq!(st.lifetime.successes, 0);
+    assert!(log_line_with(&["req_t19_idle", "idle_timeout"]));
+}
+
+/// A minimal real HTTP server: each request reserves the account, runs one attempt with the
+/// reservation and returns the attempt's response.
+async fn attempt_server(
+    p: Arc<AnthropicProvider>,
+    pool: Arc<Pool>,
+    rs: Reservations,
+) -> std::net::SocketAddr {
+    let seq = Arc::new(AtomicUsize::new(0));
+    serve(move |req: http::Request<Bytes>| {
+        let (p, pool, rs, seq) = (p.clone(), pool.clone(), rs.clone(), seq.clone());
+        async move {
+            let json: serde_json::Value = serde_json::from_slice(req.body()).unwrap();
+            let mut inbound = inbound(&json, req.headers().clone());
+            inbound.request_id = format!("req_t19_sock_{}", seq.fetch_add(1, Ordering::SeqCst));
+            let slot = reserve(&rs, &pool).await;
+            let lim = limits_idle(Duration::from_secs(30));
+            response(run_stream(&p, &pool, &inbound, lim, Some(slot)).await)
+        }
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_disconnect_mid_stream_releases_and_records_nothing() {
+    let fake = FakeAnthropic::start().await;
+    let fs = full_stream();
+    fake.script(
+        MESSAGES,
+        vec![
+            // Esc while the model is "thinking": upstream goes silent after one delta.
+            Reply::sse(frames(
+                &[message_start(), text_delta("partial")],
+                Duration::ZERO,
+            ))
+            .hold(Hold::Forever),
+            Reply::sse(frames(&fs, Duration::ZERO)),
+        ],
+    );
+    let pool = Arc::new(Pool::new());
+    let (policy, _) = fast_policy();
+    let p = Arc::new(pool.provider(&fake, policy));
+    let rs = reservations();
+    let addr = attempt_server(p, pool.clone(), rs.clone()).await;
+    let request = post_json("/v1/messages", stream_body().to_string().as_bytes());
+
+    let mut client = raw_client(addr, &request).await;
+    client.read_until(b"partial", Duration::from_secs(5)).await;
+    assert!(contains(&client.received, b"HTTP/1.1 200"));
+    assert_eq!(rs.in_flight(&pool.meta.id), 1, "held while streaming");
+    client.abort();
+
+    assert!(
+        released(&rs, &pool).await,
+        "reservation leaked after client abort"
+    );
+    let st = state(&pool);
+    assert!(
+        st.last_error.is_none(),
+        "client abort recorded on the account"
+    );
+    assert_eq!((st.lifetime.requests, st.lifetime.successes), (0, 0));
+    assert!(log_line_with(&["req_t19_sock_0", "client_cancelled"]));
+
+    // The server keeps serving.
+    let mut next = raw_client(addr, &request).await;
+    let got = next.read_to_end(Duration::from_secs(5)).await;
+    assert!(contains(&got, b"HTTP/1.1 200"));
+    assert!(contains(&got, message_stop().as_bytes()));
+    assert!(released(&rs, &pool).await);
+    assert_eq!(state(&pool).lifetime.successes, 1);
 }
