@@ -65,10 +65,30 @@ pub enum UsageError {
     Status(u16),
     #[error("account lacks entitlement")]
     Entitlement,
+    /// The response was not usable. Carries a static classification (`invalid_json`,
+    /// `no_windows`), never upstream text.
     #[error("unparseable usage response: {0}")]
     Parse(String),
+    /// No usable access token could be obtained for the poll.
+    #[error("access token unavailable: {0:?}")]
+    Refresh(RefreshErrorKind),
     #[error("usage polling not supported")]
     NotSupported,
+}
+
+impl UsageError {
+    /// Classified label for `usage_check.error` and logs: `transport:<kind>`, `status:<code>`,
+    /// `entitlement`, `parse:<class>`, `refresh:<kind>`, `not_supported`. Never upstream text.
+    pub fn label(&self) -> String {
+        match self {
+            UsageError::Transport(k) => format!("transport:{}", k.as_str()),
+            UsageError::Status(code) => format!("status:{code}"),
+            UsageError::Entitlement => "entitlement".into(),
+            UsageError::Parse(class) => format!("parse:{class}"),
+            UsageError::Refresh(k) => format!("refresh:{}", k.detail()),
+            UsageError::NotSupported => "not_supported".into(),
+        }
+    }
 }
 
 #[async_trait]
