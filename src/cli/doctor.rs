@@ -8,15 +8,19 @@
 //!   server, a hung listener or nothing `✗`).
 //! - **profile <id>**, per profile recorded in `config.toml`: still connected, pointing at this
 //!   pool, pins current. Connected while the pool is down is `✗` ("connected, pool down"):
-//!   Claude Code has no fallback for an unreachable base URL. Pins are compared with the pins the
-//!   pool's `/v1/models` listing derives, only for a family that listing yields a pin for (no live
-//!   catalog: not compared); stale pins are `!` (the pool re-syncs connected profiles every
-//!   minute).
-//! - **account <id>**: from the running pool's status, else from the files (`needs_login` and an
-//!   expired login `✗`; a login expiring within the largest `alerts.warn_days` `!`).
-//! - **upstream <origin>**: `HEAD` to the Anthropic API origin and the token origin (from config,
-//!   so tests point them at local fakes). Any HTTP answer is reachable; a timeout is `!` (slow or
-//!   offline network); a DNS, connect or TLS failure is `✗`.
+//!   Claude Code has no fallback for an unreachable base URL. Pins are compared with the pins
+//!   derived from the live Anthropic rows of the pool's `/v1/models` listing (see [`live_rows`]);
+//!   with no live rows they are not compared. Stale pins are `!` (the pool re-syncs connected
+//!   profiles every minute). A foreign base URL is shown as its origin only.
+//! - **account <id>**: the running pool's status (unreadable status: `✗`, no fallback), else,
+//!   with no pool, the files. `needs_login` / corrupt credentials `✗`; a recorded login expiry
+//!   that passed (the pool never acts on it) or falls within the largest `alerts.warn_days` `!`.
+//! - **upstream <origin>**: `HEAD` to the Anthropic API and token origins, plus the OpenAI/Codex
+//!   API and token origins when an OpenAI account exists (all from config, so tests point them at
+//!   local fakes). Any HTTP answer is reachable; a timeout is `!` (slow or offline network); a
+//!   DNS, connect or TLS failure is `✗`.
+//!
+//! Every call to the pool is bounded by 5 s, as is each upstream `HEAD`.
 //! - **clock**: skew against the `Date` header of the first upstream answer (`!` over 60 s, `✗`
 //!   over 5 min: sign-in and token expiry depend on it).
 //! - **permissions**: data dir and its subdirs without group/other access (0700), config,
@@ -39,6 +43,7 @@ use super::client::{self, Client, Located};
 use crate::accounts::Registry;
 use crate::claude_code::{derive_pins, is_connected, profile_of};
 use crate::config::{Config, Paths, ProfileRef};
+use crate::providers::anthropic::ANTHROPIC_OWNER;
 use crate::server::health::{probe_addr, Probe};
 use crate::service::{Backend, Env, SystemRunner};
 
@@ -156,11 +161,10 @@ pub async fn checks(paths: &Paths) -> Vec<Check> {
     out.push(health_check(addr, probe));
 
     let catalog = match daemon {
-        Some(c) => c
-            .get("/v1/models")
+        Some(c) => get_within(c, "/v1/models")
             .await
             .ok()
-            .and_then(|v| v["data"].as_array().cloned()),
+            .and_then(|v| v["data"].as_array().map(|rows| live_rows(rows))),
         None => None,
     };
     out.extend(profile_checks(
@@ -171,9 +175,14 @@ pub async fn checks(paths: &Paths) -> Vec<Check> {
         catalog.as_deref(),
     ));
     let warn_days = cfg.alerts.warn_days.iter().copied().max().unwrap_or(3);
-    out.extend(account_checks(paths, daemon, warn_days, OffsetDateTime::now_utc()).await);
+    let facts = account_facts(paths, daemon).await;
+    // Codex hosts matter only with an OpenAI account (unknown when the status is unreadable).
+    let openai = facts
+        .as_ref()
+        .is_ok_and(|(f, _)| f.iter().any(|a| a.provider == "openai"));
+    out.extend(account_checks(facts, warn_days, OffsetDateTime::now_utc()));
 
-    let (upstream, date) = upstream_checks(&cfg).await;
+    let (upstream, date) = upstream_checks(&cfg, openai).await;
     out.extend(upstream);
     out.push(clock_check(date, OffsetDateTime::now_utc()));
     out.extend(permission_checks(paths));
@@ -245,6 +254,34 @@ fn settings_env(settings_json: &Path) -> serde_json::Map<String, Value> {
         .unwrap_or_default()
 }
 
+/// Every doctor call to the pool is bounded by this.
+const POOL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `GET path` from the pool, giving up after [`POOL_TIMEOUT`].
+async fn get_within(c: &Client, path: &str) -> anyhow::Result<Value> {
+    match tokio::time::timeout(POOL_TIMEOUT, c.get(path)).await {
+        Ok(r) => r,
+        Err(_) => anyhow::bail!("no answer within {} s", POOL_TIMEOUT.as_secs()),
+    }
+}
+
+/// The rows of a `/v1/models` listing that came from Anthropic's live list. The pool does not say
+/// whether its live list was available, so they are told from the model table's stand-in rows,
+/// which carry only `id`, `object`, `created: 0` and `owned_by`: a live row has a `display_name`,
+/// a `max_input_tokens` or a non-zero `created`. Pins are compared only against live rows, so an
+/// unavailable catalog never reads as stale pins.
+fn live_rows(rows: &[Value]) -> Vec<Value> {
+    rows.iter()
+        .filter(|r| {
+            r["owned_by"] == ANTHROPIC_OWNER
+                && (r.get("display_name").is_some()
+                    || r.get("max_input_tokens").is_some()
+                    || r["created"].as_i64().is_some_and(|c| c != 0))
+        })
+        .cloned()
+        .collect()
+}
+
 fn profile_checks(
     paths: &Paths,
     profiles: &[ProfileRef],
@@ -260,7 +297,10 @@ fn profile_checks(
         )
         .hint("`pooltime connect <profile>`")];
     }
-    let want = catalog.map(derive_pins).unwrap_or_default();
+    let want = catalog
+        .filter(|c| !c.is_empty())
+        .map(derive_pins)
+        .unwrap_or_default();
     profiles
         .iter()
         .map(|r| {
@@ -287,7 +327,7 @@ fn profile_checks(
                 return Check::new(
                     Level::Fail,
                     label,
-                    format!("points at {url}, not this pool ({pool_url})"),
+                    format!("points at {}, not this pool ({pool_url})", shown_url(url)),
                 )
                 .hint(format!("`pooltime connect {}`", r.id));
             }
@@ -329,6 +369,8 @@ fn profile_checks(
 /// What the account checks need to know about one account.
 struct AccountFacts {
     id: String,
+    /// `anthropic` / `openai`.
+    provider: String,
     status: String,
     refresh_expires_at: Option<OffsetDateTime>,
 }
@@ -337,31 +379,38 @@ fn parse_ts(v: &Value) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(v.as_str()?, &time::format_description::well_known::Rfc3339).ok()
 }
 
-/// From the running pool's status, else (read-only) from the account files.
-async fn account_facts(paths: &Paths, daemon: Option<&Client>) -> (Vec<AccountFacts>, bool) {
+/// The accounts, and whether they are the running pool's view. `Err` (the reason) when a pool
+/// answers but its status cannot be read: the files may be stale while it runs, so there is no
+/// fallback to them then.
+type Facts = Result<(Vec<AccountFacts>, bool), String>;
+
+/// From the running pool's status, else (no pool; read-only) from the account files.
+async fn account_facts(paths: &Paths, daemon: Option<&Client>) -> Facts {
     if let Some(c) = daemon {
-        if let Ok(v) = c.get("/api/v1/status").await {
-            let facts = v["accounts"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .map(|a| AccountFacts {
-                            id: a["id"].as_str().unwrap_or("?").to_string(),
-                            status: a["status"].as_str().unwrap_or("?").to_string(),
-                            refresh_expires_at: parse_ts(&a["refresh_expires_at"]),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            return (facts, true);
-        }
+        let v = get_within(c, "/api/v1/status")
+            .await
+            .map_err(|e| format!("{e:#}"))?;
+        let facts = v["accounts"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|a| AccountFacts {
+                        id: a["id"].as_str().unwrap_or("?").to_string(),
+                        provider: a["provider"].as_str().unwrap_or("?").to_string(),
+                        status: a["status"].as_str().unwrap_or("?").to_string(),
+                        refresh_expires_at: parse_ts(&a["refresh_expires_at"]),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Ok((facts, true));
     }
     // `Registry::load` creates the accounts dir: only open it when it exists.
     if !paths.accounts.is_dir() {
-        return (Vec::new(), false);
+        return Ok((Vec::new(), false));
     }
     let Ok(reg) = Registry::load(paths) else {
-        return (Vec::new(), false);
+        return Ok((Vec::new(), false));
     };
     let facts = reg
         .list()
@@ -374,21 +423,27 @@ async fn account_facts(paths: &Paths, daemon: Option<&Client>) -> (Vec<AccountFa
             };
             AccountFacts {
                 id: m.id.as_str().to_string(),
+                provider: m.provider.as_str().to_string(),
                 status,
                 refresh_expires_at,
             }
         })
         .collect();
-    (facts, false)
+    Ok((facts, false))
 }
 
-async fn account_checks(
-    paths: &Paths,
-    daemon: Option<&Client>,
-    warn_days: u32,
-    now: OffsetDateTime,
-) -> Vec<Check> {
-    let (facts, live) = account_facts(paths, daemon).await;
+fn account_checks(facts: Facts, warn_days: u32, now: OffsetDateTime) -> Vec<Check> {
+    let (facts, live) = match facts {
+        Ok(f) => f,
+        Err(e) => {
+            return vec![Check::new(
+                Level::Fail,
+                "accounts",
+                format!("could not read pool status: {e}"),
+            )
+            .hint("see `pooltime logs`; restart it with `pooltime service restart`")]
+        }
+    };
     if facts.is_empty() {
         return vec![Check::new(Level::Fail, "accounts", "no accounts")
             .hint("`pooltime accounts login <name>` (or `pooltime import bro`)")];
@@ -418,8 +473,15 @@ fn account_check(a: AccountFacts, live: bool, warn_days: u32, now: OffsetDateTim
     }
     if let Some(exp) = a.refresh_expires_at {
         let left = exp - now;
+        // The pool never acts on this recorded clock (only a refused refresh makes an account
+        // needs_login, handled above), so a passed expiry on a working account is a warning.
         if left <= time::Duration::ZERO {
-            return Check::new(Level::Fail, label, "login expired").hint(login);
+            return Check::new(
+                Level::Warn,
+                label,
+                "recorded login expiry passed but the account still works; re-login to refresh it",
+            )
+            .hint(login);
         }
         if left <= time::Duration::days(i64::from(warn_days)) {
             let when = if left >= time::Duration::days(1) {
@@ -447,10 +509,24 @@ fn origin(url: &str) -> Option<String> {
     })
 }
 
-/// `HEAD` each Anthropic origin once; returns the checks and the first `Date` header seen.
-async fn upstream_checks(cfg: &Config) -> (Vec<Check>, Option<(String, OffsetDateTime)>) {
+/// What to show of a URL found in a settings file: its origin only (never userinfo, a path or a
+/// query).
+fn shown_url(url: &str) -> String {
+    origin(url).unwrap_or_else(|| "an unparsable URL".into())
+}
+
+/// `HEAD` each Anthropic origin (and, with `openai`, each OpenAI/Codex origin) once; returns the
+/// checks and the first `Date` header seen.
+async fn upstream_checks(
+    cfg: &Config,
+    openai: bool,
+) -> (Vec<Check>, Option<(String, OffsetDateTime)>) {
+    let mut urls = vec![&cfg.anthropic.api_base, &cfg.anthropic.token_url];
+    if openai {
+        urls.extend([&cfg.openai.api_base, &cfg.openai.token_url]);
+    }
     let mut origins: Vec<String> = Vec::new();
-    for u in [&cfg.anthropic.api_base, &cfg.anthropic.token_url] {
+    for u in urls {
         if let Some(o) = origin(u) {
             if !origins.contains(&o) {
                 origins.push(o);
@@ -702,6 +778,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let facts = |status: &str, days: Option<i64>| AccountFacts {
             id: "a".into(),
+            provider: "anthropic".into(),
             status: status.into(),
             refresh_expires_at: days.map(|d| now + time::Duration::days(d)),
         };
@@ -709,7 +786,8 @@ mod tests {
         assert_eq!(lvl(facts("ready", None)), Level::Ok);
         assert_eq!(lvl(facts("ready", Some(30))), Level::Ok);
         assert_eq!(lvl(facts("ready", Some(2))), Level::Warn);
-        assert_eq!(lvl(facts("ready", Some(-1))), Level::Fail);
+        // A passed recorded expiry on a working account: the pool still uses it.
+        assert_eq!(lvl(facts("ready", Some(-1))), Level::Warn);
         assert_eq!(lvl(facts("needs_login", None)), Level::Fail);
         assert_eq!(lvl(facts("billing", None)), Level::Warn);
         assert_eq!(lvl(facts("rate_limited", None)), Level::Ok);
@@ -725,6 +803,29 @@ mod tests {
             origin("http://127.0.0.1:9/x").as_deref(),
             Some("http://127.0.0.1:9")
         );
+    }
+
+    #[test]
+    fn pins_compare_only_against_live_rows() {
+        let table = serde_json::json!([
+            {"id": "claude-sonnet-4-5", "object": "model", "created": 0, "owned_by": ANTHROPIC_OWNER},
+            {"id": "gpt-5", "object": "model", "created": 0, "owned_by": "openai-chatgpt-pool"},
+        ]);
+        assert!(live_rows(table.as_array().unwrap()).is_empty());
+        let live = serde_json::json!([
+            {"id": "claude-sonnet-9", "object": "model", "created": 0, "owned_by": ANTHROPIC_OWNER,
+             "display_name": "Claude Sonnet 9"},
+        ]);
+        assert_eq!(live_rows(live.as_array().unwrap()).len(), 1);
+    }
+
+    #[test]
+    fn foreign_base_url_shows_only_its_origin() {
+        assert_eq!(
+            shown_url("https://user:pw@proxy.example:8443/path?key=s3cret"),
+            "https://proxy.example:8443"
+        );
+        assert_eq!(shown_url("not a url"), "an unparsable URL");
     }
 
     #[test]

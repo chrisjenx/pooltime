@@ -9,9 +9,10 @@
 //! 3. **Profiles.** Connect exactly the profiles named with `--connect default,claude-personal`
 //!    (ids as `pooltime connect` takes them), or, interactively, the ones picked from the
 //!    discovered `~/.claude*` list (current state shown). Never a profile that was not chosen.
-//!    Connecting needs a running pool: without one the step fails with how to start it.
-//! 4. (Status line and MCP registration come in a later release.)
-//! 5. **Doctor**, then the dashboard URL (`pooltime open`).
+//!    Connecting needs a running pool: without one the step fails with how to start it (or, when
+//!    the service is installed but did not come up, where to look).
+//! 4. **Doctor**, then the dashboard URL (`pooltime open`). (Spec step 4, the status line and MCP
+//!    registration, is not part of setup yet.)
 //!
 //! Interactive means stdin is a terminal and `--yes` is not given; `--yes` also binds a first
 //! sign-in to the account without asking. Every step reuses the command that does the same job
@@ -102,16 +103,8 @@ pub async fn run(paths: &Paths, args: SetupArgs) -> anyhow::Result<i32> {
     } else {
         client::find(paths).await.ok().flatten()
     };
-    let c = profiles_step(paths, &args, interactive, daemon.as_ref()).await;
+    let c = profiles_step(paths, &args, interactive, installed, daemon.as_ref()).await;
     report(&mut steps, c);
-    report(
-        &mut steps,
-        Check::new(
-            Level::Skip,
-            "status line & MCP",
-            "coming in a later release",
-        ),
-    );
 
     println!();
     let checks = doctor::checks(paths).await;
@@ -242,13 +235,19 @@ async fn service_step(paths: &Paths, args: &SetupArgs, interactive: bool) -> (Ch
         };
         return (c, true);
     }
-    let want = args.service
-        || ask(
+    let want = if args.service {
+        true
+    } else {
+        match ask(
             interactive,
             "Install the background service (starts pooltime at login)?",
         )
         .await
-        .unwrap_or(false);
+        {
+            Ok(w) => w,
+            Err(e) => return (Check::new(Level::Fail, label, format!("{e:#}")), false),
+        }
+    };
     if !want {
         let c = Check::new(
             Level::Warn,
@@ -320,6 +319,7 @@ async fn profiles_step(
     paths: &Paths,
     args: &SetupArgs,
     interactive: bool,
+    service_installed: bool,
     daemon: Option<&Client>,
 ) -> Check {
     let label = "profiles";
@@ -339,6 +339,12 @@ async fn profiles_step(
             .hint("connect later with `pooltime connect <profile>`");
     }
     if daemon.is_none() {
+        let hint = if service_installed {
+            "the service did not answer: check `pooltime service status` / `pooltime logs`, \
+             then re-run setup"
+        } else {
+            "start it with `pooltime serve` (or re-run setup with `--service`), then re-run setup"
+        };
         return Check::new(
             Level::Fail,
             label,
@@ -347,9 +353,7 @@ async fn profiles_step(
                 chosen.join(", ")
             ),
         )
-        .hint(
-            "start it with `pooltime serve` (or re-run setup with `--service`), then re-run setup",
-        );
+        .hint(hint);
     }
     match connect::connect(paths, chosen.clone(), false).await {
         Ok(0) => Check::new(Level::Ok, label, format!("connected {}", chosen.join(", "))),
