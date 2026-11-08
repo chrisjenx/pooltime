@@ -11,6 +11,8 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
       "status_since": "2026-11-05T08:30:00Z",
       "reason": null,
       "until": null,
+      "class": null,
+      "count": null,
       "priority": 10,
       "weight": 2.0,
       "weight_override": {
@@ -55,6 +57,8 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
       "status_since": "2026-11-07T11:58:00Z",
       "reason": "quota:5h",
       "until": "2026-11-07T15:00:00Z",
+      "class": null,
+      "count": null,
       "priority": 100,
       "weight": 1.0,
       "weight_override": null,
@@ -93,6 +97,8 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
       "status_since": "2026-11-06T00:00:00Z",
       "reason": "refresh_token_dead",
       "until": null,
+      "class": null,
+      "count": null,
       "priority": 100,
       "weight": 1.0,
       "weight_override": null,
@@ -115,6 +121,8 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
       "status_since": null,
       "reason": "billing",
       "until": null,
+      "class": null,
+      "count": null,
       "priority": 100,
       "weight": 1.0,
       "weight_override": null,
@@ -135,6 +143,11 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
     "seven_day_left_total": 0.73,
     "accounts": 4,
     "available": 1
+  },
+  "counts": {
+    "needs_login": 1,
+    "expiring_today": 0,
+    "expiring": 0
   },
   "tuning": {
     "five_hour_exp": 1.0,

@@ -12,8 +12,10 @@
 //!
 //! # Errors
 //! Same envelope as the inference side, `{"type":"error","error":{"type","message"}}`, so
-//! clients read `.error.message` everywhere. Status words are the five of spec §16
-//! (`ready | needs_login | rate_limited | billing | access_denied`).
+//! clients read `.error.message` everywhere. Status words are spec §4's, one per account in
+//! severity order (`needs_login | billing | access_denied | erroring | rate_limited | expiring |
+//! ready`); see [`crate::health::states`]. `expiring` carries its expiry in `until`, `erroring`
+//! its `class` and `count`; `counts` holds the dashboard banner's numbers.
 //!
 //! [`build_status`] is a pure function of [`StatusInputs`] and a clock, which is what makes the
 //! status shape snapshot-testable; [`gather`] does the I/O. For authorized requests (bearer or session cookie) the HTTP
@@ -56,6 +58,7 @@ use crate::accounts::{
 use crate::claude_code::{discover, profile_of, Profile};
 use crate::config::{Config, Paths, ProfileRef};
 use crate::fsutil::WriteOutcome;
+use crate::health::states::{derive_health, expiring_since, warn_window};
 use crate::models::Mapping;
 use crate::providers::anthropic::anthropic_error;
 use crate::providers::ProviderId;
@@ -287,8 +290,13 @@ pub enum CredsInfo {
 #[derive(Debug, Clone)]
 pub struct AccountView {
     pub meta: AccountMeta,
+    /// The one state shown (availability plus the `expiring` / `erroring` health layer).
     pub status: AccountStatus,
-    /// When the account entered `status` (latest timeline row); `None` if never recorded.
+    /// Whether its routing availability is `ready` (true for every `expiring` account, and for an
+    /// `erroring` one unless it is also rate-limited): `pool.available` counts these.
+    pub available: bool,
+    /// When the account entered `status`: latest timeline row; for `expiring` the start of the
+    /// warn window, for `erroring` the first failure of the streak. `None` if unknown.
     pub status_since: Option<OffsetDateTime>,
     pub state: AccountState,
     pub creds: CredsInfo,
@@ -304,6 +312,8 @@ pub struct StatusInputs {
     pub mappings: Vec<Mapping>,
     /// `from` families of mappings whose target is missing ([`crate::models::ModelTable::inert_mappings`]).
     pub inert_mappings: Vec<String>,
+    /// Login-expiry warn window (`alerts.warn_days[0]`), for the banner `counts`.
+    pub expiry_warn: time::Duration,
 }
 
 fn round4(x: f64) -> f64 {
@@ -345,6 +355,8 @@ fn reason_of(v: &AccountView, now: OffsetDateTime) -> Option<String> {
         AccountStatus::RateLimited { window: None, .. } => Some("quota".into()),
         AccountStatus::Billing => Some("billing".into()),
         AccountStatus::AccessDenied { .. } => Some("access_denied".into()),
+        AccountStatus::Expiring { .. } => Some("refresh_token_expiring".into()),
+        AccountStatus::Erroring { class, .. } => Some(class.clone()),
     }
 }
 
@@ -360,10 +372,14 @@ fn account_json(v: &AccountView, now: OffsetDateTime) -> Value {
         _ => &[],
     };
     let until = match &v.status {
-        AccountStatus::RateLimited { until, .. } | AccountStatus::AccessDenied { until } => {
-            Some(*until)
-        }
+        AccountStatus::RateLimited { until, .. }
+        | AccountStatus::AccessDenied { until }
+        | AccountStatus::Expiring { expires_at: until } => Some(*until),
         _ => None,
+    };
+    let (class, count) = match &v.status {
+        AccountStatus::Erroring { class, count } => (Some(class.as_str()), Some(*count)),
+        _ => (None, None),
     };
     let active = v.meta.weight_override.as_ref().filter(|o| o.until > now);
     let (expires_at, refresh_expires_at) = match &v.creds {
@@ -380,6 +396,8 @@ fn account_json(v: &AccountView, now: OffsetDateTime) -> Value {
         "status_since": ts_opt(v.status_since),
         "reason": reason_of(v, now),
         "until": ts_opt(until),
+        "class": class,
+        "count": count,
         "priority": v.meta.priority,
         "weight": v.meta.weight,
         "weight_override": active.map(override_json),
@@ -435,6 +453,36 @@ fn inert_families(t: &crate::models::ModelTable) -> Vec<String> {
         .collect()
 }
 
+/// The dashboard banner's numbers ("N accounts need login · M expire today"): `needs_login`
+/// accounts; `expiring` = every other account whose known login expiry is within the warn
+/// window (whatever state it shows, e.g. also rate-limited); `expiring_today` = those within
+/// 24 h (or passed). An unknown expiry never counts.
+fn banner_counts(inputs: &StatusInputs, now: OffsetDateTime) -> Value {
+    let needs_login = inputs
+        .accounts
+        .iter()
+        .filter(|v| v.status == AccountStatus::NeedsLogin)
+        .count();
+    let left: Vec<time::Duration> = inputs
+        .accounts
+        .iter()
+        .filter(|v| v.status != AccountStatus::NeedsLogin)
+        .filter_map(|v| match v.creds {
+            CredsInfo::Present {
+                refresh_expires_at: Some(t),
+                ..
+            } => Some(t - now),
+            _ => None,
+        })
+        .filter(|d| *d <= inputs.expiry_warn)
+        .collect();
+    json!({
+        "needs_login": needs_login,
+        "expiring_today": left.iter().filter(|d| **d <= time::Duration::DAY).count(),
+        "expiring": left.len(),
+    })
+}
+
 /// The `GET /api/v1/status` document at `now`. Pure: no clock, no I/O.
 ///
 /// `pool.seven_day_left_total` counts one account as one subscription (spec §5): the sum of the
@@ -450,11 +498,7 @@ pub fn build_status(inputs: &StatusInputs, now: OffsetDateTime) -> Value {
         .iter()
         .filter_map(|a| a["seven_day_left"].as_f64())
         .sum();
-    let available = inputs
-        .accounts
-        .iter()
-        .filter(|v| v.status == AccountStatus::Ready)
-        .count();
+    let available = inputs.accounts.iter().filter(|v| v.available).count();
     json!({
         "accounts": accounts,
         "pool": {
@@ -462,6 +506,7 @@ pub fn build_status(inputs: &StatusInputs, now: OffsetDateTime) -> Value {
             "accounts": inputs.accounts.len(),
             "available": available,
         },
+        "counts": banner_counts(inputs, now),
         "tuning": tuning_json(&inputs.tuning),
         "mapping": mapping_json(inputs.mapping_enabled, &inputs.mappings, &inputs.inert_mappings),
         "version": env!("CARGO_PKG_VERSION"),
@@ -518,15 +563,40 @@ pub async fn gather(app: &Arc<AppState>, now: OffsetDateTime) -> Result<StatusIn
         tracing::warn!(error = %format!("{e:#}"), "state flush failed before status read");
     }
     let a = app.clone();
+    let warn = warn_window(&app.cfg.alerts.warn_days);
     let accounts = blocking(move || {
         metas
             .into_iter()
             .map(|(meta, creds)| {
-                let status =
+                let availability =
                     a.state
                         .status(&meta.id, matches!(creds, CredsInfo::Present { .. }), now);
+                let available = availability == AccountStatus::Ready;
+                let erroring = a.state.erroring(&meta.id, now);
+                let refresh_expires_at = match &creds {
+                    CredsInfo::Present {
+                        refresh_expires_at, ..
+                    } => *refresh_expires_at,
+                    _ => None,
+                };
+                let status = derive_health(
+                    availability,
+                    erroring.as_ref(),
+                    refresh_expires_at,
+                    warn,
+                    now,
+                );
+                // The health layer's states are not in the timeline: their start is known here.
+                let since = match &status {
+                    AccountStatus::Expiring { expires_at } => {
+                        Some(expiring_since(*expires_at, warn))
+                    }
+                    AccountStatus::Erroring { .. } => erroring.map(|e| e.since),
+                    s => status_since(&a, &meta.id, s.label()),
+                };
                 AccountView {
-                    status_since: status_since(&a, &meta.id, status.label()),
+                    status_since: since,
+                    available,
                     state: a.state.state(&meta.id, now),
                     in_flight: a.reservations.in_flight(&meta.id),
                     sessions: a.sessions.active_count(&meta.id, now),
@@ -552,6 +622,7 @@ pub async fn gather(app: &Arc<AppState>, now: OffsetDateTime) -> Result<StatusIn
         mapping_enabled,
         mappings,
         inert_mappings,
+        expiry_warn: warn,
     })
 }
 

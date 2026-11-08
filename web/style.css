@@ -231,6 +231,8 @@ td.barcell { width: 34%; }
 .pill.billing { background: var(--bad-bg); color: var(--bad); }
 .pill.access_denied { background: var(--info-bg); color: var(--info); }
 .pill.rate_limited { background: var(--warn-bg); color: var(--warn); }
+.pill.erroring { background: var(--bad-bg); color: var(--bad); border-style: dashed; border-color: var(--bad); }
+.pill.expiring { background: var(--warn-bg); color: var(--warn); border-color: var(--warn); }
 .pill.badge { background: var(--track); color: var(--muted); font-weight: 500; }
 .pill.badge.warn { background: var(--warn-bg); color: var(--warn); }
 
@@ -249,7 +251,8 @@ td.barcell { width: 34%; }
 }
 .card.sev-needs_login, .card.sev-billing { border-left: 4px solid var(--bad); }
 .card.sev-access_denied { border-left: 4px solid var(--info); }
-.card.sev-rate_limited { border-left: 4px solid var(--warn); }
+.card.sev-rate_limited, .card.sev-expiring { border-left: 4px solid var(--warn); }
+.card.sev-erroring { border-left: 4px dashed var(--bad); }
 .card.sev-ready { border-left: 4px solid var(--ok); }
 .card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .card-head h3 { font-size: 15px; }

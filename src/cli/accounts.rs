@@ -67,16 +67,17 @@ pub enum AccountsCmd {
     },
     /// Sign in (or re-login) an account; creates it when it does not exist.
     Login(LoginArgs),
-    /// Sign in several accounts one after another.
+    /// Sign in several accounts one after another (each finishes before the next starts).
     #[command(group(ArgGroup::new("which").required(true).args(["expiring", "dead", "all"])))]
     Relogin {
-        /// Accounts whose login expires within DAYS days (default 3).
-        #[arg(long, value_name = "DAYS", num_args = 0..=1, default_missing_value = "3")]
-        expiring: Option<u32>,
+        /// Accounts whose login expires within DAYS days (default: the first `alerts.warn_days`
+        /// entry, 3).
+        #[arg(long, value_name = "DAYS", num_args = 0..=1)]
+        expiring: Option<Option<u32>>,
         /// Accounts that need login.
         #[arg(long)]
         dead: bool,
-        /// Every Claude account.
+        /// Every account.
         #[arg(long)]
         all: bool,
         #[command(flatten)]
@@ -241,7 +242,10 @@ pub async fn run(paths: &Paths, cmd: AccountsCmd) -> anyhow::Result<i32> {
             dead,
             all,
             signin,
-        } => relogin(paths, expiring, dead, all, &signin).await,
+        } => {
+            let cfg = Config::load(paths).unwrap_or_default();
+            relogin(paths, expiring_days(expiring, &cfg), dead, all, &signin).await
+        }
         AccountsCmd::Remove { name, yes } => {
             let c = client::require(paths).await?;
             if !yes
@@ -719,7 +723,20 @@ async fn spike_login_hint(paths: &Paths, hint: &str, flags: &SignInFlags) -> any
     Ok(0)
 }
 
-/// Which accounts `relogin` walks, from the status document at its `now`.
+/// `--expiring` without a value means the first `alerts.warn_days` entry.
+fn expiring_days(flag: Option<Option<u32>>, cfg: &Config) -> Option<u32> {
+    let default = cfg
+        .alerts
+        .warn_days
+        .first()
+        .copied()
+        .unwrap_or(crate::health::states::DEFAULT_WARN_DAYS);
+    flag.map(|d| d.unwrap_or(default))
+}
+
+/// Which accounts `relogin` walks, from the status document at its `now`: `--dead` =
+/// `needs_login`, `--expiring` = a known login expiry within the days (not `needs_login`),
+/// `--all` = every account.
 fn select_relogin(status: &Value, expiring: Option<u32>, dead: bool, all: bool) -> Vec<String> {
     let now = status["now"]
         .as_str()
@@ -729,7 +746,6 @@ fn select_relogin(status: &Value, expiring: Option<u32>, dead: bool, all: bool) 
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|a| a["provider"] == "anthropic")
         .filter(|a| {
             let needs_login = a["status"] == "needs_login";
             let expires_within = |days: u32| {
@@ -770,17 +786,72 @@ async fn relogin(
         println!("no accounts to re-login");
         return Ok(0);
     }
-    let mut saved = 0;
-    for (i, id) in ids.iter().enumerate() {
-        println!("\n[{}/{}] {id}", i + 1, ids.len());
-        match login(paths, Some(&c), id, None, flags).await {
-            Ok(true) => saved += 1,
-            Ok(false) => {}
-            Err(e) => eprintln!("{id}: {e:#}"),
+    // `None` hint: the sign-in pre-fills the account's email on file (login_hint), as `login`.
+    let results = walk(&ids, |id| {
+        let c = &c;
+        async move { login(paths, Some(c), &id, None, flags).await }
+    })
+    .await;
+    println!("\n{}", summary(&results));
+    let all_saved = results.iter().all(|(_, r)| matches!(r, Walked::Saved));
+    Ok(if all_saved { 0 } else { 1 })
+}
+
+/// How one account's sign-in in a `relogin` walk ended.
+#[derive(Debug)]
+enum Walked {
+    Saved,
+    NotSaved,
+    Failed(String),
+}
+
+impl Walked {
+    fn line(&self, id: &str) -> String {
+        match self {
+            Walked::Saved => format!("{id}: signed in"),
+            Walked::NotSaved => format!("{id}: not signed in"),
+            Walked::Failed(e) => format!("{id}: failed: {e}"),
         }
     }
-    println!("\nre-logged in {saved} of {} accounts", ids.len());
-    Ok(if saved == ids.len() { 0 } else { 1 })
+}
+
+/// Sign `ids` in strictly one after another: each sign-in ends (saved, refused, failed or timed
+/// out) before the next starts, so their login clocks line up. Prints a result line per account.
+async fn walk<F, Fut>(ids: &[String], mut one: F) -> Vec<(String, Walked)>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let mut out = Vec::with_capacity(ids.len());
+    for (i, id) in ids.iter().enumerate() {
+        println!("\n[{}/{}] {id}", i + 1, ids.len());
+        let r = match one(id.clone()).await {
+            Ok(true) => Walked::Saved,
+            Ok(false) => Walked::NotSaved,
+            Err(e) => Walked::Failed(format!("{e:#}")),
+        };
+        println!("{}", r.line(id));
+        out.push((id.clone(), r));
+    }
+    out
+}
+
+/// `re-logged in N of M accounts`, naming the ones that were not.
+fn summary(results: &[(String, Walked)]) -> String {
+    let missed: Vec<&str> = results
+        .iter()
+        .filter(|(_, r)| !matches!(r, Walked::Saved))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let mut s = format!(
+        "re-logged in {} of {} accounts",
+        results.len() - missed.len(),
+        results.len()
+    );
+    if !missed.is_empty() {
+        s.push_str(&format!(" (not signed in: {})", missed.join(", ")));
+    }
+    s
 }
 
 #[cfg(test)]
@@ -825,16 +896,66 @@ mod tests {
                 {"id": "codex", "provider": "openai", "status": "needs_login"}
             ]
         });
-        assert_eq!(select_relogin(&s, None, true, false), ["dead"]);
+        assert_eq!(select_relogin(&s, None, true, false), ["dead", "codex"]);
         assert_eq!(select_relogin(&s, Some(3), false, false), ["soon"]);
         assert_eq!(
             select_relogin(&s, Some(1), false, false),
             Vec::<String>::new()
         );
-        assert_eq!(select_relogin(&s, Some(3), true, false), ["dead", "soon"]);
+        assert_eq!(
+            select_relogin(&s, Some(3), true, false),
+            ["dead", "soon", "codex"]
+        );
         assert_eq!(
             select_relogin(&s, None, false, true),
-            ["dead", "soon", "later"]
+            ["dead", "soon", "later", "codex"]
+        );
+    }
+
+    #[test]
+    fn relogin_expiring_defaults_to_warn_days() {
+        let cfg = Config::default();
+        assert_eq!(expiring_days(Some(None), &cfg), Some(3));
+        assert_eq!(expiring_days(Some(Some(7)), &cfg), Some(7));
+        assert_eq!(expiring_days(None, &cfg), None);
+        let mut one = Config::default();
+        one.alerts.warn_days = vec![1, 0];
+        assert_eq!(expiring_days(Some(None), &one), Some(1));
+    }
+
+    #[tokio::test]
+    async fn relogin_all_walks_in_sequence() {
+        use std::sync::Mutex;
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ids: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+        let results = walk(&ids, |id| {
+            let log = log.clone();
+            async move {
+                log.lock().unwrap().push(format!("start {id}"));
+                // The first sign-in is the slowest: a concurrent walk would interleave.
+                let ms = if id == "a" { 80 } else { 5 };
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                log.lock().unwrap().push(format!("end {id}"));
+                match id.as_str() {
+                    "b" => Err(anyhow!("timed out")),
+                    "c" => Ok(false),
+                    _ => Ok(true),
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["start a", "end a", "start b", "end b", "start c", "end c"]
+        );
+        let lines: Vec<String> = results.iter().map(|(id, r)| r.line(id)).collect();
+        assert_eq!(
+            lines,
+            ["a: signed in", "b: failed: timed out", "c: not signed in"]
+        );
+        assert_eq!(
+            summary(&results),
+            "re-logged in 1 of 3 accounts (not signed in: b, c)"
         );
     }
 }
