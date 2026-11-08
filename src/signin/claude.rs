@@ -525,7 +525,8 @@ impl Flow {
     async fn save(&self, creds: Credentials, identity: Identity) -> anyhow::Result<()> {
         let (reg, id) = (self.registry.clone(), self.account.clone());
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let _guard = reg.lock(&id)?;
+            // Never recreate a deleted account's dir: refuse before writing anything.
+            let _guard = reg.lock_existing(&id)?;
             reg.write_creds_unlocked(&id, &creds)
         })
         .await
@@ -953,6 +954,20 @@ mod tests {
         assert!(!fx.state.is_refresh_dead(&fx.id, OLD_RT));
         // One-shot: the held credentials are gone.
         assert!(handle.bind().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_after_account_delete_recreates_nothing() {
+        let fx = fx(Identity::default(), UUID_A).await;
+        let p = fx.flow.start(&fx.id, None, SignInMode::PasteCode).unwrap();
+        let handle = p.handle();
+        p.submit_code(&format!("the-code#{STATE}")).unwrap();
+        assert!(matches!(p.wait().await, SignInResult::NeedsBinding { .. }));
+        fx.reg.remove(&fx.id).unwrap();
+        let err = handle.bind().await.unwrap_err();
+        assert!(format!("{err:#}").contains("no longer exists"), "{err:#}");
+        let dir = Paths::under(fx._dir.path()).accounts.join(fx.id.as_str());
+        assert!(!dir.exists(), "account dir recreated");
     }
 
     #[tokio::test]
