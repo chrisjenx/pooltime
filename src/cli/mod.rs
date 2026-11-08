@@ -1,3 +1,15 @@
+//! The `pooltime` command line. `serve` runs the daemon; every other command is a thin client of
+//! its management API ([`client`]), except `logs` (reads the log files), `disconnect` and
+//! `accounts login` (both fall back to working in-process when no daemon is running).
+
+pub mod accounts;
+pub mod client;
+pub mod connect;
+pub mod logs;
+pub mod models;
+pub mod open;
+pub mod status;
+
 use std::ffi::OsString;
 use std::net::IpAddr;
 
@@ -18,6 +30,35 @@ pub struct Cli {
 pub enum Command {
     /// Run the pool daemon in the foreground.
     Serve(ServeFlags),
+    /// One-screen summary: accounts, 7-day headroom, alerts.
+    Status {
+        /// Print the raw status JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage pooled accounts.
+    #[command(subcommand)]
+    Accounts(accounts::AccountsCmd),
+    /// Point Claude Code profiles at the pool.
+    Connect {
+        /// Profile ids (`default`, `claude-personal`, ...) or settings directories.
+        profiles: Vec<String>,
+        /// Every Claude Code profile found under ~/.claude*.
+        #[arg(long, conflicts_with = "profiles")]
+        all: bool,
+    },
+    /// Restore Claude Code profiles' own settings (all connected ones if none are named).
+    Disconnect {
+        /// Profile ids or settings directories.
+        profiles: Vec<String>,
+    },
+    /// The models the pool serves.
+    #[command(subcommand)]
+    Models(models::ModelsCmd),
+    /// Print the dashboard URL and open it in the browser.
+    Open,
+    /// Show the daemon's logs.
+    Logs(logs::LogsArgs),
 }
 
 /// `pooltime serve` flags. `--port`/`--host` override `config.toml` and `POOLTIME_PORT`/`POOLTIME_HOST`.
@@ -43,14 +84,56 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
             return Ok(e.exit_code());
         }
     };
-    match cli.command {
-        Some(Command::Serve(flags)) => {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
-            rt.block_on(crate::server::daemon::run_daemon(Paths::resolve(), flags))?;
-            Ok(0)
+    let Some(command) = cli.command else {
+        return Ok(0);
+    };
+    let paths = Paths::resolve();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        match command {
+            Command::Serve(flags) => {
+                crate::server::daemon::run_daemon(paths, flags).await?;
+                Ok(0)
+            }
+            Command::Status { json } => status::run(&client::require(&paths).await?, json).await,
+            Command::Accounts(cmd) => accounts::run(&paths, cmd).await,
+            Command::Connect { profiles, all } => connect::connect(&paths, profiles, all).await,
+            Command::Disconnect { profiles } => connect::disconnect(&paths, profiles).await,
+            Command::Models(cmd) => models::run(&paths, cmd).await,
+            Command::Open => open::run(&paths).await,
+            // Blocking file reads; nothing else runs on this runtime meanwhile.
+            Command::Logs(args) => logs::run(&paths, args),
         }
-        None => Ok(0),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn spike_flag_is_hidden_and_replaces_the_name() {
+        let mut cmd = Cli::command();
+        let login = cmd
+            .find_subcommand_mut("accounts")
+            .unwrap()
+            .find_subcommand_mut("login")
+            .unwrap();
+        let help = login.render_long_help().to_string();
+        assert!(!help.contains("spike"), "{help}");
+        let parse = |args: &[&str]| Cli::try_parse_from([&["pooltime"], args].concat());
+        assert!(parse(&["accounts", "login", "--spike-login-hint", "a@b"]).is_ok());
+        assert!(parse(&["accounts", "login"]).is_err());
+        assert!(parse(&["accounts", "relogin"]).is_err());
+        assert!(parse(&["accounts", "relogin", "--expiring"]).is_ok());
+        assert!(parse(&["accounts", "add", "x", "--email", "a@b"]).is_err());
     }
 }
