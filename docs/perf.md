@@ -65,7 +65,8 @@ In short:
   idles at about 40% of bro's memory, uses about a fifth of bro's memory under 50 streams, and
   starts 1.5× (first boot) to 2.7× (restart) faster.
 - **Realistic**: pooltime still uses less memory than bro at every sample and starts faster, but
-  the idle gap narrows to about 11 MiB, from 30 MiB in the default run. Almost all of pooltime's
+  the idle gap narrows from 30 MiB in the default run to about 11 MiB at 360 s (only about
+  3.4 MiB at 60 s, and about 5.9 MiB at the peaks). Almost all of pooltime's
   growth comes from the connected profile. RSS rises from 19 MiB at boot to 52 MiB once the
   5.5 MiB `.claude.json` has been parsed and rewritten (connect, then the first sync). It settles at
   about 47 MiB from 120 s on and stays flat to 360 s: the per-minute sync's memo skips the

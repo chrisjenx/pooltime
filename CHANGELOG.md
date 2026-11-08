@@ -35,5 +35,5 @@ First stable release. pooltime replaces the pool in bro-cli.
 
 ### Performance
 
-On the same machine as bro, against fake upstreams: about a third of bro's idle memory and faster
-cold starts. See [`docs/perf.md`](docs/perf.md).
+On the same machine as bro, against fake upstreams: about 40% of bro's idle memory in a fresh
+daemon (the gap narrows with a large connected `.claude.json`) and 1.5–2.7× faster cold starts. See [`docs/perf.md`](docs/perf.md).
