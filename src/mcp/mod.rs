@@ -32,19 +32,22 @@ use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use http::header::AUTHORIZATION;
 use http::{HeaderMap, StatusCode};
 use serde_json::{json, Value};
 
 use crate::config::Paths;
 use crate::providers::anthropic::anthropic_error;
-use crate::server::auth::keys_match;
+use crate::server::auth::{bearer_of, keys_match};
 use crate::server::mgmt::ensure_key_file;
 use crate::server::router::{method_not_allowed, read_json_limited};
 use crate::server::AppState;
 
-/// Protocol revisions this server speaks; the first is offered when the client asks for another.
-pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-11-25", "2025-03-26", "2024-11-05"];
+/// Protocol revisions this server speaks, newest first; the newest is offered when the client
+/// asks for another.
+pub const PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The header a client sends on every request after `initialize` (MCP HTTP transport).
+const PROTOCOL_HEADER: &str = "mcp-protocol-version";
 
 /// MCP messages are small; anything larger is refused.
 const BODY_LIMIT: usize = 1024 * 1024;
@@ -78,14 +81,7 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
 
 /// Whether `h` carries `Bearer <key>` (constant-time compare; an empty key matches nothing).
 fn bearer_matches(h: &HeaderMap, key: &str) -> bool {
-    !key.is_empty()
-        && h.get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                let (scheme, rest) = v.split_once(' ')?;
-                scheme.eq_ignore_ascii_case("bearer").then_some(rest)
-            })
-            .is_some_and(|k| keys_match(k, key))
+    !key.is_empty() && bearer_of(h).is_some_and(|k| keys_match(k, key))
 }
 
 async fn require_mcp(State(app): State<Arc<AppState>>, req: Request, next: Next) -> Response {
@@ -108,7 +104,31 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
+/// `MCP-Protocol-Version`, when sent, must name a revision we speak (the transport says to
+/// answer 400 otherwise).
+fn protocol_header_ok(h: &HeaderMap) -> bool {
+    match h.get(PROTOCOL_HEADER) {
+        None => true,
+        Some(v) => v
+            .to_str()
+            .is_ok_and(|v| PROTOCOL_VERSIONS.contains(&v.trim())),
+    }
+}
+
 async fn handle(State(app): State<Arc<AppState>>, headers: HeaderMap, body: Body) -> Response {
+    if !protocol_header_ok(&headers) {
+        return reply(
+            StatusCode::BAD_REQUEST,
+            rpc_error(
+                Value::Null,
+                INVALID_REQUEST,
+                &format!(
+                    "unsupported MCP-Protocol-Version (supported: {})",
+                    PROTOCOL_VERSIONS.join(", ")
+                ),
+            ),
+        );
+    }
     let msg = match read_json_limited(&headers, body, BODY_LIMIT).await {
         Ok((_, v)) => v,
         Err(r) if r.status() == StatusCode::PAYLOAD_TOO_LARGE => return r,
@@ -134,6 +154,22 @@ async fn handle(State(app): State<Arc<AppState>>, headers: HeaderMap, body: Body
         return StatusCode::ACCEPTED.into_response();
     };
     let id = id.clone();
+    if msg.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return reply(
+            StatusCode::OK,
+            rpc_error(id, INVALID_REQUEST, "jsonrpc must be \"2.0\""),
+        );
+    }
+    if !(id.is_string() || id.is_number()) {
+        return reply(
+            StatusCode::OK,
+            rpc_error(
+                Value::Null,
+                INVALID_REQUEST,
+                "id must be a string or a number",
+            ),
+        );
+    }
     let Some(method) = method.as_str() else {
         return reply(
             StatusCode::OK,
@@ -175,6 +211,7 @@ fn initialize(params: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http::header::AUTHORIZATION;
 
     #[test]
     fn bearer_rules() {
@@ -187,6 +224,20 @@ mod tests {
         assert!(bearer_matches(&h, "k"));
         h.insert(AUTHORIZATION, "k".parse().unwrap());
         assert!(!bearer_matches(&h, "k"));
+    }
+
+    #[test]
+    fn protocol_header_rules() {
+        let mut h = HeaderMap::new();
+        assert!(protocol_header_ok(&h), "absent is fine");
+        h.insert(PROTOCOL_HEADER, "2025-06-18".parse().unwrap());
+        assert!(protocol_header_ok(&h));
+        h.insert(PROTOCOL_HEADER, "1999-01-01".parse().unwrap());
+        assert!(!protocol_header_ok(&h));
+        assert_eq!(
+            PROTOCOL_VERSIONS[0], "2025-11-25",
+            "the newest is the fallback"
+        );
     }
 
     #[test]

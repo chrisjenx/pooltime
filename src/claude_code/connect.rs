@@ -26,10 +26,11 @@ use rand::RngExt;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
-use super::pins::{derive_pins, max_context};
+use super::fable_cache::refresh_rows;
+use super::pins::{derive_pins, max_context, newest_fable};
 use super::scrub::{context_is_managed, CONTEXT_KEY};
 use super::statusline::{install as install_statusline, restore as restore_statusline};
-use super::{apply, clear, is_connected, rewrite_fable_rows, EnvBlock, Pin, Pins, Profile};
+use super::{apply, clear, is_connected, patch_json, EnvBlock, Pin, Pins, Profile};
 use crate::config::{Config, Paths, ProfileRef};
 use crate::fsutil::WriteOutcome;
 use crate::providers::ProviderId;
@@ -167,15 +168,21 @@ fn current_pins(p: &Profile) -> (Pins, Option<u32>) {
 /// touched, so only the base URL and token can change. (Chosen over a "preserve"
 /// flag on `apply` to keep that Task 27 API as it was.)
 ///
-/// The Fable refresh is cosmetic and never fails the call: an error is logged
-/// by profile id only (never content) and the env outcome is returned; a corrupt
-/// `.claude.json` is left untouched.
+/// `mcp` (`(url, token)`) refreshes the pool's MCP entry, but only in a profile
+/// whose snapshot says it is registered ([`super::mcp::is_registered`]). The
+/// Fable rows and the MCP entry share one guarded pass over `.claude.json`, which
+/// is not opened at all when neither applies.
+///
+/// The `.claude.json` refresh is cosmetic and never fails the call: an error is
+/// logged by profile id only (never content) and the env outcome is returned; a
+/// corrupt `.claude.json` is left untouched.
 fn sync_profile(
     paths: &Paths,
     p: &Profile,
     base_url: &str,
     key: &str,
     catalog: Option<&[Value]>,
+    mcp: Option<(&str, &str)>,
 ) -> anyhow::Result<WriteOutcome> {
     let (pins, max_context) = match catalog {
         Some(c) => (derive_pins(c), max_context(c)),
@@ -188,15 +195,24 @@ fn sync_profile(
         max_context,
     };
     let env = apply(p, &block, paths)?;
-    let fable = match catalog.map(|c| rewrite_fable_rows(p, c)) {
-        Some(Ok(o)) => o,
-        Some(Err(_)) => {
-            tracing::warn!(profile = %p.id, "could not refresh cached Fable rows; left as is");
+    let fable = catalog.and_then(newest_fable);
+    let mcp = mcp.filter(|_| super::mcp::is_registered(paths, p));
+    if fable.is_none() && mcp.is_none() {
+        return Ok(env);
+    }
+    let cached = patch_json(&p.claude_json, |obj| {
+        let rows = fable.as_ref().is_some_and(|f| refresh_rows(obj, f));
+        let entry = mcp.is_some_and(|(url, token)| super::mcp::refresh_entry(obj, url, token));
+        rows || entry
+    });
+    let cached = match cached {
+        Ok(o) => o,
+        Err(_) => {
+            tracing::warn!(profile = %p.id, "could not refresh .claude.json (Fable rows / MCP entry); left as is");
             WriteOutcome::Unchanged
         }
-        None => WriteOutcome::Unchanged,
     };
-    Ok(merge(env, fable))
+    Ok(merge(env, cached))
 }
 
 /// Point `profiles` at this pool and record them in the config.
@@ -225,9 +241,15 @@ pub async fn connect(
     connect_with(state, profiles, None, false).await
 }
 
-/// `http://<addr>/mcp`: the MCP endpoint registered in `.claude.json`.
-fn mcp_url(cfg: &Config) -> String {
-    format!("{}/mcp", base_url(cfg))
+/// `(http://<addr>/mcp, MCP token)`: what a `.claude.json` registration names. `None` when the
+/// pool has no MCP token.
+fn mcp_target(state: &AppState) -> Option<(String, String)> {
+    (!state.mcp_key.is_empty()).then(|| {
+        (
+            format!("{}/mcp", base_url(&state.cfg)),
+            state.mcp_key.clone(),
+        )
+    })
 }
 
 /// [`connect`], and with `statusline: Some(bin)` also install the status line wrapper
@@ -272,12 +294,14 @@ pub async fn connect_with(
     let paths = state.paths.clone();
     let owned: Vec<Profile> = profiles.to_vec();
     let statusline: Option<PathBuf> = statusline.map(Path::to_path_buf);
-    let mcp: Option<(String, String)> = mcp.then(|| (mcp_url(&state.cfg), state.mcp_key.clone()));
+    let register = mcp;
+    let mcp = mcp_target(state);
     let (outcomes, failures) = tokio::task::spawn_blocking(move || {
         let mut outcomes = Vec::new();
         let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
+        let mcp = mcp.as_ref().map(|(u, t)| (u.as_str(), t.as_str()));
         for p in &owned {
-            let env = match sync_profile(&paths, p, &url, &key, catalog.as_deref()) {
+            let env = match sync_profile(&paths, p, &url, &key, catalog.as_deref(), mcp) {
                 Ok(o) => o,
                 Err(e) => {
                     failures.push((p.id.clone(), e));
@@ -298,9 +322,9 @@ pub async fn connect_with(
                     env
                 }
             };
-            let reg = match &mcp {
+            let reg = match mcp.filter(|_| register) {
                 None => Ok(WriteOutcome::Unchanged),
-                Some((url, token)) => super::mcp::register(p, url, token),
+                Some((url, token)) => super::mcp::register(&paths, p, url, token),
             };
             match reg {
                 Ok(o) => outcomes.push((p.clone(), merge(env, o))),
@@ -379,7 +403,7 @@ pub fn disconnect(
                 if o != WriteOutcome::GaveUp {
                     released.push(&p.id);
                 }
-                out.push((p.id.clone(), merge(o, unregister_mcp(p))));
+                out.push((p.id.clone(), merge(o, unregister_mcp(paths, p))));
             }
             Err(e) => {
                 failure.get_or_insert(e.context(format!("disconnecting profile {}", p.id)));
@@ -401,8 +425,8 @@ pub fn disconnect(
 /// Drop the pool's MCP registration from `p` once its `env` is restored. Best effort: a
 /// `.claude.json` that cannot be parsed (Claude Code cannot read it either) or kept changing is
 /// logged by profile id and does not undo the disconnect. `Unchanged` unless it wrote.
-fn unregister_mcp(p: &Profile) -> WriteOutcome {
-    match super::mcp::unregister(p) {
+fn unregister_mcp(paths: &Paths, p: &Profile) -> WriteOutcome {
+    match super::mcp::unregister(paths, p) {
         Ok(WriteOutcome::GaveUp) => {
             tracing::warn!(profile = %p.id, "MCP entry not removed: .claude.json kept changing");
             WriteOutcome::Unchanged
@@ -450,25 +474,13 @@ pub async fn sync_once(state: &AppState) -> anyhow::Result<Vec<(String, WriteOut
     let catalog = catalog(state).await;
     let url = base_url(&state.cfg);
     let paths = state.paths.clone();
-    // An existing MCP registration follows a moved port too (never added here).
-    let mcp = (!state.mcp_key.is_empty()).then(|| (mcp_url(&state.cfg), state.mcp_key.clone()));
+    // A registered profile's MCP entry follows a moved port too (never added here).
+    let mcp = mcp_target(state);
     tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
+        let mcp = mcp.as_ref().map(|(u, t)| (u.as_str(), t.as_str()));
         for p in connected {
-            let synced = sync_profile(&paths, &p, &url, &key, catalog.as_deref());
-            let synced = match (&mcp, synced) {
-                (Some((mcp_url, token)), Ok(o)) if o != WriteOutcome::GaveUp => {
-                    match super::mcp::refresh(&p, mcp_url, token) {
-                        Ok(m) => Ok(merge(o, m)),
-                        Err(_) => {
-                            tracing::warn!(profile = %p.id, "MCP entry not refreshed: .claude.json unreadable");
-                            Ok(o)
-                        }
-                    }
-                }
-                (_, r) => r,
-            };
-            match synced {
+            match sync_profile(&paths, &p, &url, &key, catalog.as_deref(), mcp) {
                 Ok(WriteOutcome::GaveUp) => {
                     tracing::warn!(profile = %p.id, "profile sync gave up: settings kept changing");
                     out.push((p.id, WriteOutcome::GaveUp));

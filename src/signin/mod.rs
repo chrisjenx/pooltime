@@ -87,6 +87,9 @@ pub trait SignInFlow: Send + Sync {
 pub(crate) trait FlowControl: Send + Sync {
     fn submit_code(&self, pasted: &str) -> Result<(), SubmitError>;
     fn bind(&self) -> BoxFuture<'static, anyhow::Result<Identity>>;
+    /// End the flow because a newer one replaces it (unclaimed: fails as superseded and closes
+    /// its listener; mid-exchange: left to finish).
+    fn supersede(&self);
 }
 
 /// A cheap, cloneable way to drive a running flow without owning its completion.
@@ -107,6 +110,11 @@ impl SignInHandle {
     /// the five-minute window passed).
     pub async fn bind(&self) -> anyhow::Result<Identity> {
         self.ctl.bind().await
+    }
+
+    /// End the flow in favour of a newer one (see [`FlowControl::supersede`]).
+    pub fn supersede(&self) {
+        self.ctl.supersede();
     }
 }
 

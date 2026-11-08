@@ -318,16 +318,26 @@ fn parse_until(raw: &str, now: OffsetDateTime) -> Result<OffsetDateTime, String>
         (_, Some(n)) => (n, 24),
         _ => return Err(UNTIL_MSG.into()),
     };
-    match num.trim().parse::<i64>() {
-        Ok(n) if n >= 1 && n * hours_per <= MAX_UNTIL_HOURS => {
-            Ok(now + time::Duration::hours(n * hours_per))
-        }
-        Ok(_) => Err(format!(
+    // Overflow-safe: a huge count never multiplies, adds or builds a Duration out of range.
+    let range = || {
+        format!(
             "until must be between 1h and {}d from now",
             MAX_UNTIL_HOURS / 24
-        )),
-        Err(_) => Err(UNTIL_MSG.into()),
-    }
+        )
+    };
+    let n = num
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| match num.trim().parse::<u128>() {
+            Ok(_) => range(),
+            Err(_) => UNTIL_MSG.to_string(),
+        })?;
+    let hours = n
+        .checked_mul(hours_per)
+        .filter(|h| (1..=MAX_UNTIL_HOURS).contains(h))
+        .ok_or_else(range)?;
+    now.checked_add(time::Duration::hours(hours))
+        .ok_or_else(range)
 }
 
 /// Priority and weight pass through unchanged, so the routing handler validates them exactly as
@@ -431,6 +441,9 @@ mod tests {
             "",
             "1.5h",
             "9999d",
+            "400000000000000000d",
+            "9223372036854775807h",
+            "99999999999999999999999h",
         ] {
             let e = parse_until(bad, now).unwrap_err();
             assert!(e.contains("until"), "{bad}: {e}");

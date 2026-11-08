@@ -28,7 +28,7 @@ pub fn rewrite_fable_rows(p: &Profile, catalog: &[Value]) -> anyhow::Result<Writ
 }
 
 /// Rewrite stale Fable rows of a parsed `.claude.json`; whether anything changed.
-fn refresh_rows(obj: &mut Map<String, Value>, fable: &Newest) -> bool {
+pub(super) fn refresh_rows(obj: &mut Map<String, Value>, fable: &Newest) -> bool {
     let Some(Value::Array(rows)) = obj.get_mut("additionalModelOptionsCache") else {
         return false;
     };

@@ -21,7 +21,7 @@ pub use connect::{
 pub use fable_cache::rewrite_fable_rows;
 pub use pins::{derive_pins, max_context, newest_fable, newest_of_family, Newest};
 pub use profile::{discover, Profile};
-pub use safe_write::patch_json;
+pub use safe_write::{patch_json, patch_json_mode};
 pub use scrub::{scrub_legacy_pins, scrub_managed_context};
 pub use settings_env::{apply, clear, is_connected, EnvBlock, Pin, Pins, MANAGED_KEYS};
 pub use snapshot::snapshot_path;

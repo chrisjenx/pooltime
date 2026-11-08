@@ -200,6 +200,163 @@ async fn mcp_tools_listed() {
     )
     .await;
     assert_eq!(r.status, 405);
+
+    // Not JSON-RPC 2.0, or a null id: invalid request.
+    for bad in [
+        json!({"jsonrpc": "1.0", "id": 1, "method": "ping"}),
+        json!({"id": 1, "method": "ping"}),
+        json!({"jsonrpc": "2.0", "id": null, "method": "ping"}),
+    ] {
+        let r = post(srv.addr, "/mcp", Some(MCP_KEY), &bad).await;
+        assert_eq!(r.json()["error"]["code"], -32600, "{bad}: {}", r.text());
+    }
+    // MCP-Protocol-Version: a supported one passes, an unknown one is 400.
+    let ping = json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}).to_string();
+    let with_version = |v: &'static str| {
+        let ping = ping.clone();
+        let addr = srv.addr;
+        async move {
+            http_req(
+                addr,
+                "POST",
+                "/mcp",
+                &[
+                    ("content-type", "application/json"),
+                    ("authorization", "Bearer mcp-test-key"),
+                    ("mcp-protocol-version", v),
+                ],
+                ping.as_bytes(),
+            )
+            .await
+        }
+    };
+    assert_eq!(with_version("2025-06-18").await.status, 200);
+    assert_eq!(with_version("2025-11-25").await.status, 200);
+    assert_eq!(with_version("1999-01-01").await.status, 400);
+    // An unknown requested revision gets the newest one offered.
+    let init = rpc(&srv, "initialize", json!({"protocolVersion": "2099-01-01"})).await;
+    assert_eq!(init["protocolVersion"], "2025-11-25");
+}
+
+#[tokio::test]
+async fn repeated_start_relogin_supersedes_the_pending_one() {
+    let pool = Pool::new();
+    let srv = pool.boot(Boot::default()).await;
+    let port_of = |text: &str| {
+        let v: Value = serde_json::from_str(text).unwrap();
+        let url = reqwest::Url::parse(v["authorize_url"].as_str().unwrap()).unwrap();
+        let redirect = url
+            .query_pairs()
+            .find(|(k, _)| k == "redirect_uri")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+        reqwest::Url::parse(&redirect).unwrap().port().unwrap()
+    };
+    let (err, first) = call_tool(&srv, "start_relogin", json!({"account": "work"})).await;
+    assert!(!err, "{first}");
+    let old = port_of(&first);
+    assert!(tokio::net::TcpStream::connect(("127.0.0.1", old))
+        .await
+        .is_ok());
+
+    let (err, second) = call_tool(&srv, "start_relogin", json!({"account": "work"})).await;
+    assert!(!err, "{second}");
+    let new = port_of(&second);
+    assert_ne!(old, new);
+    // The first flow's listener closes; the new one listens.
+    let mut closed = false;
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", old))
+            .await
+            .is_err()
+        {
+            closed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(closed, "superseded sign-in still listening on {old}");
+    assert!(tokio::net::TcpStream::connect(("127.0.0.1", new))
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn sync_refreshes_only_registered_profiles() {
+    let pool = Pool::new();
+    let srv = pool.boot(Boot::default()).await;
+    let home = tempfile::tempdir().unwrap();
+    let make = |name: &str| {
+        let dir = home.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), "{}").unwrap();
+        dir
+    };
+    let reg = make(".claude-mcpreg");
+    let unreg = make(".claude-mcpunreg");
+    let connect = |dir: &std::path::Path, mcp: bool| {
+        let body = json!({"profiles": [dir.to_str().unwrap()], "mcp": mcp});
+        let addr = srv.addr;
+        async move {
+            let auth = format!("Bearer {MGMT_KEY}");
+            http_req(
+                addr,
+                "POST",
+                "/api/v1/profiles/connect",
+                &[
+                    ("content-type", "application/json"),
+                    ("authorization", &auth),
+                ],
+                body.to_string().as_bytes(),
+            )
+            .await
+        }
+    };
+    assert_eq!(connect(&reg, true).await.status, 200);
+    assert_eq!(connect(&unreg, false).await.status, 200);
+
+    // The registration created .claude.json: it holds the token, so 0600.
+    let reg_json = reg.join(".claude.json");
+    let mode = std::fs::metadata(&reg_json).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let snap = |id: &str| -> Value {
+        let p = srv.app.paths.run.join(format!("profiles/{id}.json"));
+        serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
+    };
+    assert_eq!(snap("claude-mcpreg")["mcp_registered"], true);
+    assert!(snap("claude-mcpunreg").get("mcp_registered").is_none());
+
+    // A stale entry in the registered profile is brought back to this pool.
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&reg_json).unwrap()).unwrap();
+    v["mcpServers"]["pooltime"]["url"] = json!("http://127.0.0.1:1/mcp");
+    std::fs::write(&reg_json, v.to_string()).unwrap();
+    // The unregistered profile's .claude.json is unparseable: reading it would log a failure.
+    let unreg_json = unreg.join(".claude.json");
+    std::fs::write(&unreg_json, "{not json").unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&unreg_json)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+
+    pooltime::claude_code::sync_once(&srv.app).await.unwrap();
+
+    let v: Value = serde_json::from_slice(&std::fs::read(&reg_json).unwrap()).unwrap();
+    assert_eq!(
+        v["mcpServers"]["pooltime"]["url"],
+        format!("http://{}/mcp", srv.addr)
+    );
+    assert_eq!(std::fs::read(&unreg_json).unwrap(), b"{not json");
+    assert_eq!(
+        std::fs::metadata(&unreg_json).unwrap().modified().unwrap(),
+        old
+    );
+    assert!(
+        !support::captured_logs().contains("claude-mcpunreg"),
+        "the unregistered profile's .claude.json was opened"
+    );
 }
 
 #[tokio::test]
@@ -230,6 +387,19 @@ async fn mcp_token_cannot_call_mgmt_mutations_beyond_scope() {
     )
     .await;
     assert_eq!(r.status, 403);
+    // The right Host with a foreign Origin (a browser page) is refused too.
+    let r = http_req(
+        srv.addr,
+        "POST",
+        "/mcp",
+        &[
+            ("origin", "http://evil.example"),
+            ("authorization", "Bearer mcp-test-key"),
+        ],
+        init.to_string().as_bytes(),
+    )
+    .await;
+    assert_eq!(r.status, 403, "{}", r.text());
 
     // The MCP token is not a management key: every /api/v1 mutation (and keyed read) is 401.
     for (method, path, body) in [

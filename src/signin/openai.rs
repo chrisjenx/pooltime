@@ -650,6 +650,10 @@ impl FlowControl for Ctl {
     fn bind(&self) -> BoxFuture<'static, anyhow::Result<Identity>> {
         self.0.clone().bind().boxed()
     }
+
+    fn supersede(&self) {
+        self.0.supersede();
+    }
 }
 
 #[cfg(test)]

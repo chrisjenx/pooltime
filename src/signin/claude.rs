@@ -598,6 +598,15 @@ impl FlowControl for Ctl {
     fn bind(&self) -> BoxFuture<'static, anyhow::Result<Identity>> {
         self.0.clone().bind().boxed()
     }
+
+    /// A newer sign-in for the account replaces this one: an unclaimed flow fails as superseded
+    /// (which closes its listener); one already exchanging its code finishes on its own.
+    fn supersede(&self) {
+        if self.0.claim() {
+            self.0
+                .finish(SignInResult::Failed("superseded by a new sign-in".into()));
+        }
+    }
 }
 
 #[cfg(test)]

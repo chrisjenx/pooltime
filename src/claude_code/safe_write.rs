@@ -25,9 +25,19 @@ const RETRIES: u8 = 5;
 /// `Ok(GaveUp)` means the file kept changing for every attempt.
 pub fn patch_json(
     path: &Path,
+    f: impl FnMut(&mut Map<String, Value>) -> bool,
+) -> anyhow::Result<WriteOutcome> {
+    patch_json_mode(path, NEW_FILE_MODE, f)
+}
+
+/// [`patch_json`], creating a missing file with `new_mode` (e.g. 0600 when what we write is a
+/// secret). An existing file keeps its mode either way.
+pub fn patch_json_mode(
+    path: &Path,
+    new_mode: u32,
     mut f: impl FnMut(&mut Map<String, Value>) -> bool,
 ) -> anyhow::Result<WriteOutcome> {
-    guarded_patch(path, NEW_FILE_MODE, RETRIES, |current| {
+    guarded_patch(path, new_mode, RETRIES, |current| {
         let mut obj = match current {
             None => Map::new(),
             Some(bytes) => match serde_json::from_slice::<Value>(bytes)
