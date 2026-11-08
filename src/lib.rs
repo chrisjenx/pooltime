@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod claude_code;
 pub mod cli;
 pub mod config;
 pub mod errors;
