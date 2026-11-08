@@ -764,16 +764,9 @@ fn logs_request_prints_the_journaled_attempt_chain() {
         .expect("request id header")
         .to_string();
 
-    // The row is queued on the store writer; give it a moment.
-    let start = Instant::now();
-    let out = loop {
-        let out = h.command(&["logs", "--request", &id]).output().unwrap();
-        if out.status.success() {
-            break String::from_utf8_lossy(&out.stdout).into_owned();
-        }
-        assert!(start.elapsed() < BOOT_BUDGET, "never journaled: {out:?}");
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    // Straight after the response: the row may still sit in the store writer's queue, and the
+    // server flushes it before answering 404 (no retry loop here).
+    let out = stdout_of(&h.cli(&["logs", "--request", &id]).success());
     let lines: Vec<&str> = out.lines().collect();
     assert!(lines[0].starts_with(&id), "{out}");
     assert!(

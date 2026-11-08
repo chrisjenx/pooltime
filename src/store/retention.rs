@@ -96,21 +96,25 @@ fn prune_journal(
     rep.alerts_sent = tx.execute("DELETE FROM alerts_sent WHERE ts < ?1", [cutoff])? as u64;
     tx.commit()?;
 
-    // Row ceiling: drop everything older than the newest `journal_max_requests` rows.
-    let max_rows = i64::from(cfg.journal_max_requests);
-    let keep_from = "SELECT id FROM journal_requests ORDER BY ts DESC, id DESC LIMIT -1 OFFSET ?1";
-    let tx = conn.transaction()?;
-    let attempts = tx.execute(
-        &format!("DELETE FROM journal_attempts WHERE request_id IN ({keep_from})"),
-        [max_rows],
-    )?;
-    let requests = tx.execute(
-        &format!("DELETE FROM journal_requests WHERE id IN ({keep_from})"),
-        [max_rows],
-    )?;
-    tx.commit()?;
-    rep.journal_attempts += attempts as u64;
-    rep.journal_requests_by_size += requests as u64;
+    // Row ceiling: drop everything older than the newest `journal_max_requests` rows (0 = no
+    // ceiling).
+    if cfg.journal_max_requests > 0 {
+        let max_rows = i64::from(cfg.journal_max_requests);
+        let keep_from =
+            "SELECT id FROM journal_requests ORDER BY ts DESC, id DESC LIMIT -1 OFFSET ?1";
+        let tx = conn.transaction()?;
+        let attempts = tx.execute(
+            &format!("DELETE FROM journal_attempts WHERE request_id IN ({keep_from})"),
+            [max_rows],
+        )?;
+        let requests = tx.execute(
+            &format!("DELETE FROM journal_requests WHERE id IN ({keep_from})"),
+            [max_rows],
+        )?;
+        tx.commit()?;
+        rep.journal_attempts += attempts as u64;
+        rep.journal_requests_by_size += requests as u64;
+    }
 
     let cap = i64::from(cfg.journal_max_mb) * MIB;
     while live_bytes(conn)? > cap {

@@ -83,9 +83,16 @@ static ASSETS: LazyLock<HashMap<&'static str, Asset>> = LazyLock::new(|| {
     ])
 });
 
-/// `/` and `/assets/{name}`.
+/// `/`, `/assets/{name}` and `/favicon.ico`.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        // Browsers ask for it on every dashboard load; an empty 204 keeps those probes out of the
+        // request journal's unknown-path errors.
+        .route(
+            "/favicon.ico",
+            get(|| async { http::StatusCode::NO_CONTENT })
+                .fallback(|| async { method_not_allowed("GET") }),
+        )
         .route(
             "/",
             get(index).fallback(|| async { method_not_allowed("GET") }),

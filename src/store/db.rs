@@ -283,6 +283,55 @@ mod tests {
     }
 
     #[test]
+    fn v2_database_upgrades_to_v3_journal_columns() {
+        use crate::store::journal::{self, AttemptRow, RequestRow};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pooltime.db");
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE journal_requests (id TEXT PRIMARY KEY, ts INTEGER, model TEXT, provider TEXT, status INTEGER, outcome TEXT, ttfb_ms INTEGER, total_ms INTEGER, input_tokens INTEGER, output_tokens INTEGER, cache_read INTEGER, cache_write INTEGER, session_hash TEXT);
+                 CREATE TABLE journal_attempts (request_id TEXT, n INTEGER, account TEXT, provider TEXT, outcome TEXT, reason TEXT, upstream_status INTEGER, upstream_request_id TEXT, ms INTEGER);
+                 CREATE TABLE account_state_quarantine (account TEXT, ts INTEGER, json TEXT);
+                 INSERT INTO journal_requests(id, ts, outcome) VALUES ('old', 1, 'completed');",
+            )
+            .unwrap();
+            c.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let row = RequestRow {
+            id: "new".into(),
+            ts: 2,
+            path: Some("/v1/messages/count_tokens".into()),
+            outcome: "error".into(),
+            reason: Some("unknown_path".into()),
+            status: Some(404),
+            ..RequestRow::default()
+        };
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.schema_version().unwrap(), 3);
+            let (r, a) = (row.clone(), Vec::<AttemptRow>::new());
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(store.exec(move |c| journal::insert(c, &r, &a)))
+                .unwrap();
+            let (got, _) = store.read(|c| journal::get(c, "new")).unwrap().unwrap();
+            assert_eq!(got, row);
+            let (old, _) = store.read(|c| journal::get(c, "old")).unwrap().unwrap();
+            assert_eq!((old.path, old.reason), (None, None));
+        }
+        // A second open is a no-op: same version, rows intact.
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.read(journal::count).unwrap(), 2);
+        assert_eq!(
+            store.read(|c| journal::get(c, "new")).unwrap().unwrap().0,
+            row
+        );
+    }
+
+    #[test]
     fn open_rejects_newer_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pooltime.db");

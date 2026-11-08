@@ -43,6 +43,8 @@ impl Verdict {
 pub struct Served {
     pub response: Response,
     pub verdict: Verdict,
+    /// The provider whose response this is (journaled as the request's provider).
+    pub provider: ProviderId,
 }
 
 impl Served {

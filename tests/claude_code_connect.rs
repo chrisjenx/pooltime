@@ -655,9 +655,11 @@ async fn state_change_rewrites_the_status_cache_promptly() {
     pool.state
         .mark_billing(&pool.meta.id, time::OffsetDateTime::now_utc());
     while read().is_none_or(|v| v["pool"]["available"] != 0) {
+        // Change-driven, not the 60 s heartbeat: a generous bound that load cannot trip.
         assert!(
-            t.elapsed() < Duration::from_secs(2),
-            "no rewrite within 2 s of a state change"
+            t.elapsed() < Duration::from_secs(15),
+            "no change-driven rewrite (heartbeat is {:?})",
+            pooltime::claude_code::statusline::HEARTBEAT
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

@@ -126,8 +126,18 @@ pub(super) async fn request(State(app): State<Arc<AppState>>, Path(id): Path<Str
             None => not_found(&id),
         };
     }
-    let (a, key) = (app.clone(), id.clone());
-    match blocking(move || a.store.read(|c| journal::get(c, &key))).await {
+    let read = |app: &Arc<AppState>| {
+        let (a, key) = (app.clone(), id.clone());
+        blocking(move || a.store.read(|c| journal::get(c, &key)))
+    };
+    let mut found = read(&app).await;
+    if matches!(found, Ok(Ok(None))) {
+        // Rows are queued on the store writer: a request that just finished may still be in
+        // the queue. Flush it once (every queued job runs before this one) and look again.
+        let _ = app.store.exec(|_| Ok(())).await;
+        found = read(&app).await;
+    }
+    match found {
         Ok(Ok(Some((r, attempts)))) => ok(json!({
             "request": with_time(serde_json::to_value(r).unwrap_or_default()),
             "attempts": attempts,

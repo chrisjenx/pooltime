@@ -182,6 +182,10 @@ mod tests {
         "pool 6/8 · 7d 41% left · ⚠ 2 need login".into()
     }
 
+    /// Budget for tests about composition, not timing: an instant segment is always in, however
+    /// slowly a loaded machine spawns the original command.
+    const SEGMENT_READY: Duration = ORIGINAL_TIMEOUT;
+
     #[test]
     fn wrap_appends_segment_to_original_output() {
         // `cat` proves the original sees Claude Code's stdin bytes.
@@ -189,7 +193,7 @@ mod tests {
             b"{\"model\":\"x\"}\n",
             &cmd("cat"),
             seg,
-            BUDGET,
+            SEGMENT_READY,
             ORIGINAL_TIMEOUT,
         );
         assert_eq!(
@@ -201,7 +205,7 @@ mod tests {
             b"",
             &cmd("printf orig; echo noise >&2"),
             seg,
-            BUDGET,
+            SEGMENT_READY,
             ORIGINAL_TIMEOUT,
         );
         assert_eq!(
@@ -213,7 +217,7 @@ mod tests {
             b"",
             &cmd("echo partial; exit 3"),
             seg,
-            BUDGET,
+            SEGMENT_READY,
             ORIGINAL_TIMEOUT,
         );
         assert_eq!(
@@ -222,21 +226,25 @@ mod tests {
         );
         // No prior (or nothing printed): the segment alone.
         for prior in [Value::Null, cmd("true"), json!({"type": "static"})] {
-            let out = wrap_with(b"{}", &prior, seg, BUDGET, ORIGINAL_TIMEOUT);
+            let out = wrap_with(b"{}", &prior, seg, SEGMENT_READY, ORIGINAL_TIMEOUT);
             assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", seg()));
         }
     }
 
     #[test]
     fn budget_exceeded_prints_original_only() {
-        let slow = || {
-            std::thread::sleep(Duration::from_secs(2));
+        // The segment cannot finish during the call: it waits on a channel opened only after.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let slow = move || {
+            let _ = rx.recv();
             seg()
         };
         let t = Instant::now();
         let out = wrap_with(b"{}", &cmd("echo orig"), slow, BUDGET, ORIGINAL_TIMEOUT);
+        drop(tx);
         assert_eq!(out, b"orig\n");
-        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        // Hang guard only: the call never waits for the segment past its budget.
+        assert!(t.elapsed() < ORIGINAL_TIMEOUT, "{:?}", t.elapsed());
     }
 
     #[test]
@@ -249,16 +257,31 @@ mod tests {
             marker.display()
         );
         let t = Instant::now();
-        let out = wrap_with(b"{}", &cmd(&c), seg, BUDGET, Duration::from_millis(300));
+        let out = wrap_with(
+            b"{}",
+            &cmd(&c),
+            seg,
+            SEGMENT_READY,
+            Duration::from_millis(300),
+        );
         assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", seg()));
-        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
-        // The whole group is gone: the grandchild never gets to run on.
-        std::thread::sleep(Duration::from_millis(100));
-        let out = Command::new("pgrep")
-            .args(["-f", &marker.to_string_lossy()])
-            .output()
-            .unwrap();
-        assert!(out.stdout.is_empty(), "grandchild still running");
+        // Hang guard only (the original would run 30 s if it were not killed).
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        // The whole group is gone: the grandchild never gets to run on. Signal delivery is
+        // asynchronous, so poll for it rather than sleeping a fixed time.
+        let gone = || {
+            Command::new("pgrep")
+                .args(["-f", &marker.to_string_lossy()])
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty()
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        while !gone() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone(), "grandchild still running");
     }
 
     #[test]

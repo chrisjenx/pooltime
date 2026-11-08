@@ -2000,6 +2000,32 @@ mod inference {
                     && l.contains(r#""second_reason":"quota""#)),
             "both reasons not logged: {lines:#?}"
         );
+        // The journal row describes the returned (first provider's) response; the chain shows
+        // the hop.
+        let mut j = serde_json::Value::Null;
+        for _ in 0..100 {
+            let r = http_get(
+                booted.addr,
+                &format!("/api/v1/requests/{rid}"),
+                &[("authorization", "Bearer mgmt-test-key")],
+            )
+            .await;
+            if r.status == 200 {
+                j = r.json();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(j["request"]["provider"], "anthropic", "{j}");
+        assert_eq!(j["request"]["status"], 529);
+        assert_eq!(j["request"]["reason"], "overloaded");
+        let providers: Vec<&str> = j["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["provider"].as_str().unwrap())
+            .collect();
+        assert_eq!(providers, ["anthropic", "openai"], "{j}");
 
         // Recovered fallback: the alternate's success is returned.
         let fake = FakeAnthropic::start().await;

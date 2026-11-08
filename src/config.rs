@@ -235,7 +235,7 @@ pub struct RetentionCfg {
     /// ...and the oldest rows go first while the database holds more live data than this...
     pub journal_max_mb: u32,
     /// ...or the journal holds more requests than this (~100k requests is a few weeks of heavy
-    /// use, tens of MB).
+    /// use, tens of MB). 0 means no row ceiling.
     pub journal_max_requests: u32,
     /// Usage history: hourly rows kept this long, then rolled up to daily...
     pub history_hourly_days: u32,
