@@ -13,6 +13,7 @@ use crate::config::OpenAiCfg;
 use crate::upstream::Upstream;
 
 mod oauth;
+mod translate_req;
 
 #[cfg(test)]
 pub(crate) use oauth::testkit;
@@ -21,6 +22,7 @@ pub use oauth::{
     IdTokenClaims,
 };
 pub(crate) use oauth::{token_expiry, TokenResponse};
+pub use translate_req::{clamp_effort, derive_effort_tier, to_codex_request};
 
 pub struct OpenAiProvider {
     cfg: OpenAiCfg,
