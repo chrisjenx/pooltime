@@ -7,20 +7,12 @@ use tempfile::TempDir;
 
 #[test]
 fn version_flag_prints_name_and_version() {
-    assert_cmd::Command::cargo_bin("pooltime")
-        .unwrap()
-        .arg("--version")
-        .assert()
+    procs::assert(Command::new(env!("CARGO_BIN_EXE_pooltime")).arg("--version"))
         .success()
         .stdout(predicate::str::starts_with("pooltime "));
 }
 
 const BOOT_BUDGET: Duration = Duration::from_secs(10);
-
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
 
 /// A `pooltime serve` command over a temp home (never the real `$HOME`).
 fn serve_cmd(home: &TempDir, port: u16) -> Command {
@@ -44,10 +36,7 @@ struct Daemon {
 
 impl Daemon {
     fn spawn(home: TempDir, port: u16) -> Daemon {
-        let child = serve_cmd(&home, port)
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let child = procs::spawn(serve_cmd(&home, port).stderr(Stdio::piped()));
         Daemon {
             child,
             port,
@@ -71,9 +60,8 @@ impl Daemon {
     }
 
     fn sigterm(&self) {
-        let st = Command::new("kill")
-            .args(["-TERM", &self.child.id().to_string()])
-            .status()
+        let st = procs::spawn(Command::new("kill").args(["-TERM", &self.child.id().to_string()]))
+            .wait()
             .unwrap();
         assert!(st.success());
     }
@@ -124,7 +112,7 @@ fn second_serve_on_same_port_says_already_running() {
     let mut first = Daemon::spawn(tempfile::tempdir().unwrap(), free_port());
     first.wait_healthy();
     let second_home = tempfile::tempdir().unwrap();
-    let out = serve_cmd(&second_home, first.port).output().unwrap();
+    let out = procs::output(&mut serve_cmd(&second_home, first.port));
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("already running"), "{err}");
@@ -135,6 +123,8 @@ fn second_serve_on_same_port_says_already_running() {
 // ---- Task 30: thin-client commands ------------------------------------------------------------
 
 mod support;
+
+use support::procs::{self, free_port};
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -197,18 +187,16 @@ impl Home {
     }
 
     fn cli(&self, args: &[&str]) -> assert_cmd::assert::Assert {
-        let mut c = assert_cmd::Command::from_std(self.command(args));
-        c.write_stdin("").assert()
+        procs::assert(&mut self.command(args))
     }
 
     fn serve(&self) -> Served {
-        let mut child = self
-            .command(&["serve", "--i-stopped-bro"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut child = procs::spawn(
+            self.command(&["serve", "--i-stopped-bro"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        );
         let start = Instant::now();
         loop {
             if let Some(st) = child.try_wait().unwrap() {
@@ -487,7 +475,7 @@ fn connect_dot_claude_name_resolves_to_home_profile_not_cwd() {
     let run = |args: &[&str]| {
         let mut c = h.command(args);
         c.current_dir(repo.path());
-        assert_cmd::Command::from_std(c).write_stdin("").assert()
+        procs::assert(&mut c)
     };
     run(&["connect", ".claude"])
         .success()
@@ -571,21 +559,20 @@ async fn fake_signin_upstream() -> support::FakeAnthropic {
 /// Run `pooltime <args>` headless (an SSH session): read stdout until the authorize URL appears,
 /// paste `code#<state>`, confirm the binding, and return (exit success, all output, URL).
 fn headless_login(h: &Home, args: &[&str]) -> (bool, String, String) {
-    let mut child = h
-        .command(args)
-        .env("SSH_TTY", "/dev/ttys999")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = procs::spawn(
+        h.command(args)
+            .env("SSH_TTY", "/dev/ttys999")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
     // Watchdog: a regression that leaves the CLI waiting must fail the test, not hang the suite.
     let (done, watch) = std::sync::mpsc::channel::<()>();
     let pid = child.id().to_string();
     let watchdog = std::thread::spawn(move || {
         if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(LOGIN_WATCHDOG)
         {
-            let _ = Command::new("kill").args(["-KILL", &pid]).status();
+            let _ = procs::spawn(Command::new("kill").args(["-KILL", &pid])).wait();
         }
     });
     let mut stdin = child.stdin.take().unwrap();

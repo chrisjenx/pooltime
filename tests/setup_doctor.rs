@@ -6,7 +6,7 @@ mod support;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -17,6 +17,7 @@ use pooltime::claude_code::{apply, is_connected, profile_of, EnvBlock, Pins};
 use pooltime::config::{Config, Paths, ProfileRef};
 use pooltime::providers::ProviderId;
 use serde_json::{json, Value};
+use support::procs::{self, free_port};
 use support::{FakeAnthropic, Reply};
 use tempfile::TempDir;
 
@@ -26,11 +27,6 @@ const WATCHDOG: Duration = Duration::from_secs(60);
 const TOKEN_PATH: &str = "/v1/oauth/token";
 const PROFILE_PATH: &str = "/api/oauth/profile";
 const EMAIL: &str = "you@example.com";
-
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
 
 fn health_ok(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -162,20 +158,19 @@ exit 0"#,
     }
 
     fn run(&self, args: &[&str]) -> (bool, String) {
-        let out = self.command(args).stdin(Stdio::null()).output().unwrap();
+        let out = procs::output(self.command(args).stdin(Stdio::null()));
         let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
         s.push_str(&String::from_utf8_lossy(&out.stderr));
         (out.status.success(), s)
     }
 
     fn serve(&self) -> Served {
-        let mut child = self
-            .command(&["serve", "--i-stopped-bro"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut child = procs::spawn(
+            self.command(&["serve", "--i-stopped-bro"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        );
         let start = Instant::now();
         loop {
             if let Some(st) = child.try_wait().unwrap() {
@@ -274,18 +269,17 @@ async fn fake_upstream() -> FakeAnthropic {
 /// Run `pooltime <args>`, paste `code#<state>` once the authorize URL shows, and collect all
 /// output. Returns (exit success, output).
 fn run_with_signin(m: &Machine, args: &[&str]) -> (bool, String) {
-    let mut child = m
-        .command(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = procs::spawn(
+        m.command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
     let (done, watch) = std::sync::mpsc::channel::<()>();
     let pid = child.id().to_string();
     let watchdog = std::thread::spawn(move || {
         if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watch.recv_timeout(WATCHDOG) {
-            let _ = Command::new("/bin/kill").args(["-KILL", &pid]).status();
+            let _ = procs::spawn(Command::new("/bin/kill").args(["-KILL", &pid])).wait();
         }
     });
     let mut stdin = child.stdin.take().unwrap();
