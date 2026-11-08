@@ -97,7 +97,7 @@ pub fn window_duration(key: &str) -> Option<Duration> {
 
 /// A window that will 429 if routed to: explicitly rejected, or fully used without an
 /// explicit `allowed` (Codex reports 100% with `allowed` while a limit is unenforced).
-fn is_spent(w: &Window) -> bool {
+pub(crate) fn is_spent(w: &Window) -> bool {
     match w.status {
         WindowStatus::Rejected => true,
         WindowStatus::Allowed => false,

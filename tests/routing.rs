@@ -16,12 +16,14 @@
 //! Ported from `describe("expiry-share regression")`:
 //! - eleven live sessions allocate 5/3/2/1                     -> `eleven_live_sessions_allocate_5_3_2_1`
 //! - healthy 5h quota is neutral; only scarcity tapers         -> `low_5h_headroom_tapers_score`
+//! - Fable weekly {0.92, 0.999, 1} only excludes true exhaustion -> `fable_weekly_only_excludes_true_exhaustion`
 //! - repeated tie preview / round robin (a, b tied)            -> `ties_round_robin`
 //!
 //! Ported from `describe("expiry shares edge cases")`:
 //! - later ranks halve; equal resets share rank; weights multiply -> `later_ranks_halve_equal_resets_share_rank`
 //! - weekly-only Codex near exhaustion neutral; allowed kept   -> `weekly_only_allowed_window_stays_neutral`
-//! - expired and unrelated 5h windows are neutral              -> `expired_and_model_scoped_windows_are_neutral`
+//! - expired / other-family windows neutral, own family binds  -> `expired_and_model_scoped_windows_are_neutral`
+//!   (+ `family_scoped_5h_gate_binds_only_the_requested_family`)
 //!
 //! New in pooltime:
 //! - `timed_weight_override_applies_until_expiry`, `usable_*`, `choose_*`, `tuning_*`.
@@ -98,7 +100,7 @@ fn cand<'a>(m: &'a AccountMeta, s: Option<&'a RateLimitSnapshot>, sessions: u32)
 }
 
 fn pick<'a>(cands: &[Candidate<'a>]) -> Option<&'a AccountId> {
-    choose(cands, &Tuning::default(), &AtomicUsize::new(0), NOW)
+    choose(cands, &Tuning::default(), &AtomicUsize::new(0), NOW, None)
 }
 
 fn name(id: Option<&AccountId>) -> &str {
@@ -210,7 +212,7 @@ fn weekly_spent_unknown_reset_ranks_last() {
         spent_7d(None),
     ]);
     let s2 = snap_7d(0.0, Duration::days(5));
-    assert_eq!(expiry_rank(Some(&s1), NOW), ExpiryRank::Spent);
+    assert_eq!(expiry_rank(Some(&s1), None, NOW), ExpiryRank::Spent);
     let c = [cand(&spent, Some(&s1), 0), cand(&known, Some(&s2), 0)];
     assert_eq!(name(pick(&c)), "known-later");
 }
@@ -246,7 +248,7 @@ fn eleven_live_sessions_allocate_5_3_2_1() {
         let cands: Vec<Candidate> = (0..4)
             .map(|i| cand(&metas[i], Some(&snaps[i]), sessions[i]))
             .collect();
-        let w = choose(&cands, &Tuning::default(), &cursor, NOW).unwrap();
+        let w = choose(&cands, &Tuning::default(), &cursor, NOW, None).unwrap();
         let i = metas.iter().position(|m| &m.id == w).unwrap();
         sessions[i] += 1;
     }
@@ -264,7 +266,7 @@ fn low_5h_headroom_tapers_score() {
         (0.05, 0.25),
     ] {
         let s = snap(vec![win("5h", 1.0 - headroom, Some(Duration::hours(1)))]);
-        let h = gate_headroom(Some(&s), NOW);
+        let h = gate_headroom(Some(&s), None, NOW);
         assert!((h - headroom).abs() < 1e-12);
         // Single account -> expiry rank 0 -> share 5.
         let got = score(1.0, 5.0, h, 0, &t);
@@ -296,7 +298,10 @@ fn later_ranks_halve_equal_resets_share_rank() {
             )])
         })
         .collect();
-    let ranks: Vec<ExpiryRank> = snaps.iter().map(|s| expiry_rank(Some(s), NOW)).collect();
+    let ranks: Vec<ExpiryRank> = snaps
+        .iter()
+        .map(|s| expiry_rank(Some(s), None, NOW))
+        .collect();
     assert_eq!(
         expiry_shares(&ranks),
         vec![5.0, 3.0, 2.0, 1.0, 0.5, 0.25, 0.25]
@@ -316,15 +321,15 @@ fn weekly_only_allowed_window_stays_neutral() {
     let c = meta("codex");
     for util in [0.92, 0.999, 1.0] {
         let s = snap(vec![win("7d", util, Some(Duration::hours(1)))]);
-        assert_eq!(gate_headroom(Some(&s), NOW), 1.0);
+        assert_eq!(gate_headroom(Some(&s), None, NOW), 1.0);
         assert_eq!(name(pick(&[cand(&c, Some(&s), 0)])), "codex");
     }
     // `allowed` at 100% 5h is unenforced: neutral. An enforced one is not.
     let s = snap(vec![win("5h", 1.0, Some(Duration::hours(1)))]);
-    assert_eq!(gate_headroom(Some(&s), NOW), 1.0);
+    assert_eq!(gate_headroom(Some(&s), None, NOW), 1.0);
     let mut w = win("5h", 1.0, Some(Duration::hours(1)));
     w.status = WindowStatus::AllowedWarning;
-    assert_eq!(gate_headroom(Some(&snap(vec![w])), NOW), 0.0);
+    assert_eq!(gate_headroom(Some(&snap(vec![w])), None, NOW), 0.0);
 }
 
 #[test]
@@ -335,12 +340,68 @@ fn expired_and_model_scoped_windows_are_neutral() {
         model_win("5h-fable", "fable", 0.95, Duration::hours(1)),
         model_win("7d-fable", "fable", 0.999, Duration::hours(2)),
     ]);
-    assert_eq!(gate_headroom(Some(&s), NOW), 1.0);
-    // Model-scoped and expired windows leave no usable 7d data: probe-first.
-    assert_eq!(expiry_rank(Some(&s), NOW), ExpiryRank::Unknown);
-    // A 7d whose reset has passed is likewise treated as unknown/refreshing.
+    // Windows of OTHER families (or of no family) are neutral...
+    for fam in [None, Some("sonnet")] {
+        assert_eq!(gate_headroom(Some(&s), fam, NOW), 1.0);
+        assert_eq!(expiry_rank(Some(&s), fam, NOW), ExpiryRank::Unknown);
+    }
+    // ...while the requested family's own windows bind (0.95 used -> 0.05 left; the
+    // 7d-fable reset is the soonest future expiry).
+    let h = gate_headroom(Some(&s), Some("fable"), NOW);
+    assert!((h - 0.05).abs() < 1e-12, "{h}");
+    assert_eq!(
+        expiry_rank(Some(&s), Some("fable"), NOW),
+        ExpiryRank::At(NOW + Duration::hours(2))
+    );
+    // A 7d whose reset has passed is treated as unknown/refreshing.
     let s = snap(vec![win("7d", 1.0, Some(Duration::seconds(-5)))]);
-    assert_eq!(expiry_rank(Some(&s), NOW), ExpiryRank::Unknown);
+    assert_eq!(expiry_rank(Some(&s), None, NOW), ExpiryRank::Unknown);
+}
+
+/// bro: `expiry-share regression` / "Fable weekly {0.92, 0.999, 1} only excludes true
+/// exhaustion".
+#[test]
+fn fable_weekly_only_excludes_true_exhaustion() {
+    let (soon, later) = (meta("soon"), meta("later"));
+    for used in [0.92, 0.999, 1.0] {
+        let mut w = model_win("7d-fable", "fable", used, Duration::hours(3));
+        w.status = WindowStatus::AllowedWarning;
+        let s1 = snap(vec![win("5h", 0.0, Some(Duration::hours(1))), w]);
+        let s2 = snap(vec![
+            win("5h", 0.0, Some(Duration::hours(1))),
+            model_win("7d-fable", "fable", 0.2, Duration::hours(70)),
+        ]);
+        let c = [cand(&soon, Some(&s1), 0), cand(&later, Some(&s2), 0)];
+        let got = choose(
+            &c,
+            &Tuning::default(),
+            &AtomicUsize::new(0),
+            NOW,
+            Some("fable"),
+        );
+        // Fully used -> ranked last; anything less still drains the soonest reset first.
+        let want = if used >= 1.0 { "later" } else { "soon" };
+        assert_eq!(name(got), want, "used {used}");
+    }
+}
+
+#[test]
+fn family_scoped_5h_gate_binds_only_the_requested_family() {
+    let (a, b) = (meta("a"), meta("b"));
+    let s1 = snap(vec![
+        win("5h", 0.0, Some(Duration::hours(1))),
+        win("7d", 0.2, Some(Duration::days(1))),
+        model_win("5h-fable", "fable", 0.95, Duration::hours(1)),
+    ]);
+    let s2 = snap_7d(0.0, Duration::days(6));
+    let c = [cand(&a, Some(&s1), 0), cand(&b, Some(&s2), 0)];
+    let t = Tuning::default();
+    let at = |fam| name(choose(&c, &t, &AtomicUsize::new(0), NOW, fam));
+    // Sonnet is unaffected: a resets sooner and wins.
+    assert_eq!(at(Some("sonnet")), "a");
+    assert_eq!(at(None), "a");
+    // Fable: a's 5h-fable headroom 0.05 < min_headroom 0.1 -> not viable.
+    assert_eq!(at(Some("fable")), "b");
 }
 
 #[test]
@@ -350,7 +411,7 @@ fn ties_round_robin() {
     let cursor = AtomicUsize::new(0);
     let t = Tuning::default();
     let seq: Vec<&str> = (0..6)
-        .map(|_| name(choose(&cands, &t, &cursor, NOW)))
+        .map(|_| name(choose(&cands, &t, &cursor, NOW, None)))
         .collect();
     assert_eq!(seq, ["a", "b", "a", "b", "a", "b"]);
 }
@@ -365,7 +426,10 @@ fn cursor_advances_only_on_ties() {
     let cands = [cand(&a, Some(&s1), 0), cand(&b, Some(&s2), 0)];
     let cursor = AtomicUsize::new(0);
     for _ in 0..5 {
-        assert_eq!(name(choose(&cands, &Tuning::default(), &cursor, NOW)), "a");
+        assert_eq!(
+            name(choose(&cands, &Tuning::default(), &cursor, NOW, None)),
+            "a"
+        );
     }
     assert_eq!(cursor.load(Ordering::SeqCst), 0);
 }
@@ -380,7 +444,7 @@ fn timed_weight_override_applies_until_expiry() {
     let s = snap_7d(0.2, Duration::days(3));
     let c = [cand(&plain, Some(&s), 0), cand(&boosted, Some(&s), 0)];
     let t = Tuning::default();
-    let at = |now| name(choose(&c, &t, &AtomicUsize::new(0), now));
+    let at = |now| name(choose(&c, &t, &AtomicUsize::new(0), now, None));
     assert_eq!(at(NOW), "boosted");
     assert_eq!(at(NOW + Duration::minutes(9)), "boosted");
     // Expired: both weigh 1 and tie, so the fresh cursor yields the first candidate.
@@ -503,8 +567,8 @@ fn min_headroom_gate_follows_tuning() {
     let c = [cand(&mid, Some(&s1), 0), cand(&fresh, Some(&s2), 0)];
     let cursor = AtomicUsize::new(0);
     let loose = Tuning::new(1.0, 0.1, 0.2).unwrap();
-    assert_eq!(name(choose(&c, &loose, &cursor, NOW)), "mid");
+    assert_eq!(name(choose(&c, &loose, &cursor, NOW, None)), "mid");
     // 0.7 gate is above mid's 0.6 headroom -> benched.
     let strict = Tuning::new(1.0, 0.7, 0.2).unwrap();
-    assert_eq!(name(choose(&c, &strict, &cursor, NOW)), "fresh");
+    assert_eq!(name(choose(&c, &strict, &cursor, NOW, None)), "fresh");
 }

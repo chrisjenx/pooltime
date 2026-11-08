@@ -50,12 +50,14 @@ pub fn usable(
 /// `cands` competes; within it the highest [`score()`] among *viable* accounts (5h headroom
 /// at least `min_headroom`) wins, falling back to all of the tier when none is viable. Exact
 /// score ties are broken round-robin via `cursor` (advanced only on ties, like bro).
-/// `now` drives `weight_override` expiry and which 7d resets are still in the future.
+/// `now` drives `weight_override` expiry and which 7d resets are still in the future;
+/// `family` adds that family's model-scoped windows to the binding windows.
 pub fn choose<'a>(
     cands: &[Candidate<'a>],
     tuning: &Tuning,
     cursor: &AtomicUsize,
     now: OffsetDateTime,
+    family: Option<&str>,
 ) -> Option<&'a AccountId> {
     let min_priority = cands.iter().map(|c| c.meta.priority).min()?;
     let tier: Vec<&Candidate<'a>> = cands
@@ -65,7 +67,7 @@ pub fn choose<'a>(
 
     let ranks: Vec<ExpiryRank> = tier
         .iter()
-        .map(|c| score::expiry_rank(c.snapshot, now))
+        .map(|c| score::expiry_rank(c.snapshot, family, now))
         .collect();
     let shares = score::expiry_shares(&ranks);
 
@@ -78,7 +80,7 @@ pub fn choose<'a>(
         .iter()
         .zip(&shares)
         .map(|(c, share)| {
-            let headroom = score::gate_headroom(c.snapshot, now);
+            let headroom = score::gate_headroom(c.snapshot, family, now);
             let meta: &'a AccountMeta = c.meta;
             Row {
                 id: &meta.id,
