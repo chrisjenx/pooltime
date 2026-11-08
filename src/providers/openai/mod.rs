@@ -12,9 +12,12 @@ use crate::accounts::{AccountId, Registry, StateBook};
 use crate::config::OpenAiCfg;
 use crate::upstream::Upstream;
 
+mod context;
 mod oauth;
 mod translate_req;
+mod translate_stream;
 
+pub use context::ContextCarry;
 #[cfg(test)]
 pub(crate) use oauth::testkit;
 pub use oauth::{
@@ -23,6 +26,7 @@ pub use oauth::{
 };
 pub(crate) use oauth::{token_expiry, TokenResponse};
 pub use translate_req::{clamp_effort, derive_effort_tier, to_codex_request};
+pub use translate_stream::{CodexToAnthropic, StreamError};
 
 pub struct OpenAiProvider {
     cfg: OpenAiCfg,
