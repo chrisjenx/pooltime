@@ -61,7 +61,7 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
     health::check_bro_shadow(&registry, health::BRO_PORT, flags.i_stopped_bro).await?;
 
     let store = Arc::new(Store::open(&paths.db)?);
-    let state = Arc::new(StateBook::load(store.clone())?);
+    let state = Arc::new(state_book(store.clone(), &cfg.timeouts)?);
     let sessions = Arc::new(Sessions::load(store.clone(), cfg.timeouts.session_idle));
     let reservations = Reservations::new(HashMap::from([
         (ProviderId::Anthropic, cfg.routing.anthropic_max_inflight),
@@ -223,6 +223,13 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The account state book, with the configured counter window and access-denied cooldown.
+fn state_book(store: Arc<Store>, t: &crate::config::Timeouts) -> anyhow::Result<StateBook> {
+    Ok(StateBook::load(store)?
+        .with_usage_window(t.usage_window)
+        .with_access_denied_cooldown(t.access_denied_cooldown))
+}
+
 /// Wait for every future in `futs`, at most `within`. False when the bound cut it short.
 async fn drain_within(
     futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
@@ -320,6 +327,35 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         task.abort();
+    }
+
+    #[test]
+    fn state_book_applies_configured_window_and_cooldown() {
+        use crate::accounts::{AccountId, AccountStatus};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("pooltime.db")).unwrap());
+        let t = crate::config::Timeouts {
+            usage_window: Duration::from_secs(3600),
+            access_denied_cooldown: Duration::from_secs(600),
+            ..Default::default()
+        };
+        let book = state_book(store, &t).unwrap();
+        let a: AccountId = "a".parse().unwrap();
+        let at = |s: i64| OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1_800_000_000 + s);
+
+        book.mark_access_denied(&a, at(0));
+        assert_eq!(
+            book.state(&a, at(0)).access_denied_until,
+            Some(at(600)),
+            "cooldown from timeouts.access_denied_cooldown"
+        );
+        assert_eq!(book.status(&a, true, at(601)), AccountStatus::Ready);
+
+        let b: AccountId = "b".parse().unwrap();
+        book.record_success(&b, Default::default(), at(0));
+        assert_eq!(book.state(&b, at(1800)).window_counters.requests, 1);
+        // Past the configured 1 h (not the built-in 5 h): the window is empty.
+        assert_eq!(book.state(&b, at(3601)).window_counters.requests, 0);
     }
 
     #[tokio::test]
