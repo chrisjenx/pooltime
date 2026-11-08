@@ -30,7 +30,7 @@ pub struct Mapping {
     pub effort: Option<HashMap<String, String>>,
 }
 
-fn sorted_effort<S: Serializer>(
+pub(crate) fn sorted_effort<S: Serializer>(
     v: &Option<HashMap<String, String>>,
     s: S,
 ) -> Result<S::Ok, S::Error> {

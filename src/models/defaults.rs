@@ -52,6 +52,7 @@ fn claude(id: &str) -> RouteDef {
         context_window: None,
         max_context_window: None,
         supported_efforts: Vec::new(),
+        effort_map: None,
     }
 }
 
@@ -63,6 +64,7 @@ fn openai(id: &str, upstream: &str, max: u32) -> RouteDef {
         context_window: Some(CODEX_DEFAULT_CONTEXT_WINDOW),
         max_context_window: Some(max),
         supported_efforts: inferred_efforts(ProviderId::OpenAi, upstream),
+        effort_map: None,
     }
 }
 
