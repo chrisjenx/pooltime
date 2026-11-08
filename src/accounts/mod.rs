@@ -5,11 +5,13 @@
 
 pub mod creds;
 pub mod id;
+pub mod identity;
 pub mod registry;
 pub mod status;
 
 pub use creds::{Credentials, CredsError};
 pub use id::{AccountId, InvalidAccountId};
+pub use identity::{fetch_identity, verify, Verify};
 pub use registry::{AccountMeta, Identity, Registry, TimedOverride};
 pub use status::{
     AccountState, AccountStatus, Counters, ErrorRecord, RateLimitSnapshot, StateBook, TokenUsage,
