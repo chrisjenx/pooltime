@@ -294,8 +294,22 @@ refresh anything by hand).
 
 ### Conclusion
 
-**Pending re-check ≥ 2026-11-07T23:15.** Working assumption until then: refresh tokens **do rotate**, so treat every refresh
-as consuming the old token. Design consequences that hold regardless of the final answer:
+**Confirmed: Anthropic rotates the refresh token on every refresh.** Re-check at 2026-11-07T23:17:33 (same script):
+
+| account | sha256(refreshToken)[:16] | credentials mtime (local) | vs baseline |
+|---|---|---|---|
+| acct-f | `fp-5` | 2026-11-01T05:40:27 | unchanged (dormant, no evidence) |
+| acct-b | `fp-10` | 2026-11-07T20:26:23 | **rotated** |
+| acct-c | `fp-11` | 2026-11-07T12:32:23 | unchanged (not refreshed since baseline) |
+| acct-a | `fp-4` | 2026-10-25T16:01:37 | unchanged (dormant, no evidence) |
+| acct-d | `fp-7` | 2026-11-07T20:31:24 | **rotated** |
+| acct-e | `fp-13` | 2026-11-07T20:35:27 | **rotated** |
+| acct-h | `fp-8` | 2026-11-07T19:22:27 | **rotated** |
+| acct-g | `fp-12` | 2026-11-07T20:23:27 | **rotated** |
+
+Every account whose mtime advanced (5 of 5) has a new fingerprint; no account was rewritten with the same token. The
+writes landed ~7h56m–7h58m after the previous ones (an ~8 h access-token lifetime, refreshed on use). Refresh tokens are
+single-use. Design consequences (all already implemented or required):
 
 - Persist the new refresh token atomically (temp + fsync + rename) **before** using the new access token, and use
   compare-and-swap semantics against the old value (Claude Code does exactly this), serialising refreshes per account
