@@ -5,10 +5,10 @@
 //! to their floors (see [`Config::normalize`]). Durations are humantime strings
 //! in TOML (`"15m"`, `"2500ms"`).
 
-use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, DirBuilder};
+use std::io;
 use std::net::{IpAddr, Ipv4Addr};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -371,37 +371,9 @@ impl Config {
     pub fn save(&self, p: &Paths) -> anyhow::Result<()> {
         p.ensure()?;
         let s = toml::to_string_pretty(self).context("serializing config")?;
-        write_atomic_0600(&p.config, s.as_bytes())
+        crate::fsutil::atomic_write(&p.config, s.as_bytes(), 0o600)
             .with_context(|| format!("writing {}", p.config.display()))
     }
-}
-
-/// temp file in the same dir + fsync + rename + dir fsync, mode 0600.
-/// Task 4's `fsutil::atomic_write` may replace this.
-fn write_atomic_0600(path: &Path, data: &[u8]) -> io::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.tmp.{}", std::process::id()));
-    let res = (|| {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.set_permissions(fs::Permissions::from_mode(0o600))?;
-        f.write_all(data)?;
-        f.sync_all()?;
-        fs::rename(&tmp, path)?;
-        File::open(dir)?.sync_all()
-    })();
-    if res.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    res
 }
 
 #[cfg(test)]
