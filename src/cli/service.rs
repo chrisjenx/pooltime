@@ -100,10 +100,14 @@ fn uninstall(backend: Backend, env: &Env, r: &dyn Runner) -> anyhow::Result<i32>
             }
         }
     }
-    if backend.uninstall(env, r)? {
-        println!("removed the pooltime service");
-    } else {
-        println!("the pooltime service was not installed");
+    match backend.uninstall(env, r) {
+        Ok(true) => println!("removed the pooltime service"),
+        Ok(false) => println!("the pooltime service was not installed"),
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            eprintln!("the service definition was kept; fix the problem and retry");
+            return Ok(1);
+        }
     }
     Ok(code)
 }
