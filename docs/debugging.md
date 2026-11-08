@@ -79,7 +79,8 @@ request/response **headers** are logged with the request id. `authorization`, `p
 `set-cookie`, `chatgpt-account-id` and `code=`/`state=`/`k=` query values are redacted. Bodies are never
 logged. It lives in memory only, so a restart ends it.
 
-There is no CLI command for it; use the management API with your key:
+There is no CLI command for it; use the management API with your key (replace `3460` with your
+configured port if you changed it):
 
 ```sh
 key=$(cat ~/.pooltime/run/mgmt.key)

@@ -71,6 +71,14 @@ Design docs: `docs/specs/2026-11-07-pooltime-design.md` (§16 overrides earlier 
   notification or CLI output.
 - Anthropic SSE bytes are forwarded **unchanged** after commit; request bytes are forwarded
   unchanged unless Codex-thinking stripping removed something.
+- Pre-commit buffering is capped at 64 KiB and by the idle watchdog. `message_start` commits an
+  Anthropic stream (`ping` never does); a Codex stream commits on its first content frame, so a
+  created-then-failed upstream can still fail over.
+- Upstream HTTP client: no total request timeout (header-wait + per-read idle + per-attempt
+  deadline instead), automatic decompression off, and upstream `content-length` /
+  `content-encoding` / `transfer-encoding` are never forwarded on streamed responses.
+- Unknown inbound paths get an Anthropic-shaped 404 JSON and are journaled/logged.
+- The session `metadata.user_id` is stored only as a hash, never raw.
 - A client disconnect never records an account error and never panics or crashes the daemon.
   No state mutation may live after an `.await` in a cancellable handler future: use `Drop` guards
   or the spawned pump task.
@@ -80,9 +88,16 @@ Design docs: `docs/specs/2026-11-07-pooltime-design.md` (§16 overrides earlier 
   re-check before rename and retry if Claude Code changed the file.
 - One token refresh in flight per account, plus a cross-process `flock`; re-read credentials after
   a refresh timeout before retrying.
+- Stored refresh-token expiry = `min(old, new)`; with no server value and no old one it is
+  **unknown** (a guess may be displayed, never used to sideline).
 - Never sideline an account on a clock alone: an unknown or passed expiry is not `needs_login`
   until a probe refresh is refused (`invalid_grant` and similar). Network/5xx never means
   `needs_login`.
+- Sign-in flows run inside the daemon via the management API (the CLI is a thin client; it runs
+  them in-process only when no daemon answers). Callback listener: 127.0.0.1, `state` checked,
+  one-shot, 5-minute expiry.
+- `connect` requires a healthy pool whose `/health` passes the identity check; `service uninstall`
+  disconnects every profile first.
 - Header-less 429 from Anthropic is passed through (`x-pool-upstream-rejected: 1`): no bench,
   no failover, no cross-provider hop.
 - Management API and MCP are local-key protected; `Host`/`Origin` must be `127.0.0.1:<port>` or
@@ -92,13 +107,18 @@ Design docs: `docs/specs/2026-11-07-pooltime-design.md` (§16 overrides earlier 
 - Import is read-only on bro's files and Keychain items.
 - Tests: `cargo test`; **no network** (fake upstreams on `127.0.0.1:0`, wiremock); tempdirs only,
   never the real `$HOME`, `~/.claude*`, `~/.bro` or `~/.claude-max-pool`.
+- Never modify the developer's real Claude Code profiles (`~/.claude`, `~/.claude.json`,
+  `~/.claude-*`) or bro's state while developing or testing; set `HOME`/`POOLTIME_HOME` to a temp
+  dir for any manual run of `connect`, `setup` or `import`.
 - Tests that capture tracing output with `with_default` must first call
   `crate::test_support::ensure_callsites_stay_enabled()`.
-- MIT license. Conventional commits.
+- MIT license. Conventional commits (`feat(scope): ...`, `fix(...)`, `docs: ...`), one commit per
+  change; never commit tokens, credentials or real account emails.
 
 ## Docs
 
 User docs live in `README.md`, `llms.txt` and `docs/*.md`. They must describe what the code does:
-every command and flag must match `pooltime <cmd> --help`, every config key `src/config.rs`.
+every command must exist in `pooltime <cmd> --help` (checked by `scripts/check-docs.sh`; flags
+are checked by hand against `--help`), every config key must match `src/config.rs`.
 Tag a ```sh block `run` only if it is offline-safe (no network, browser, service install or real
 home); `scripts/check-docs.sh` executes those blocks against a temp home.

@@ -16,6 +16,11 @@ restores them when you disconnect). It runs on macOS and Linux, and replaces the
 > **Terms of service.** Pooling consumer subscription accounts may violate the providers' terms of
 > service. Whether and how you use pooltime with your accounts is your responsibility.
 
+> **Version.** This README and the docs describe pooltime **v1.0.0 or later**. On v0.1.0
+> (`pooltime --version`), `accounts relogin`, `statusline`, `connect --statusline/--mcp`,
+> `logs --request`, notifications, weekly burn and MCP do not exist yet: upgrade first
+> (`brew upgrade pooltime`, or re-run the install script).
+
 ## 60-second quickstart
 
 ```sh
@@ -43,7 +48,7 @@ Paste this into Claude Code (or any coding agent):
 ```text
 Set up pooltime for me by following https://raw.githubusercontent.com/chrisjenx/pooltime/main/llms.txt
 Ask me which Claude Code profiles to connect and which accounts to add, and tell me when I need to
-sign in in the browser. Never print tokens or key files.
+sign in in the browser. Never print tokens, key files or the dashboard URL.
 ```
 
 ## Everyday commands
@@ -75,8 +80,6 @@ pooltime logs --request <id>          # why did this request fail
 | [Migrating from bro](docs/migrating-from-bro.md) | import and cutover |
 | [Architecture](docs/architecture.md) · [Adding a provider](docs/adding-a-provider.md) · [AGENTS.md](AGENTS.md) | for contributors |
 | [llms.txt](llms.txt) | non-interactive setup for agents |
-
-These docs describe the `main` branch (v1.0.0); see [Install](docs/install.md) for what v0.1.0 lacks.
 
 ## Privacy
 
