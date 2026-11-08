@@ -29,7 +29,7 @@ fn weeks_of(q: &HashMap<String, String>) -> Result<u32, String> {
     }
 }
 
-pub(super) async fn burn(
+pub(crate) async fn burn(
     State(app): State<Arc<AppState>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {

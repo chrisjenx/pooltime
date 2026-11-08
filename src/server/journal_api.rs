@@ -80,7 +80,7 @@ fn not_found(id: &str) -> Response {
     anthropic_error(404, "not_found_error", &format!("Unknown request: {id}"))
 }
 
-pub(super) async fn requests(State(app): State<Arc<AppState>>, Query(q): Params) -> Response {
+pub(crate) async fn requests(State(app): State<Arc<AppState>>, Query(q): Params) -> Response {
     let (errors_only, limit) = match (flag(&q, "errors_only"), limit_of(&q)) {
         (Ok(e), Ok(l)) => (e, l),
         (Err(r), _) | (_, Err(r)) => return r,
@@ -119,7 +119,7 @@ pub(super) async fn requests(State(app): State<Arc<AppState>>, Query(q): Params)
     }
 }
 
-pub(super) async fn request(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+pub(crate) async fn request(State(app): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     if let Some(f) = fixture(&app, "details") {
         return match f.get(&id) {
             Some(v) => ok(v.clone()),

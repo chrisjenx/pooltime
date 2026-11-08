@@ -137,6 +137,7 @@ impl Pool {
                 "mgmt-test-key".into(),
             )
             .with_upstream(self.up.clone())
+            .with_mcp_key("mcp-test-key".into())
             .with_fixture_state(opts.fixture_state),
         );
         let mut router = pooltime::server::router::routes(app.clone());

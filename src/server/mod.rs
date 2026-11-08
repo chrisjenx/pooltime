@@ -52,6 +52,8 @@ pub struct AppState {
     pub store: Arc<Store>,
     /// Secret for dashboard/management mutations (never the proxy key).
     pub mgmt_key: String,
+    /// Bearer token for `/mcp` only (`run/mcp.key`); empty = `/mcp` refuses everything.
+    pub mcp_key: String,
     pub runtime: Runtime,
     /// Shared upstream HTTP client handed to every attempt.
     pub upstream: Arc<Upstream>,
@@ -97,6 +99,7 @@ impl AppState {
             providers,
             store,
             mgmt_key,
+            mcp_key: String::new(),
             runtime: Runtime::default(),
             upstream: Arc::new(Upstream::new().with_debug(debug.clone())),
             debug,
@@ -116,6 +119,12 @@ impl AppState {
     /// Serve `fixture` from `/api/v1/status` instead of the live state (dev/test only).
     pub fn with_fixture_state(mut self, fixture: Option<serde_json::Value>) -> AppState {
         self.fixture_state = fixture;
+        self
+    }
+
+    /// Accept `key` as the MCP token on `/mcp` ([`crate::mcp`]).
+    pub fn with_mcp_key(mut self, key: String) -> AppState {
+        self.mcp_key = key;
         self
     }
 

@@ -222,18 +222,29 @@ pub async fn connect(
     state: &AppState,
     profiles: &[Profile],
 ) -> anyhow::Result<Vec<(String, WriteOutcome)>> {
-    connect_with(state, profiles, None).await
+    connect_with(state, profiles, None, false).await
+}
+
+/// `http://<addr>/mcp`: the MCP endpoint registered in `.claude.json`.
+fn mcp_url(cfg: &Config) -> String {
+    format!("{}/mcp", base_url(cfg))
 }
 
 /// [`connect`], and with `statusline: Some(bin)` also install the status line wrapper
 /// (`<bin> statusline --wrap <id>`, [`super::statusline::install`]) into each profile whose `env`
-/// was applied. A profile whose wrapper cannot be installed stays connected and recorded, and is
-/// reported as failed. `None` never touches `statusLine`.
+/// was applied. With `mcp` also register the pool's MCP server (with the MCP token, never the
+/// management key) in each such profile's `.claude.json` ([`super::mcp::register`]). A profile
+/// whose wrapper or registration cannot be written stays connected and recorded, and is reported
+/// as failed. `None` / `false` never touch `statusLine` / `mcpServers`.
 pub async fn connect_with(
     state: &AppState,
     profiles: &[Profile],
     statusline: Option<&Path>,
+    mcp: bool,
 ) -> anyhow::Result<Vec<(String, WriteOutcome)>> {
+    if mcp && state.mcp_key.is_empty() {
+        return Err(anyhow!("this pool has no MCP token; restart it and retry"));
+    }
     let addr = probe_addr(state.cfg.host, state.cfg.port);
     match probe(addr).await {
         Probe::Pooltime => {}
@@ -261,6 +272,7 @@ pub async fn connect_with(
     let paths = state.paths.clone();
     let owned: Vec<Profile> = profiles.to_vec();
     let statusline: Option<PathBuf> = statusline.map(Path::to_path_buf);
+    let mcp: Option<(String, String)> = mcp.then(|| (mcp_url(&state.cfg), state.mcp_key.clone()));
     let (outcomes, failures) = tokio::task::spawn_blocking(move || {
         let mut outcomes = Vec::new();
         let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
@@ -279,11 +291,22 @@ pub async fn connect_with(
                 None => Ok(WriteOutcome::Unchanged),
                 Some(r) => r,
             };
-            match line {
+            let env = match line {
+                Ok(o) => merge(env, o),
+                Err(e) => {
+                    failures.push((p.id.clone(), e.context("installing the status line")));
+                    env
+                }
+            };
+            let reg = match &mcp {
+                None => Ok(WriteOutcome::Unchanged),
+                Some((url, token)) => super::mcp::register(p, url, token),
+            };
+            match reg {
                 Ok(o) => outcomes.push((p.clone(), merge(env, o))),
                 Err(e) => {
                     outcomes.push((p.clone(), env));
-                    failures.push((p.id.clone(), e.context("installing the status line")));
+                    failures.push((p.id.clone(), e.context("registering the MCP server")));
                 }
             }
         }
@@ -356,7 +379,7 @@ pub fn disconnect(
                 if o != WriteOutcome::GaveUp {
                     released.push(&p.id);
                 }
-                out.push((p.id.clone(), o));
+                out.push((p.id.clone(), merge(o, unregister_mcp(p))));
             }
             Err(e) => {
                 failure.get_or_insert(e.context(format!("disconnecting profile {}", p.id)));
@@ -372,6 +395,23 @@ pub fn disconnect(
     match failure {
         Some(e) => Err(e),
         None => Ok(out),
+    }
+}
+
+/// Drop the pool's MCP registration from `p` once its `env` is restored. Best effort: a
+/// `.claude.json` that cannot be parsed (Claude Code cannot read it either) or kept changing is
+/// logged by profile id and does not undo the disconnect. `Unchanged` unless it wrote.
+fn unregister_mcp(p: &Profile) -> WriteOutcome {
+    match super::mcp::unregister(p) {
+        Ok(WriteOutcome::GaveUp) => {
+            tracing::warn!(profile = %p.id, "MCP entry not removed: .claude.json kept changing");
+            WriteOutcome::Unchanged
+        }
+        Ok(o) => o,
+        Err(_) => {
+            tracing::warn!(profile = %p.id, "MCP entry not removed: .claude.json unreadable");
+            WriteOutcome::Unchanged
+        }
     }
 }
 
@@ -410,10 +450,25 @@ pub async fn sync_once(state: &AppState) -> anyhow::Result<Vec<(String, WriteOut
     let catalog = catalog(state).await;
     let url = base_url(&state.cfg);
     let paths = state.paths.clone();
+    // An existing MCP registration follows a moved port too (never added here).
+    let mcp = (!state.mcp_key.is_empty()).then(|| (mcp_url(&state.cfg), state.mcp_key.clone()));
     tokio::task::spawn_blocking(move || {
         let mut out = Vec::new();
         for p in connected {
-            match sync_profile(&paths, &p, &url, &key, catalog.as_deref()) {
+            let synced = sync_profile(&paths, &p, &url, &key, catalog.as_deref());
+            let synced = match (&mcp, synced) {
+                (Some((mcp_url, token)), Ok(o)) if o != WriteOutcome::GaveUp => {
+                    match super::mcp::refresh(&p, mcp_url, token) {
+                        Ok(m) => Ok(merge(o, m)),
+                        Err(_) => {
+                            tracing::warn!(profile = %p.id, "MCP entry not refreshed: .claude.json unreadable");
+                            Ok(o)
+                        }
+                    }
+                }
+                (_, r) => r,
+            };
+            match synced {
                 Ok(WriteOutcome::GaveUp) => {
                     tracing::warn!(profile = %p.id, "profile sync gave up: settings kept changing");
                     out.push((p.id, WriteOutcome::GaveUp));

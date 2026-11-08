@@ -54,6 +54,10 @@ pub enum Command {
         /// Also wrap each profile's status line to show the pool segment (restored on disconnect).
         #[arg(long)]
         statusline: bool,
+        /// Also register the pool's MCP server in each profile's .claude.json (removed on
+        /// disconnect).
+        #[arg(long)]
+        mcp: bool,
     },
     /// Restore Claude Code profiles' own settings (all connected ones if none are named).
     Disconnect {
@@ -132,7 +136,8 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
                 profiles,
                 all,
                 statusline,
-            } => connect::connect(&paths, profiles, all, statusline).await,
+                mcp,
+            } => connect::connect(&paths, profiles, all, statusline, mcp).await,
             Command::Disconnect { profiles } => connect::disconnect(&paths, profiles).await,
             Command::Models(cmd) => models::run(&paths, cmd).await,
             Command::Open => open::run(&paths).await,

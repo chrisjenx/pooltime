@@ -78,12 +78,14 @@ fn print_profiles(verb: &str, list: &Value) {
     }
 }
 
-/// `statusline`: also install the status line wrapper (`connect --statusline`).
+/// `statusline`: also install the status line wrapper (`connect --statusline`); `mcp`: also
+/// register the MCP server in each profile's `.claude.json` (`connect --mcp`).
 pub async fn connect(
     paths: &Paths,
     profiles: Vec<String>,
     all: bool,
     statusline: bool,
+    mcp: bool,
 ) -> anyhow::Result<i32> {
     let c = client::require(paths).await?;
     if profiles.is_empty() && !all {
@@ -105,7 +107,8 @@ pub async fn connect(
     let v = c
         .post(
             "/api/v1/profiles/connect",
-            json!({ "profiles": normalize(&profiles)?, "all": all, "statusline": statusline }),
+            json!({ "profiles": normalize(&profiles)?, "all": all, "statusline": statusline,
+                "mcp": mcp }),
         )
         .await?;
     print_profiles("connected", &v["profiles"]);

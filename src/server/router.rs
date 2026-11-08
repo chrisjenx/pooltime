@@ -55,6 +55,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
             get(models_route::models).fallback(|| async { method_not_allowed("GET") }),
         )
         .merge(mgmt::routes(state.clone()))
+        .merge(crate::mcp::routes(state.clone()))
         .merge(dashboard::routes())
         .fallback(not_found)
         .with_state(state)
@@ -136,7 +137,7 @@ async fn not_found(
     )
 }
 
-pub(super) fn method_not_allowed(allow: &'static str) -> Response {
+pub(crate) fn method_not_allowed(allow: &'static str) -> Response {
     let mut r = anthropic_error(405, "invalid_request_error", "pooltime: method not allowed");
     r.headers_mut()
         .insert(ALLOW, HeaderValue::from_static(allow));

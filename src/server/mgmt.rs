@@ -98,21 +98,31 @@ fn is_valid_key(k: &str) -> bool {
 /// The management key, created (32 random bytes, hex, mode 0600, atomically) when absent. A file
 /// that is not 64 hex characters is replaced rather than used as a weak key. Call at serve start.
 pub fn ensure_mgmt_key(paths: &Paths) -> anyhow::Result<String> {
+    ensure_key_file(paths, &mgmt_key_path(paths), "run/mgmt.key")
+}
+
+/// The random hex key stored at `path` (`name` for messages), created (32 random bytes, hex,
+/// mode 0600, atomically) when absent or malformed. Shared by the management and MCP keys.
+pub(crate) fn ensure_key_file(
+    paths: &Paths,
+    path: &std::path::Path,
+    name: &str,
+) -> anyhow::Result<String> {
     paths.ensure()?;
-    let path = mgmt_key_path(paths);
-    match fs::read_to_string(&path) {
+    match fs::read_to_string(path) {
         Ok(s) if is_valid_key(s.trim()) => {
-            crate::fsutil::ensure_mode(&path, 0o600)?;
+            crate::fsutil::ensure_mode(path, 0o600)?;
             return Ok(s.trim().to_string());
         }
-        Ok(_) => tracing::warn!("run/mgmt.key is malformed; generating a new management key"),
+        Ok(_) => tracing::warn!(file = name, "key file is malformed; generating a new key"),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(anyhow::Error::new(e).context("reading run/mgmt.key")),
+        Err(e) => return Err(anyhow::Error::new(e).context(format!("reading {name}"))),
     }
     let key = hex::encode(rand::rng().random::<[u8; 32]>());
-    // Regenerable: a key lost to power loss only changes the dashboard URL/cookie, so the
-    // relaxed (plain fsync) write is enough; it saves ~10 ms on a first boot on macOS.
-    crate::fsutil::atomic_write_relaxed(&path, format!("{key}\n").as_bytes(), 0o600)?;
+    // Regenerable: a key lost to power loss only changes the dashboard URL/cookie (or the MCP
+    // registration, rewritten by the next connect), so the relaxed (plain fsync) write is
+    // enough; it saves ~10 ms on a first boot on macOS.
+    crate::fsutil::atomic_write_relaxed(path, format!("{key}\n").as_bytes(), 0o600)?;
     Ok(key)
 }
 
@@ -285,7 +295,7 @@ pub(super) async fn read_object(
 }
 
 /// Run blocking work (disk, sqlite) off the async threads.
-pub(super) async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Response> {
     tokio::task::spawn_blocking(f).await.map_err(|e| {
@@ -294,7 +304,7 @@ pub(super) async fn blocking<T: Send + 'static>(
     })
 }
 
-pub(super) fn ts(t: OffsetDateTime) -> String {
+pub(crate) fn ts(t: OffsetDateTime) -> String {
     t.format(&Rfc3339).unwrap_or_default()
 }
 
@@ -674,7 +684,7 @@ pub async fn try_gather(
     })
 }
 
-async fn status(State(app): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub(crate) async fn status(State(app): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(fixture) = &app.fixture_state {
         return ok(fixture.clone());
     }
@@ -930,7 +940,7 @@ fn parse_routing(body: &Map<String, Value>, now: OffsetDateTime) -> Result<Routi
 /// `until` the weight is a temporary override that stops applying at that instant (routing
 /// ignores an expired override, so it reverts with no further action). `until: null` alone
 /// cancels an active override.
-async fn routing(
+pub(crate) async fn routing(
     State(app): State<Arc<AppState>>,
     Path(raw): Path<String>,
     headers: HeaderMap,
@@ -1360,7 +1370,8 @@ fn statusline_bin() -> Option<PathBuf> {
 /// `{profiles: [id | absolute dir, ...]}` or `{all: true}` (every `~/.claude*` profile found under
 /// the daemon's `$HOME`): point them at this pool ([`crate::claude_code::connect`]). Naming
 /// nothing is refused rather than read as "all", so no profile is ever connected by accident.
-/// `statusline: true` also installs the status line wrapper ([`crate::claude_code::connect_with`]).
+/// `statusline: true` also installs the status line wrapper and `mcp: true` registers the MCP
+/// server in each profile's `.claude.json` ([`crate::claude_code::connect_with`]).
 async fn profiles_connect(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1378,6 +1389,11 @@ async fn profiles_connect(
         None | Some(Value::Bool(false)) => false,
         Some(Value::Bool(true)) => true,
         Some(_) => return bad("all must be a boolean"),
+    };
+    let mcp = match body.get("mcp") {
+        None | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) => true,
+        Some(_) => return bad("mcp must be a boolean"),
     };
     let statusline = match body.get("statusline") {
         None | Some(Value::Bool(false)) => None,
@@ -1418,7 +1434,7 @@ async fn profiles_connect(
         Ok(Ok(p)) => p,
         Ok(Err(r)) | Err(r) => return r,
     };
-    match crate::claude_code::connect_with(&app, &profiles, statusline.as_deref()).await {
+    match crate::claude_code::connect_with(&app, &profiles, statusline.as_deref(), mcp).await {
         Ok(outcomes) => {
             tracing::info!(profiles = outcomes.len(), "profiles connected");
             ok(json!({ "ok": true, "profiles": profiles_json(&profiles, &outcomes) }))
@@ -1681,7 +1697,7 @@ pub fn mismatch_message(account: &AccountId, expected: &Identity, got: &Identity
 
 /// Start a sign-in for `{id}`, creating the account first when it does not exist yet.
 /// `{mode?: "callback"|"paste", provider?, hint?}`. Only Anthropic accounts can sign in so far.
-async fn login(
+pub(crate) async fn login(
     State(app): State<Arc<AppState>>,
     Path(raw): Path<String>,
     headers: HeaderMap,
