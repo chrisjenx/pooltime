@@ -42,8 +42,13 @@
 //! pooltime-only: selector_id_appends_1m_for_openai_routes_with_872k_max,
 //! family_of_follows_fable_mythos_opus_sonnet_haiku_order_case_insensitively,
 //! save_writes_models_toml_0600_and_only_non_default_rows,
-//! from_bro_json_imports_camel_case_models_json, corrupt_file_falls_back_to_defaults.
+//! from_bro_json_imports_camel_case_models_json,
+//! corrupt_file_falls_back_to_defaults (now: quarantined to models.toml.corrupt-<ts>),
+//! loaded_direct_routes_preserve_valid_effort_overrides (bro, fix round 1),
+//! effort_maps_round_trip_through_save_and_bro_json_import,
+//! effective_effort_prefers_mapping_row_then_route_map_then_pass_through.
 
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 
 use super::*;
@@ -608,6 +613,7 @@ fn save_round_trips_models_and_mapping_state() {
         context_window: Some(272_000),
         max_context_window: Some(872_000),
         supported_efforts: efforts(&["low", "high"]),
+        effort_map: Some([("max".to_string(), "xhigh".to_string())].into()),
     }]);
     t.save(&paths).unwrap();
     assert_eq!(ModelTable::load(&paths).unwrap(), t);
@@ -849,6 +855,7 @@ fn def(id: &str) -> RouteDef {
         context_window: Some(272_000),
         max_context_window: Some(872_000),
         supported_efforts: efforts(&["low", "high"]),
+        effort_map: None,
     }
 }
 
@@ -969,7 +976,123 @@ fn from_bro_json_imports_camel_case_models_json() {
 fn corrupt_file_falls_back_to_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::under(dir.path());
-    std::fs::write(dir.path().join("models.toml"), "this is = = not toml [[").unwrap();
+    let original = "this is = = not toml [[";
+    std::fs::write(dir.path().join("models.toml"), original).unwrap();
     assert_eq!(ModelTable::load(&paths).unwrap(), defaults());
     assert_eq!(ModelTable::from_bro_json("{nope"), defaults());
+
+    // The corrupt file was moved aside intact (0600), not left to be overwritten.
+    assert!(!dir.path().join("models.toml").exists());
+    let kept: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("models.toml.corrupt-")
+        })
+        .collect();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    let ts = kept[0].file_name().unwrap().to_string_lossy();
+    assert!(ts["models.toml.corrupt-".len()..]
+        .chars()
+        .all(|c| c.is_ascii_digit()));
+    assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), original);
+    assert_eq!(
+        std::fs::metadata(&kept[0]).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // A later save writes a fresh file and leaves the quarantined bytes alone.
+    defaults().save(&paths).unwrap();
+    assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), original);
+    assert!(dir.path().join("models.toml").exists());
+
+    // A second corruption in the same second does not clobber the first quarantine.
+    std::fs::write(dir.path().join("models.toml"), "[[").unwrap();
+    ModelTable::load(&paths).unwrap();
+    assert_eq!(std::fs::read_to_string(&kept[0]).unwrap(), original);
+}
+
+#[test]
+fn loaded_direct_routes_preserve_valid_effort_overrides() {
+    let t = from_toml(
+        r#"[[models]]
+id = "gpt-custom"
+provider = "openai"
+upstream_model = "gpt-custom"
+[models.effort_map]
+max = "xhigh"
+invalid = "high"
+low = "invalid"
+
+[[models]]
+id = "none-valid"
+provider = "openai"
+upstream_model = "none-valid"
+[models.effort_map]
+low = "ultra"
+"#,
+    );
+    assert_eq!(
+        t.resolve("gpt-custom").def.effort_map,
+        Some([("max".to_string(), "xhigh".to_string())].into())
+    );
+    assert_eq!(t.resolve("none-valid").def.effort_map, None);
+    // `[1m]` resolution and mapped routes carry the route's map too.
+    assert!(t.resolve("gpt-custom[1m]").def.effort_map.is_some());
+}
+
+#[test]
+fn effort_maps_round_trip_through_save_and_bro_json_import() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = Paths::under(dir.path());
+    let imported = ModelTable::from_bro_json(
+        r#"{"models":[{"id":"gpt-custom","provider":"openai","upstreamModel":"gpt-custom",
+            "effortMap":{"max":"xhigh","low":"nope","bogus":"high"}}]}"#,
+    );
+    assert_eq!(
+        imported.resolve("gpt-custom").def.effort_map,
+        Some([("max".to_string(), "xhigh".to_string())].into())
+    );
+    imported.save(&paths).unwrap();
+    assert_eq!(ModelTable::load(&paths).unwrap(), imported);
+}
+
+#[test]
+fn effective_effort_prefers_mapping_row_then_route_map_then_pass_through() {
+    let t = from_toml(
+        r#"[[models]]
+id = "r"
+provider = "openai"
+upstream_model = "r"
+[models.effort_map]
+max = "xhigh"
+high = "medium"
+"#,
+    );
+    let def = &t.resolve("r").def;
+    let mapping: HashMap<String, String> = [("high".to_string(), "low".to_string())].into();
+    let eff = |m: Option<&HashMap<String, String>>, tier: &str| effective_effort(def, m, tier);
+    // mapping row wins over the route map
+    assert_eq!(eff(Some(&mapping), "high").as_deref(), Some("low"));
+    // route map used when the mapping row has no entry for the tier (or no mapping)
+    assert_eq!(eff(Some(&mapping), "max").as_deref(), Some("xhigh"));
+    assert_eq!(eff(None, "high").as_deref(), Some("medium"));
+    // otherwise 1:1, and "default" stays unset
+    assert_eq!(eff(None, "low").as_deref(), Some("low"));
+    assert_eq!(eff(None, "default"), None);
+    let plain = defaults().resolve("gpt-6-sol").def;
+    assert_eq!(
+        effective_effort(&plain, None, "xhigh").as_deref(),
+        Some("xhigh")
+    );
+    assert_eq!(effective_effort(&plain, None, "default"), None);
+    // an explicit override for "default" is honoured
+    let d: HashMap<String, String> = [("default".to_string(), "medium".to_string())].into();
+    assert_eq!(
+        effective_effort(&plain, Some(&d), "default").as_deref(),
+        Some("medium")
+    );
 }

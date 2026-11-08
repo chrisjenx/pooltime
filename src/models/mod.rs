@@ -10,6 +10,8 @@ mod table;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::providers::ProviderId;
@@ -31,6 +33,30 @@ pub struct RouteDef {
     pub context_window: Option<u32>,
     pub max_context_window: Option<u32>,
     pub supported_efforts: Vec<String>,
+    /// Per-route source tier -> Codex effort overrides (bro `effortMap`), sanitised on load.
+    /// See [`effective_effort`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "mapping::sorted_effort"
+    )]
+    pub effort_map: Option<HashMap<String, String>>,
+}
+
+/// Codex effort to send for a source effort `tier` (`default`, `low`, ... `max`): the
+/// mapping row's override wins, then the route's `effort_map`, else the tier passes
+/// through 1:1 and `default` stays unset (Codex applies its own server default).
+/// Clamping to `supported_efforts` is the caller's job.
+pub fn effective_effort(
+    def: &RouteDef,
+    mapping_effort: Option<&HashMap<String, String>>,
+    tier: &str,
+) -> Option<String> {
+    mapping_effort
+        .and_then(|m| m.get(tier))
+        .or_else(|| def.effort_map.as_ref().and_then(|m| m.get(tier)))
+        .cloned()
+        .or_else(|| (tier != "default").then(|| tier.to_string()))
 }
 
 /// A resolved request route.

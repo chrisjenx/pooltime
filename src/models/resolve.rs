@@ -35,6 +35,7 @@ pub(crate) fn resolve_in(rows: &[RouteDef], requested: &str) -> Route {
             context_window: None,
             max_context_window: None,
             supported_efforts: Vec::new(),
+            effort_map: None,
         },
     };
     Route {

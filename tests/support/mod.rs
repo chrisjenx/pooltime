@@ -260,6 +260,7 @@ pub fn route(model: &str) -> Route {
             context_window: None,
             max_context_window: None,
             supported_efforts: vec![],
+            effort_map: None,
         },
         effort: None,
     }

@@ -1,10 +1,12 @@
 //! The live model table: bundled defaults overlaid by `models.toml`, plus family
 //! mappings. A plain struct; the server wraps it in an `RwLock` for hot edits.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde::Serialize;
@@ -75,13 +77,27 @@ impl ModelTable {
         }
     }
 
-    /// Load `<home>/models.toml`; a missing file means defaults.
+    /// Load `<home>/models.toml`; a missing file means defaults. An unparseable file is
+    /// quarantined (renamed to `models.toml.corrupt-<unix-ts>`, 0600, path logged) and
+    /// defaults are returned, so the next `save` cannot silently destroy the user's bytes.
+    /// If the quarantine rename itself fails that is an error.
     pub fn load(p: &Paths) -> anyhow::Result<Self> {
         let path = Self::path(p);
-        match std::fs::read_to_string(&path) {
-            Ok(text) => Ok(Self::from_toml_str(&text)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::defaults()),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::defaults()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        match toml::from_str::<Value>(&text) {
+            Ok(v) => Ok(Self::from_value(Some(&v))),
+            Err(e) => {
+                let kept = quarantine(&path)?;
+                tracing::warn!(
+                    error = %e, quarantined = %kept.display(),
+                    "models.toml failed to parse; moved aside and using default model table"
+                );
+                Ok(Self::defaults())
+            }
         }
     }
 
@@ -241,6 +257,36 @@ impl ModelTable {
     }
 }
 
+/// Rename a corrupt `path` to `<path>.corrupt-<unix-ts>` (never overwriting an earlier
+/// quarantine) and tighten it to 0600.
+fn quarantine(path: &Path) -> anyhow::Result<PathBuf> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let base = format!("{}.corrupt-{ts}", path.display());
+    let mut dest = PathBuf::from(&base);
+    let mut n = 1;
+    while dest.exists() {
+        dest = PathBuf::from(format!("{base}-{n}"));
+        n += 1;
+    }
+    std::fs::rename(path, &dest)
+        .with_context(|| format!("quarantining corrupt {}", path.display()))?;
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting {}", dest.display()))?;
+    Ok(dest)
+}
+
+/// Recognised `(tier, value)` pairs of an effort map object; `None` when empty/not an object.
+fn parse_effort_map(v: Option<&Value>) -> Option<HashMap<String, String>> {
+    let raw: HashMap<String, String> = v?
+        .as_object()?
+        .iter()
+        .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+        .collect();
+    sanitize_effort(&raw)
+}
+
 fn get<'a>(o: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
     keys.iter().find_map(|k| o.get(*k))
 }
@@ -270,6 +316,7 @@ struct FileRow {
     context_window: Option<u32>,
     max_context_window: Option<u32>,
     supported_efforts: Option<Vec<String>>,
+    effort_map: Option<HashMap<String, String>>,
 }
 
 fn parse_row(v: &Value) -> Option<FileRow> {
@@ -290,6 +337,7 @@ fn parse_row(v: &Value) -> Option<FileRow> {
         context_window: ctx.filter(|_| !contradictory),
         max_context_window: max.filter(|_| !contradictory),
         supported_efforts: parse_efforts(get(o, &["supported_efforts", "supportedEfforts"])),
+        effort_map: parse_effort_map(get(o, &["effort_map", "effortMap"])),
     })
 }
 
@@ -315,6 +363,7 @@ fn merge_rows(models: Option<&Value>) -> Vec<RouteDef> {
                 supported_efforts: r
                     .supported_efforts
                     .unwrap_or_else(|| b.supported_efforts.clone()),
+                effort_map: r.effort_map,
                 id: r.id,
                 provider: r.provider,
                 upstream_model: r.upstream_model,
@@ -325,6 +374,7 @@ fn merge_rows(models: Option<&Value>) -> Vec<RouteDef> {
                     .unwrap_or_else(|| inferred_efforts(r.provider, &r.upstream_model)),
                 context_window: r.context_window,
                 max_context_window: r.max_context_window,
+                effort_map: r.effort_map,
                 id: r.id,
                 provider: r.provider,
                 upstream_model: r.upstream_model,
@@ -370,19 +420,10 @@ fn parse_mappings(v: Option<&Value>, rows: &[RouteDef]) -> Vec<Mapping> {
         if out.iter().any(|m| m.from == from) {
             continue;
         }
-        let effort = o
-            .get("effort")
-            .and_then(Value::as_object)
-            .map(|e| {
-                e.iter()
-                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
-                    .collect()
-            })
-            .and_then(|e| sanitize_effort(&e));
         let mut m = Mapping {
             from: from.to_string(),
             to: to.to_string(),
-            effort,
+            effort: parse_effort_map(o.get("effort")),
         };
         drop_unsupported_efforts(rows, &mut m);
         out.push(m);
