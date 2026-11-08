@@ -101,7 +101,9 @@ pub fn ensure_mgmt_key(paths: &Paths) -> anyhow::Result<String> {
         Err(e) => return Err(anyhow::Error::new(e).context("reading run/mgmt.key")),
     }
     let key = hex::encode(rand::rng().random::<[u8; 32]>());
-    crate::fsutil::atomic_write(&path, format!("{key}\n").as_bytes(), 0o600)?;
+    // Regenerable: a key lost to power loss only changes the dashboard URL/cookie, so the
+    // relaxed (plain fsync) write is enough; it saves ~10 ms on a first boot on macOS.
+    crate::fsutil::atomic_write_relaxed(&path, format!("{key}\n").as_bytes(), 0o600)?;
     Ok(key)
 }
 

@@ -1063,6 +1063,26 @@ mod mgmt {
     }
 
     #[test]
+    fn mgmt_key_written_atomically_0600_without_temp_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        let key = ensure_mgmt_key(&paths).unwrap();
+        let p = mgmt_key_path(&paths);
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), format!("{key}\n"));
+        // Regenerating a malformed key replaces the file by rename: no temp file remains.
+        std::fs::write(&p, "short").unwrap();
+        let fresh = ensure_mgmt_key(&paths).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), format!("{fresh}\n"));
+        let names: Vec<String> = std::fs::read_dir(&paths.run)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["mgmt.key".to_string()]);
+    }
+
+    #[test]
     fn mgmt_key_created_once_with_0600() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path());
