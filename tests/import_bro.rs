@@ -194,6 +194,79 @@ fn imports_accounts_creds_and_routing() {
     assert_no_secrets(&text);
     assert!(text.contains("bro pool down"), "{text}");
     assert!(text.contains("--i-stopped-bro"), "{text}");
+
+    // kc1 and bad+name stay only in bro: never advise deleting the whole pool dir.
+    let pool_rm = format!("rm -rf '{}'", fx.pool.display());
+    assert!(!report.cleanup.contains(&pool_rm), "{:?}", report.cleanup);
+    for name in ["alpha", "beta", "codex1", "dead1", "stale1"] {
+        let rm = format!("rm -rf '{}'", fx.pool.join("accounts").join(name).display());
+        assert!(
+            report.cleanup.contains(&rm),
+            "{rm} missing: {:?}",
+            report.cleanup
+        );
+    }
+    assert!(!report
+        .cleanup
+        .iter()
+        .any(|c| c.contains("kc1") && c.starts_with("rm")));
+    assert!(report
+        .cleanup
+        .contains(&"# kept in bro (not imported): bad+name, kc1".to_string()));
+    assert!(!report.cleanup.iter().any(|c| c.starts_with("security")));
+    // The orphan snapshot stays: only the imported snapshot file is listed, no glob.
+    assert!(!report.cleanup.iter().any(|c| c.contains("pool-settings*")));
+}
+
+#[test]
+fn per_account_write_failure_is_reported_and_import_continues() {
+    let fx = fixture();
+    fx.paths.ensure().unwrap();
+    // A directory where beta's lock file must go makes beta's credentials write fail.
+    fs::create_dir_all(fx.paths.accounts.join("beta/lock")).unwrap();
+    let report = import(&fx, &FakeKeychain::default());
+    assert!(
+        matches!(
+            &report.account("beta").unwrap().outcome,
+            AccountOutcome::Failed { .. }
+        ),
+        "{:?}",
+        report.account("beta")
+    );
+    assert!(matches!(
+        report.account("alpha").unwrap().outcome,
+        AccountOutcome::Imported { .. }
+    ));
+    assert_eq!(report.models, ItemOutcome::Imported);
+    let reg = Registry::load(&fx.paths).unwrap();
+    assert!(reg.get(&id("beta")).is_none());
+    // Its seeded markers are dropped again, and bro's copy is the one to keep.
+    let book = state(&fx);
+    assert!(book
+        .state(&id("beta"), OffsetDateTime::now_utc())
+        .snapshot
+        .is_none());
+    assert!(report
+        .cleanup
+        .iter()
+        .any(|c| c.starts_with("# kept in bro") && c.contains("beta")));
+    assert!(report.render().contains("FAILED"));
+}
+
+#[test]
+fn tuning_does_not_override_custom_config() {
+    let fx = fixture();
+    fx.paths.ensure().unwrap();
+    fs::write(&fx.paths.config, "[routing]\nfive_hour_exp = 3.0\n").unwrap();
+    let report = import(&fx, &FakeKeychain::default());
+    assert!(
+        matches!(&report.tuning, ItemOutcome::Skipped(r) if r.contains("five_hour_exp")),
+        "{:?}",
+        report.tuning
+    );
+    let cfg = Config::load_file(&fx.paths).unwrap();
+    assert_eq!(cfg.routing.five_hour_exp, 3.0);
+    assert_eq!(cfg.routing.min_headroom, 0.1);
 }
 
 #[test]
@@ -250,7 +323,10 @@ fn existing_pooltime_account_is_not_overwritten() {
     mine.priority = 7;
     reg.upsert(mine.clone()).unwrap();
     let report = import(&fx, &FakeKeychain::default());
-    assert!(skipped_reason(&report, "alpha").contains("already exists"));
+    assert_eq!(
+        report.account("alpha").unwrap().outcome,
+        AccountOutcome::AlreadyExists
+    );
     assert_eq!(reg.get(&id("alpha")).unwrap(), mine);
     assert!(reg.read_creds(&id("alpha")).unwrap().is_none());
     // The sticky session for the skipped account is not imported either.
@@ -260,8 +336,12 @@ fn existing_pooltime_account_is_not_overwritten() {
 #[test]
 fn keychain_fallback_used_when_no_file() {
     let fx = fixture();
+    // Without the invalid account, every bro account ends up in pooltime.
+    fs::remove_dir_all(fx.pool.join("accounts/bad+name")).unwrap();
     let kc = kc1_keychain(&fx);
     let report = import(&fx, &kc);
+    let pool_rm = format!("rm -rf '{}'", fx.pool.display());
+    assert!(report.cleanup.contains(&pool_rm), "{:?}", report.cleanup);
     // Only the account without a .credentials.json consults the Keychain, by bro's service name.
     assert_eq!(*kc.calls.lock().unwrap(), [kc1_service(&fx)]);
     let reg = Registry::load(&fx.paths).unwrap();
@@ -464,22 +544,131 @@ fn tree_digest(root: &Path) -> Vec<(String, Vec<u8>, u32, i64, i64)> {
     out
 }
 
-#[test]
-fn bro_files_untouched() {
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A `pooltime import bro` command over the fixture: temp HOME, temp POOLTIME_HOME, and a port
+/// nothing answers on unless the test says so.
+fn import_cmd(fx: &Fx, port: u16, extra: &[&str]) -> assert_cmd::Command {
+    let mut c = assert_cmd::Command::cargo_bin("pooltime").unwrap();
+    c.args(["import", "bro"])
+        .args(extra)
+        .arg("--bro-pool")
+        .arg(&fx.pool)
+        .arg("--bro-home")
+        .arg(&fx.bro_home)
+        .env("HOME", &fx.home)
+        .env("POOLTIME_HOME", &fx.paths.home)
+        .env("POOLTIME_PORT", port.to_string())
+        .env_remove("POOLTIME_HOST");
+    c
+}
+
+#[tokio::test]
+async fn bro_files_untouched() {
     let fx = fixture();
     fs::create_dir_all(fx.home.join(".claude")).unwrap();
     fs::write(fx.home.join(".claude/settings.json"), "{}").unwrap();
     let before = (tree_digest(&fx.pool), tree_digest(&fx.bro_home));
     assert!(before.0.len() > 10);
-    let report = import(&fx, &kc1_keychain(&fx));
+    let mut report = import(&fx, &kc1_keychain(&fx));
     assert!(matches!(
         report.account("kc1").unwrap().outcome,
         AccountOutcome::Imported { .. }
     ));
+    let fake = FakeAnthropic::start().await;
+    fake.script(
+        "/api/oauth/profile",
+        vec![Reply::error(500, "api_error", "x")],
+    );
+    let cfg = AnthropicCfg {
+        profile_url: format!("{}/api/oauth/profile", fake.url()),
+        ..AnthropicCfg::default()
+    };
+    fill_identities(&fx.paths, &mut report, &Upstream::new(), &cfg).await;
     assert_eq!((tree_digest(&fx.pool), tree_digest(&fx.bro_home)), before);
     // Cleanup commands are printed for the user, never executed.
     assert!(report.cleanup.iter().any(|c| c == "bro pool down"));
     assert!(fx.pool.exists() && fx.bro_home.join("pool-settings.json").exists());
+}
+
+#[test]
+fn cli_import_leaves_bro_files_untouched() {
+    let fx = fixture();
+    // The real binary uses the real Keychain: keep it out of reach (no Keychain-only account).
+    fs::remove_dir_all(fx.pool.join("accounts/kc1")).unwrap();
+    fx.paths.ensure().unwrap();
+    // Identity fetches go to a closed local port, never the network.
+    fs::write(
+        &fx.paths.config,
+        "[anthropic]\napi_base = \"http://127.0.0.1:9\"\nprofile_url = \"http://127.0.0.1:9/api/oauth/profile\"\n",
+    )
+    .unwrap();
+    let before = (tree_digest(&fx.pool), tree_digest(&fx.bro_home));
+    let out = import_cmd(&fx, free_port(), &[])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_no_secrets(&stdout);
+    assert_no_secrets(&String::from_utf8(out.stderr).unwrap());
+    assert!(stdout.contains("identity pending"), "{stdout}");
+    assert_eq!((tree_digest(&fx.pool), tree_digest(&fx.bro_home)), before);
+    let reg = Registry::load(&fx.paths).unwrap();
+    assert!(reg.get(&id("alpha")).unwrap().imported);
+}
+
+/// Answers every connection's `GET /health` like a pooltime daemon.
+fn fake_pooltime_health() -> u16 {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut conn in l.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = conn.read(&mut buf);
+            let body = r#"{"service":"pooltime","status":"ok","version":"0.1.0"}"#;
+            let _ = write!(
+                conn,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    port
+}
+
+#[test]
+fn import_refuses_while_pooltime_runs() {
+    let fx = fixture();
+    let port = fake_pooltime_health();
+    let before = (tree_digest(&fx.pool), tree_digest(&fx.bro_home));
+    let out = import_cmd(&fx, port, &[])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("pooltime is running"), "{stderr}");
+    assert!(stderr.contains("stop it first"), "{stderr}");
+    assert!(!fx.paths.home.exists(), "nothing may be written");
+    assert_eq!((tree_digest(&fx.pool), tree_digest(&fx.bro_home)), before);
+    // A dry run still shows the plan, with a note.
+    let out = import_cmd(&fx, port, &["--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("pooltime is running"), "{stdout}");
+    assert!(stdout.contains("alpha"), "{stdout}");
+    assert!(!fx.paths.home.exists());
 }
 
 #[test]
@@ -492,16 +681,7 @@ fn dry_run_writes_nothing() {
         tree_digest(&fx.pool),
         tree_digest(&fx.bro_home),
     );
-    let out = assert_cmd::Command::cargo_bin("pooltime")
-        .unwrap()
-        .args(["import", "bro", "--dry-run", "--bro-pool"])
-        .arg(&fx.pool)
-        .arg("--bro-home")
-        .arg(&fx.bro_home)
-        .env("HOME", &fx.home)
-        .env("POOLTIME_HOME", &fx.paths.home)
-        .env_remove("POOLTIME_PORT")
-        .env_remove("POOLTIME_HOST")
+    let out = import_cmd(&fx, free_port(), &["--dry-run"])
         .assert()
         .success()
         .get_output()
@@ -523,13 +703,7 @@ fn dry_run_writes_nothing() {
     assert_eq!(after, before);
     // An absent pooltime home stays absent.
     let fresh = fx.dir.path().join("fresh-pt");
-    assert_cmd::Command::cargo_bin("pooltime")
-        .unwrap()
-        .args(["import", "bro", "--dry-run", "--bro-pool"])
-        .arg(&fx.pool)
-        .arg("--bro-home")
-        .arg(&fx.bro_home)
-        .env("HOME", &fx.home)
+    import_cmd(&fx, free_port(), &["--dry-run"])
         .env("POOLTIME_HOME", &fresh)
         .assert()
         .success();
@@ -589,5 +763,17 @@ async fn identity_fetched_for_refreshable_accounts_and_failure_is_pending() {
         .iter()
         .any(|a| a.contains("dead1") || a.contains("codex1")));
     assert_eq!(auths.len(), 3, "alpha, beta, stale1");
-    assert!(report.render().contains("identity pending"));
+    let text = report.render();
+    assert!(
+        text.contains("identity pending (run `pooltime accounts login beta`"),
+        "{text}"
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.starts_with("beta: identity fetch failed")),
+        "{:?}",
+        report.notes
+    );
 }
