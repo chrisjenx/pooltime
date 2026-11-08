@@ -92,6 +92,26 @@ impl AnthropicProvider {
         }
     }
 
+    /// Fetch now, ignoring the cache's age (`POST /api/v1/models/refresh`). Shares the
+    /// single-flight gate with [`Self::live_models`]. Success replaces the cache; a failure is an
+    /// `Err` with a classified reason and keeps the previous list cached for the listing.
+    pub async fn refresh_live_models(&self) -> anyhow::Result<Vec<Value>> {
+        let mut cache = self.catalog.state.lock().await;
+        let fetched = self.fetch_models().await;
+        self.catalog.attempts.fetch_add(1, Ordering::SeqCst);
+        match fetched {
+            Ok(models) => {
+                let models = Arc::new(models);
+                *cache = Some((Instant::now(), models.clone()));
+                Ok(models.to_vec())
+            }
+            Err(reason) => {
+                tracing::warn!(reason = %reason, "live model catalog refresh failed");
+                Err(anyhow!("live model catalog refresh failed: {reason}"))
+            }
+        }
+    }
+
     /// One fetch: try each eligible account until one answers. `Err` is a classified label.
     async fn fetch_models(&self) -> Result<Vec<Value>, String> {
         let url: reqwest::Url = join_url(&self.cfg.api_base, MODELS_PATH)

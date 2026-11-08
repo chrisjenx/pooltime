@@ -119,6 +119,11 @@ pub trait Provider: Send + Sync {
     async fn live_models(&self) -> anyhow::Result<Vec<serde_json::Value>> {
         Ok(Vec::new())
     }
+    /// Like [`Provider::live_models`] but bypassing any cache (`pooltime models refresh`). A
+    /// failure is an `Err` (no stale fallback), and must leave the last good list in place.
+    async fn refresh_live_models(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.live_models().await
+    }
 }
 
 /// True when an upstream 403/error message indicates an entitlement problem
