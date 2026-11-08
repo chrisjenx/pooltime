@@ -1017,17 +1017,21 @@ fn erroring_threshold_and_clear() {
     }
     assert_eq!(b.erroring(&r, t(70)).map(|e| e.count), Some(3));
 
-    // A failed expiry probe is erroring on its own until a success.
+    // A failed expiry probe is erroring on its own until a success, for at most its TTL (the
+    // probe's 15-minute retry renews it).
     let q = id("q");
     b.record_probe_failure(&q, "refresh:network:connect", t(0));
     assert_eq!(
-        b.erroring(&q, t(3600)),
+        b.erroring(&q, t(16 * 60)),
         Some(Erroring {
             class: "refresh:network:connect".into(),
             count: 1,
             since: t(0),
         })
     );
-    b.mark_verified(&q, t(3700));
-    assert_eq!(b.erroring(&q, t(3701)), None);
+    assert_eq!(b.erroring(&q, t(17 * 60)), None, "lapses without a retry");
+    b.record_probe_failure(&q, "refresh:network:connect", t(17 * 60));
+    assert!(b.erroring(&q, t(17 * 60 + 1)).is_some());
+    b.mark_verified(&q, t(18 * 60));
+    assert_eq!(b.erroring(&q, t(18 * 60 + 1)), None);
 }

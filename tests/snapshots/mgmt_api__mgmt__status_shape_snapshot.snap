@@ -149,6 +149,7 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
     "expiring_today": 0,
     "expiring": 0
   },
+  "expiry_warn_secs": 259200,
   "tuning": {
     "five_hour_exp": 1.0,
     "min_headroom": 0.1,

@@ -19,7 +19,11 @@
   const POLL_MS = 4000;
   const TIMEOUT_MS = 10000;
   const SIGNIN_POLL_MS = 1500;
-  const EXPIRY_WARN_MS = 3 * 24 * 3600 * 1000;
+  // Login-expiry warn window: the server's (`expiry_warn_secs`, from alerts.warn_days[0]).
+  function expiryWarnMs() {
+    const s = ui.data && ui.data.expiry_warn_secs;
+    return (typeof s === "number" ? s : 3 * 24 * 3600) * 1000;
+  }
 
   // Exact status words (spec §4/§16): the same everywhere, most severe first.
   const WORDS = {
@@ -147,7 +151,7 @@
   function loginExpiringSoon(a) {
     if (a.status === "expiring") return true;
     if (isDead(a) || !a.refresh_expires_at) return false;
-    return Date.parse(a.refresh_expires_at) - now() < EXPIRY_WARN_MS;
+    return Date.parse(a.refresh_expires_at) - now() <= expiryWarnMs();
   }
   // "expires in 2d 4h" / "expired 3h ago, still working" (only a refused refresh ends a login).
   function expiryCountdown(ts) {
@@ -492,7 +496,7 @@
     if (a.refresh_expires_at) {
       const left = Date.parse(a.refresh_expires_at) - now();
       expiry = (left > 0 ? "expires " : "expired ") + rel(a.refresh_expires_at) + " (" + clock(a.refresh_expires_at) + ")";
-      expiryCls = left <= 0 ? "bad-text" : left < EXPIRY_WARN_MS ? "warn-text" : null;
+      expiryCls = left <= 0 ? "bad-text" : left < expiryWarnMs() ? "warn-text" : null;
     }
     const ov = a.weight_override;
     const routingText = "priority " + a.priority + " · weight " + a.effective_weight +

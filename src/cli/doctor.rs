@@ -14,7 +14,8 @@
 //!   profiles every minute). A foreign base URL is shown as its origin only.
 //! - **account <id>**: the running pool's status (unreadable status: `✗`, no fallback), else,
 //!   with no pool, the files. `needs_login` / corrupt credentials `✗`; a recorded login expiry
-//!   that passed (the pool never acts on it) or falls within the largest `alerts.warn_days` `!`.
+//!   that passed (unconfirmed: only a refused probe refresh means needs_login) or falls within
+//!   the largest `alerts.warn_days` `!`.
 //! - **upstream <origin>**: `HEAD` to the Anthropic API and token origins, plus the OpenAI/Codex
 //!   API and token origins when an OpenAI account exists (all from config, so tests point them at
 //!   local fakes). Any HTTP answer is reachable; a timeout is `!` (slow or offline network); a
@@ -483,7 +484,7 @@ fn account_check(a: AccountFacts, live: bool, warn_days: u32, now: OffsetDateTim
     }
     if let Some(exp) = a.refresh_expires_at {
         let left = exp - now;
-        // The pool never acts on this recorded clock (only a refused refresh makes an account
+        // A passed clock alone never sidelines (only a refused probe refresh makes an account
         // needs_login, handled above), so a passed expiry on a working account is a warning.
         if left <= time::Duration::ZERO {
             return Check::new(

@@ -2628,6 +2628,8 @@ mod mgmt {
             json!({"needs_login": 1, "expiring_today": 1, "expiring": 2}),
             "{v}"
         );
+        // The warn window behind `expiring` (alerts.warn_days[0] = 3 days), for the dashboard.
+        assert_eq!(v["expiry_warn_secs"], 3 * 86_400, "{v}");
         let work = account(&v, "work");
         assert_eq!(work["status"], "expiring", "{work}");
         assert_eq!(work["until"], work["refresh_expires_at"], "{work}");
@@ -2685,8 +2687,40 @@ mod mgmt {
         let a = work_account(&srv).await;
         assert_eq!(a["status"], "erroring", "{a}");
         assert_eq!(a["class"], "refresh:server:503", "{a}");
-        // Once per expiry value: the next tick does not probe again.
+        // Unconfirmed: no re-probe until the 15-minute retry is due, then exactly one more POST.
         assert!(probe.tick(&srv.app, now).await.is_empty());
+        let almost = now + time::Duration::minutes(15) - time::Duration::seconds(1);
+        assert!(probe.tick(&srv.app, almost).await.is_empty());
+        assert_eq!(fake.requests_to(TOKEN).len(), 1);
+        let retry = now + time::Duration::minutes(15);
+        assert_eq!(
+            probe.tick(&srv.app, retry).await,
+            [(
+                id("work"),
+                ProbeOutcome::Erroring("refresh:server:503".into())
+            )]
+        );
+        assert_eq!(fake.requests_to(TOKEN).len(), 2);
+        assert!(probe.tick(&srv.app, retry).await.is_empty());
+        assert_eq!(fake.requests_to(TOKEN).len(), 2);
+
+        // account_on_hold is billing, not a probe failure, and is not retried.
+        let fake = FakeAnthropic::start().await;
+        fake.route(TOKEN, |_, _| {
+            Reply::json(400, &json!({"error": {"type": "account_on_hold"}}))
+        });
+        let (_pool, srv, _) = expired(&fake).await;
+        let probe = ExpiryProbe::default();
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            probe.tick(&srv.app, now).await,
+            [(id("work"), ProbeOutcome::Billing)]
+        );
+        let a = work_account(&srv).await;
+        assert_eq!(a["status"], "billing", "{a}");
+        assert!(srv.app.state.erroring(&id("work"), now).is_none());
+        let later = now + time::Duration::minutes(30);
+        assert!(probe.tick(&srv.app, later).await.is_empty());
         assert_eq!(fake.requests_to(TOKEN).len(), 1);
 
         // invalid_grant confirms the dead login.
@@ -2702,8 +2736,8 @@ mod mgmt {
         assert_eq!(a["status"], "needs_login", "{a}");
         assert_eq!(a["reason"], "refresh_token_dead", "{a}");
 
-        // A refresh that works keeps the account usable (expiring by the clock: the min rule
-        // keeps the passed expiry), and it is not probed again.
+        // A refresh that works disproves the passed expiry: it is replaced (unknown here, the
+        // server sent none), the account is ready, and it is not probed again.
         let fake = FakeAnthropic::start().await;
         fake.route(TOKEN, |_, _| {
             Reply::json(
@@ -2719,8 +2753,11 @@ mod mgmt {
             [(id("work"), ProbeOutcome::Refreshed)]
         );
         let a = work_account(&srv).await;
-        assert_eq!(a["status"], "expiring", "{a}");
+        assert_eq!(a["status"], "ready", "{a}");
+        assert_eq!(a["refresh_expires_at"], Value::Null, "{a}");
         assert!(probe.tick(&srv.app, now).await.is_empty());
+        let later = now + time::Duration::hours(1);
+        assert!(probe.tick(&srv.app, later).await.is_empty());
         assert_eq!(fake.requests_to(TOKEN).len(), 1);
     }
 }

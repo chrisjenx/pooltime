@@ -25,6 +25,10 @@ use crate::errors::{FailReason, RefreshErrorKind};
 pub const ERRORING_WINDOW: Duration = Duration::minutes(15);
 /// Failures within [`ERRORING_WINDOW`] that make an account `erroring`.
 pub const ERRORING_THRESHOLD: u32 = 3;
+/// How long a failed expiry probe keeps an account `erroring` without a success: the probe's
+/// retry interval ([`ERRORING_WINDOW`]) plus two health ticks of slack, so the state stays up
+/// between retries but lapses when probing stops.
+pub const PROBE_FAILURE_TTL: Duration = Duration::minutes(17);
 /// Default warn window when `alerts.warn_days` is empty.
 pub const DEFAULT_WARN_DAYS: u32 = 3;
 /// Cap on remembered failures per account (only the window's worth matters).
@@ -76,7 +80,8 @@ pub struct Erroring {
 #[derive(Debug, Clone, Default)]
 pub struct ErrorStreak {
     failures: VecDeque<(OffsetDateTime, String)>,
-    /// A failed expiry probe: `erroring` on its own until a success clears it.
+    /// A failed expiry probe: `erroring` on its own until a success clears it or
+    /// [`PROBE_FAILURE_TTL`] passes (each failed retry renews it).
     probe_failed: Option<(OffsetDateTime, String)>,
 }
 
@@ -122,7 +127,11 @@ impl ErrorStreak {
         let count = u32::try_from(live.len()).unwrap_or(u32::MAX);
         let latest = live.last().map(|(t, c)| (*t, c.clone()));
         let first = live.first().map(|(t, _)| *t);
-        match &self.probe_failed {
+        let probe = self
+            .probe_failed
+            .as_ref()
+            .filter(|(pt, _)| now - *pt < PROBE_FAILURE_TTL);
+        match probe {
             Some((pt, pc)) => {
                 let class = match &latest {
                     Some((t, c)) if t > pt => c.clone(),

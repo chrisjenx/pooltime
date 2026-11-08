@@ -23,6 +23,8 @@
 //! rounded to whole numbers.
 
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use super::client::Client;
 
@@ -129,6 +131,11 @@ pub fn accounts_table(status: &Value) -> String {
 
 /// Lines for every account that is not ready: `<id> <status words> (<reason>)`.
 fn alerts(status: &Value) -> Vec<String> {
+    let rfc = |v: &Value| {
+        v.as_str()
+            .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+    };
+    let now = rfc(&status["now"]).unwrap_or_else(OffsetDateTime::now_utc);
     let mut out = Vec::new();
     for a in &by_severity(status) {
         let words = match str_of(a, "status") {
@@ -137,6 +144,10 @@ fn alerts(status: &Value) -> Vec<String> {
             "rate_limited" => format!("is rate-limited until {}", str_of(a, "until")),
             "billing" => "has a billing problem".to_string(),
             "access_denied" => format!("is access-denied until {}", str_of(a, "until")),
+            // Passed but no refresh refused it yet: only a probe can confirm needs_login.
+            "expiring" if rfc(&a["until"]).is_some_and(|u| u <= now) => {
+                format!("login expired {} (unconfirmed)", str_of(a, "until"))
+            }
             "expiring" => format!("login expires {}", str_of(a, "until")),
             "erroring" => format!("is erroring ({} failures)", num(&a["count"])),
             other => format!("is {other}"),
@@ -231,9 +242,12 @@ mod tests {
         let mut soon = row("soon", "expiring");
         soon["until"] = json!("2026-11-09T12:00:00Z");
         soon["reason"] = json!("refresh_token_expiring");
-        let s = json!({"version": "0.1.0",
-            "pool": {"accounts": 4, "available": 3, "seven_day_left_total": 0.0},
-            "accounts": [row("a-ready", "ready"), soon, row("limited", "rate_limited"), flaky]});
+        let mut lapsed = row("lapsed", "expiring");
+        lapsed["until"] = json!("2026-11-07T11:00:00Z");
+        let s = json!({"version": "0.1.0", "now": "2026-11-07T12:00:00Z",
+            "pool": {"accounts": 5, "available": 4, "seven_day_left_total": 0.0},
+            "accounts": [row("a-ready", "ready"), soon, row("limited", "rate_limited"), flaky,
+                lapsed]});
         let out = render(&s, "x");
         let at = |id: &str| {
             out.find(&format!("\n{id} "))
@@ -246,7 +260,8 @@ mod tests {
         assert!(
             out.contains(
                 "alerts: flaky is erroring (3 failures) (refresh:server:503); limited is \
-                 rate-limited until -; soon login expires 2026-11-09T12:00:00Z"
+                 rate-limited until -; lapsed login expired 2026-11-07T11:00:00Z (unconfirmed); \
+                 soon login expires 2026-11-09T12:00:00Z"
             ),
             "{out}"
         );
