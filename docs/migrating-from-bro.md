@@ -75,7 +75,10 @@ than importing ones bro is still using.
 
 After a few days on pooltime, run the cleanup commands the import printed (`bro pool down`,
 `rm -rf` of the imported bro account dirs, `security delete-generic-password` for the Keychain
-items). Nothing is removed until you run them.
+items). Nothing is removed until you run them. The whole `~/.claude-max-pool` is only offered for
+deletion when everything in it was imported; anything bro still holds alone (an account that was
+skipped, failed, or whose id pooltime already had; models or tuning that were not imported) is
+named on a `# kept in bro` line instead.
 
 ## Non-default locations
 
