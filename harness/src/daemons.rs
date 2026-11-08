@@ -24,7 +24,7 @@ use crate::scenarios::{AccountSpec, Provider, Scenario};
 pub const FORBIDDEN_PORTS: &[u16] = &[3456, 3460];
 
 /// Same-account overload retry knobs, identical for both daemons (fast but non-zero backoff).
-const OVERLOAD_RETRY_MAX: u32 = 3;
+pub const OVERLOAD_RETRY_MAX: u32 = 3;
 const OVERLOAD_BASE_MS: u64 = 20;
 const OVERLOAD_CAP_MS: u64 = 80;
 

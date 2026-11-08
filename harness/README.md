@@ -66,13 +66,13 @@ Each daemon's run is flattened to `field -> value`:
 |---|---|
 | `step<i>.status` | HTTP status |
 | `step<i>.header.<h>` | `content-type` (no parameters), `retry-after`, `x-pool-account`, `x-pool-route`, `x-pool-upstream-rejected`, `x-pool-retryable-transport`, `request-id` |
-| `step<i>.sse` | semantic SSE sequence: pings dropped, consecutive deltas of one block coalesced (chunking does not matter), `error` events reduced to their type |
+| `step<i>.sse` | semantic SSE sequence: `message_start:<model>:usage=<in>/<out>[,cache…]`, `block_start:<idx>:<type>[:name][:id]`, `delta:<idx>:<type>:<text>` (consecutive deltas of one block coalesced, so chunking does not matter), `block_stop:<idx>`, `message_delta:<stop_reason>:usage=…`, `error:<type>`; pings dropped |
 | `step<i>.pings` | whether any `ping` arrived (`some`/`none`); count and timing are not compared |
 | `step<i>.end` | how the stream ended: `clean`, `reset` (transport error), `client-hangup` |
-| `step<i>.json` | projection of a JSON body: error type; message stop reason + content; model list ids/owners/context windows |
+| `step<i>.json` | projection of a JSON body: error type; message model, stop reason, usage and content (text, thinking, tool_use name/id/input); model list ids/owners/context windows |
 | `account.<name>.status` | `ready \| needs_login \| rate_limited \| billing \| access_denied` (bro's account view mapped onto pooltime's labels) |
 | `account.<name>.cooldown` | remaining cooldown in whole minutes (`-` when none) |
-| `upstream.inference` | `messages@<account>` / `responses@<account>` per upstream inference request (Anthropic hits first, then Codex) |
+| `upstream.inference` | `messages@<account>` / `responses@<account>` per upstream inference request, in arrival order across both fakes |
 | `upstream.refresh` | refresh grants per account |
 | `upstream.detail<n>` | scenario-specific projection of upstream request bodies (e.g. Codex `input` item kinds) |
 | `info.*` | step timings; printed with `--verbose`, never compared |
@@ -88,7 +88,7 @@ Every difference is triaged as either
   report lists them), or
 - **intended** - an entry in `harness/allowlist.toml`: anchored regexes for `scenario`, `field`,
   `bro` and `pooltime` values (`<absent>` = missing), a `reason`, and a `source` that must cite
-  an INV §10 item, spec §16, a `docs/parity.md` decision or a ledger ruling (the harness refuses to
+  an INV item (e.g. §10.x), spec §16, a `docs/parity.md` decision or a ledger ruling (the harness refuses to
   load an entry without one). Allowlisting a pooltime bug to get green is not allowed.
 
 The report also lists allowlist entries that matched nothing (stale, or scenario not selected).

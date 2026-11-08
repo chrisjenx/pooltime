@@ -32,19 +32,70 @@ pub const CODEX_MODELS: &str = "/models";
 /// Anthropic model list.
 pub const ANTHROPIC_MODELS: &str = "/v1/models";
 
+/// Requests of both fakes in arrival order: `(side, request)`.
+type Arrivals = Arc<Mutex<Vec<(&'static str, Recorded)>>>;
+
+/// One fake upstream whose routed requests are also appended to the daemon's shared arrival log,
+/// so the order *across* the Anthropic and Codex fakes is observable (cross-provider hops).
+pub struct Side {
+    fake: Fake,
+    name: &'static str,
+    log: Arrivals,
+}
+
+impl Side {
+    pub fn url(&self) -> String {
+        self.fake.url()
+    }
+
+    /// Answer `path` with `f(request, hit_index)`; the request is logged before `f` runs.
+    pub fn route(&self, path: &str, f: impl Fn(&Recorded, usize) -> Reply + Send + Sync + 'static) {
+        let (log, name) = (self.log.clone(), self.name);
+        self.fake.route(path, move |rec, i| {
+            log.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((name, rec.clone()));
+            f(rec, i)
+        });
+    }
+
+    /// Answer `path` with `replies` in order; the last one repeats.
+    pub fn script(&self, path: &str, replies: Vec<Reply>) {
+        assert!(!replies.is_empty(), "script needs at least one reply");
+        self.route(path, move |_, i| replies[i.min(replies.len() - 1)].clone());
+    }
+}
+
 /// One daemon's upstreams.
 pub struct Upstreams {
-    pub anthropic: Fake,
-    pub openai: Fake,
+    pub anthropic: Side,
+    pub openai: Side,
+    log: Arrivals,
 }
 
 impl Upstreams {
+    /// Every routed request to either fake, in arrival order (unrouted paths, which get the
+    /// fake's 404, are not listed).
+    pub fn arrivals(&self) -> Vec<(&'static str, Recorded)> {
+        self.log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Start both fakes with the default routes: token endpoints that refresh any known account,
     /// and a Codex catalog that answers 404 (so pooltime's boot-time discovery adds nothing).
     pub async fn start() -> Upstreams {
+        let log: Arrivals = Arc::default();
         let up = Upstreams {
-            anthropic: Fake::start().await,
-            openai: Fake::start().await,
+            anthropic: Side {
+                fake: Fake::start().await,
+                name: "anthropic",
+                log: log.clone(),
+            },
+            openai: Side {
+                fake: Fake::start().await,
+                name: "openai",
+                log: log.clone(),
+            },
+            log,
         };
         up.anthropic.route(TOKEN, |rec, _| refresh_ok(rec, "a"));
         up.openai.route(OAUTH_TOKEN, |rec, _| refresh_ok(rec, "o"));
@@ -344,7 +395,8 @@ pub fn codex_completed() -> String {
     codex_event(json!({
         "type": "response.completed",
         "response": {"id": "resp_fake", "status": "completed",
-                     "usage": {"input_tokens": 7, "output_tokens": 3}}
+                     "usage": {"input_tokens": 7, "output_tokens": 3,
+                               "input_tokens_details": {"cached_tokens": 2}}}
     }))
 }
 

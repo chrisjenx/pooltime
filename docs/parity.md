@@ -19,3 +19,10 @@ decisions taken while porting, so they are recorded where that checklist will li
 - **Codex error types are mapped to the Anthropic set** (changed vs bro, which forwarded Codex
   codes such as `rate_limit_exceeded` as the error `type`). Test:
   `error_frames_use_anthropic_error_types`.
+- **Codex 64 KiB pre-commit cap counts upstream bytes as they arrive** (changed vs bro, whose
+  check runs only after each whole Bun read). A `response.created` larger than the cap always
+  forces `message_start`, and the late real `response.created` becomes an in-place `ping` (the
+  same translator rule as bro's). bro may get the whole event in one read, parse it before
+  checking the cap, and send neither. The only client-visible difference is that one extra `ping`.
+  Test: `oversized_response_created_forces_message_start`; harness scenario
+  `codex_oversized_created_single_read`.

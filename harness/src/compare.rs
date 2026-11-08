@@ -3,7 +3,7 @@
 //! An observation is a flat `field -> value` map (see `main.rs` for the field names). Every field
 //! present on either side is compared; a missing field reads as `<absent>`. A differing field is
 //! *allowed* when an allowlist entry matches the scenario, the field and both values (all regexes,
-//! anchored). Every entry must say why and cite where the difference comes from (an INV §10 item,
+//! anchored). Every entry must say why and cite where the difference comes from (an INV item,
 //! spec §16 or a ledger ruling), so an allowlist entry can never be a silent pass.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,7 +32,7 @@ pub struct AllowEntry {
     /// Regex pooltime's value must match.
     pub pooltime: String,
     pub reason: String,
-    /// `INV §10.<n>`, `spec §16 ...`, `docs/parity.md ...` or `ruling: ...`.
+    /// `INV §<n>...`, `spec §16 ...`, `docs/parity.md ...` or `ruling: ...`.
     pub source: String,
 }
 
@@ -53,7 +53,7 @@ fn anchored(p: &str) -> anyhow::Result<Regex> {
 }
 
 /// Accepted citation prefixes for `source`.
-const SOURCES: &[&str] = &["INV §10.", "spec §16", "docs/parity.md", "ruling:"];
+const SOURCES: &[&str] = &["INV §", "spec §16", "docs/parity.md", "ruling:"];
 
 impl Allowlist {
     pub fn parse(text: &str) -> anyhow::Result<Allowlist> {
