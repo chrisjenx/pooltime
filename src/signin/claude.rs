@@ -523,11 +523,18 @@ impl Flow {
     /// Persist new credentials (under the account lock), retire a stale dead-refresh marker and
     /// record the identity baseline.
     async fn save(&self, creds: Credentials, identity: Identity) -> anyhow::Result<()> {
+        // Credentials and identity under ONE held account lock: a concurrent delete waits for
+        // both, and nothing recreates `account.toml` after it. Refused before writing anything
+        // when the account is already gone.
         let (reg, id) = (self.registry.clone(), self.account.clone());
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            // Never recreate a deleted account's dir: refuse before writing anything.
+        let meta_saved = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
             let _guard = reg.lock_existing(&id)?;
-            reg.write_creds_unlocked(&id, &creds)
+            reg.write_creds_unlocked(&id, &creds)?;
+            let meta_saved = reg.get(&id).is_some_and(|mut m| {
+                m.identity = identity;
+                reg.upsert_unlocked(m).is_ok()
+            });
+            Ok(meta_saved)
         })
         .await
         .context("saving credentials panicked")??;
@@ -537,17 +544,7 @@ impl Flow {
             .clear_refresh_dead(&self.account, OffsetDateTime::now_utc());
         // A first login turns `needs_login` into `ready` without any state change.
         self.state.notify_changed();
-
-        let (reg, id) = (self.registry.clone(), self.account.clone());
-        let meta_saved = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let mut m = reg
-                .get(&id)
-                .ok_or_else(|| anyhow!("account {id} no longer exists"))?;
-            m.identity = identity;
-            reg.upsert(m)
-        })
-        .await;
-        if !matches!(meta_saved, Ok(Ok(()))) {
+        if !meta_saved {
             // The credentials are saved and usable; a missing baseline only means the next login
             // asks for confirmation again.
             tracing::warn!(account = %self.account, "signed in but could not update the account identity");
@@ -714,18 +711,20 @@ mod tests {
                             let method = req.method().clone();
                             let headers = req.headers().clone();
                             let raw = req.into_body().collect().await.unwrap().to_bytes();
-                            let delay = s.lock().unwrap().token_delay;
-                            if path == "/v1/oauth/token" {
+                            if (method.as_str(), path.as_str()) == ("POST", "/v1/oauth/token") {
+                                assert_eq!(headers["content-type"], "application/json");
+                                // Recorded on arrival, before the scripted delay: a test that
+                                // waits for the hit acts while the exchange is still pending.
+                                tb.lock()
+                                    .unwrap()
+                                    .push(serde_json::from_slice(&raw).unwrap());
+                                let delay = s.lock().unwrap().token_delay;
                                 tokio::time::sleep(delay).await;
                             }
                             let (status, body) = {
                                 let s = s.lock().unwrap();
                                 match (method.as_str(), path.as_str()) {
                                     ("POST", "/v1/oauth/token") => {
-                                        assert_eq!(headers["content-type"], "application/json");
-                                        tb.lock()
-                                            .unwrap()
-                                            .push(serde_json::from_slice(&raw).unwrap());
                                         (s.token_status, s.token_body.clone())
                                     }
                                     ("GET", "/api/oauth/profile") => {

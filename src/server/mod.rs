@@ -68,6 +68,9 @@ pub struct AppState {
     /// The proxy key inference requests must present (seeded from `cfg.proxy_key`; `connect`
     /// sets it when it generates one, so it applies without a restart). `None` = open.
     proxy_key: RwLock<Option<String>>,
+    /// Serializes `connect`'s config.toml read-modify-write (key generation, profile records)
+    /// so concurrent connects agree on one key and keep each other's entries.
+    pub(crate) config_write: tokio::sync::Mutex<()>,
     /// In-flight and finished sign-in flows, addressable by id (management API).
     pub signins: mgmt::SignIns,
     /// Dev/test hook: when set, `GET /api/v1/status` serves this document instead of the live
@@ -111,6 +114,7 @@ impl AppState {
             cursor: AtomicUsize::new(0),
             tuning,
             proxy_key,
+            config_write: tokio::sync::Mutex::new(()),
             signins: mgmt::SignIns::default(),
             fixture_state: None,
         }

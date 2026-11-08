@@ -209,6 +209,16 @@ impl Registry {
         Ok(())
     }
 
+    /// Like [`Registry::upsert`] but does not take the lock; the caller must hold
+    /// [`Registry::lock_existing`] (or [`Registry::lock`]) for `m.id`.
+    pub fn upsert_unlocked(&self, m: AccountMeta) -> anyhow::Result<()> {
+        m.validate()?;
+        let dir = self.ensure_dir(&m.id)?;
+        let body = toml::to_string(&m).context("serializing account.toml")?;
+        fsutil::atomic_write(&dir.join("account.toml"), body.as_bytes(), 0o600)?;
+        Ok(())
+    }
+
     /// Deletes the account directory (meta, credentials, lock). Missing is Ok.
     pub fn remove(&self, id: &AccountId) -> anyhow::Result<()> {
         let dir = self.dir(id);
@@ -529,5 +539,32 @@ mod tests {
         assert!(!paths.accounts.join("work").exists());
         assert!(reg.lock_existing(&id("never")).is_err());
         assert!(!paths.accounts.join("never").exists());
+    }
+
+    /// The sign-in save path: creds and identity are written under one held lock, so a
+    /// concurrent remove waits for both and nothing recreates the dir after it.
+    #[test]
+    fn remove_waits_for_a_held_save_and_nothing_survives_it() {
+        let (_d, paths, reg) = setup();
+        let reg = std::sync::Arc::new(reg);
+        reg.upsert(meta("work")).unwrap();
+        let guard = reg.lock_existing(&id("work")).unwrap();
+        reg.write_creds_unlocked(&id("work"), &creds()).unwrap();
+        let remover = {
+            let reg = reg.clone();
+            std::thread::spawn(move || reg.remove(&id("work")).unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            paths.accounts.join("work/account.toml").exists(),
+            "remove must wait for the held lock"
+        );
+        let mut m = reg.get(&id("work")).unwrap();
+        m.identity.email = Some("me@example.com".into());
+        reg.upsert_unlocked(m).unwrap();
+        drop(guard);
+        remover.join().unwrap();
+        assert!(!paths.accounts.join("work").exists());
+        assert!(reg.lock_existing(&id("work")).is_err());
     }
 }
