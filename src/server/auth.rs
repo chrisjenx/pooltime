@@ -21,8 +21,9 @@ pub async fn require_proxy_key(
     next: Next,
 ) -> Response {
     // An empty key (`proxy_key = ""`, `POOLTIME_PROXY_KEY=`) means "not set", never "match empty".
-    if let Some(key) = app.cfg.proxy_key.as_deref().filter(|k| !k.is_empty()) {
-        if !presented_keys(req.headers()).any(|k| keys_match(k, key)) {
+    // Read per request: `connect` may have just generated the key (no restart needed).
+    if let Some(key) = app.proxy_key() {
+        if !presented_keys(req.headers()).any(|k| keys_match(k, &key)) {
             return anthropic_error(
                 401,
                 "authentication_error",
@@ -73,6 +74,38 @@ fn is_guarded(path: &str) -> bool {
         || path == "/mcp"
 }
 
+/// Inference paths (`/v1/*`): what Claude Code calls. Claude Code sends no `Origin` and a
+/// loopback `Host`; a browser page always sends `Origin`, and a DNS-rebound page its own name
+/// as `Host`.
+fn is_inference(path: &str) -> bool {
+    path == "/v1" || path.starts_with("/v1/")
+}
+
+/// The inference rule: no `Origin` at all, and (on a loopback bind) a loopback `Host` when one
+/// is sent, any port (rebinding needs a foreign name, not a foreign port). A non-loopback bind
+/// serves other machines, so their `Host` is accepted; it always has a proxy key
+/// ([`crate::config::Config::validate`]).
+fn inference_allowed(headers: &HeaderMap, host: Option<&str>, app: &AppState) -> (bool, bool) {
+    let origin_ok = !headers.contains_key(ORIGIN);
+    let host_ok = !app.cfg.host.is_loopback() || host.is_none_or(loopback_host);
+    (host_ok, origin_ok)
+}
+
+/// `localhost`, a loopback IPv4 address or `[::1]`, with or without a port.
+fn loopback_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((v6, tail)) if tail.is_empty() || tail.starts_with(':') => v6,
+            _ => return false,
+        },
+        None => host.split_once(':').map_or(host, |(n, _)| n),
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Reject requests to `/`, `/assets/*` and `/api/*` whose `Host` is not `127.0.0.1:<port>` / `localhost:<port>`
 /// or whose `Origin` (when sent) is not the matching `http://` origin. There is deliberately no
 /// CORS support: browsers never get a grant, so only same-origin pages can read responses.
@@ -81,18 +114,23 @@ pub async fn host_origin_guard(
     req: Request,
     next: Next,
 ) -> Response {
-    if is_guarded(req.uri().path()) {
+    let path = req.uri().path();
+    let (guarded, inference) = (is_guarded(path), is_inference(path));
+    if guarded || inference {
         let port = app.cfg.port;
-        let host = req
-            .headers()
-            .get(HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned)
-            .or_else(|| req.uri().authority().map(|a| a.as_str().to_owned()));
-        let host_ok = host.as_deref().is_some_and(|h| host_allowed(h, port));
-        let origin_ok = match req.headers().get(ORIGIN) {
-            None => true,
-            Some(o) => o.to_str().is_ok_and(|o| origin_allowed(o, port)),
+        let host = match req.headers().get(HOST) {
+            Some(v) => Some(v.to_str().unwrap_or("").to_owned()),
+            None => req.uri().authority().map(|a| a.as_str().to_owned()),
+        };
+        let (host_ok, origin_ok) = if inference {
+            inference_allowed(req.headers(), host.as_deref(), &app)
+        } else {
+            let host_ok = host.as_deref().is_some_and(|h| host_allowed(h, port));
+            let origin_ok = match req.headers().get(ORIGIN) {
+                None => true,
+                Some(o) => o.to_str().is_ok_and(|o| origin_allowed(o, port)),
+            };
+            (host_ok, origin_ok)
         };
         if !(host_ok && origin_ok) {
             tracing::info!(
@@ -153,5 +191,19 @@ mod tests {
         assert!(!is_guarded("/health"));
         assert!(!is_guarded("/v1/messages"));
         assert!(is_guarded("/mcp"));
+        assert!(loopback_host("127.0.0.1:3460"));
+        assert!(loopback_host("localhost"));
+        assert!(loopback_host("LOCALHOST:1"));
+        assert!(loopback_host("[::1]:3460"));
+        assert!(loopback_host("127.0.0.2:3460"));
+        assert!(!loopback_host("evil.com:3460"));
+        assert!(!loopback_host("127.0.0.1.evil.example:3460"));
+        assert!(!loopback_host("localhost.evil.example"));
+        assert!(!loopback_host("[::1]x"));
+        assert!(!loopback_host(""));
+        assert!(is_inference("/v1/messages"));
+        assert!(is_inference("/v1/models"));
+        assert!(!is_inference("/v1x"));
+        assert!(!is_inference("/health"));
     }
 }

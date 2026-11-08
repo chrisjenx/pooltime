@@ -86,7 +86,9 @@ Design docs: `docs/specs/2026-11-07-pooltime-design.md` (§16 overrides earlier 
 - Header-less 429 from Anthropic is passed through (`x-pool-upstream-rejected: 1`): no bench,
   no failover, no cross-provider hop.
 - Management API and MCP are local-key protected; `Host`/`Origin` must be `127.0.0.1:<port>` or
-  `localhost:<port>`; no CORS. The MCP token is never the management key.
+  `localhost:<port>`; no CORS. The MCP token is never the management key. `/v1/*` refuses any
+  `Origin` and (on a loopback bind) a non-loopback `Host`; the proxy key `connect` generates is
+  enforced at once.
 - Import is read-only on bro's files and Keychain items.
 - Tests: `cargo test`; **no network** (fake upstreams on `127.0.0.1:0`, wiremock); tempdirs only,
   never the real `$HOME`, `~/.claude*`, `~/.bro` or `~/.claude-max-pool`.
