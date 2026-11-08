@@ -213,7 +213,7 @@ fn imports_accounts_creds_and_routing() {
         .any(|c| c.contains("kc1") && c.starts_with("rm")));
     assert!(report
         .cleanup
-        .contains(&"# kept in bro (not imported): bad+name, kc1".to_string()));
+        .contains(&"# kept in bro (not imported): 'bad+name', 'kc1'".to_string()));
     assert!(!report.cleanup.iter().any(|c| c.starts_with("security")));
     // The orphan snapshot stays: only the imported snapshot file is listed, no glob.
     assert!(!report.cleanup.iter().any(|c| c.contains("pool-settings*")));
@@ -332,6 +332,82 @@ fn existing_pooltime_account_is_not_overwritten() {
     assert!(reg.read_creds(&id("alpha")).unwrap().is_none());
     // The sticky session for the skipped account is not imported either.
     assert_eq!(report.sessions_imported, 1);
+}
+
+/// Every bro account importable (Keychain item present, invalid name removed).
+fn fully_importable() -> (Fx, FakeKeychain) {
+    let fx = fixture();
+    fs::remove_dir_all(fx.pool.join("accounts/bad+name")).unwrap();
+    let kc = kc1_keychain(&fx);
+    (fx, kc)
+}
+
+#[test]
+fn pool_rm_withheld_when_tuning_not_imported() {
+    let (fx, kc) = fully_importable();
+    fx.paths.ensure().unwrap();
+    fs::write(&fx.paths.config, "[routing]\nfive_hour_exp = 3.0\n").unwrap();
+    let report = import(&fx, &kc);
+    assert!(matches!(report.tuning, ItemOutcome::Skipped(_)));
+    let pool_rm = format!("rm -rf '{}'", fx.pool.display());
+    assert!(!report.cleanup.contains(&pool_rm), "{:?}", report.cleanup);
+    // The imported accounts are still offered one by one; bro's tuning stays.
+    let rm = format!("rm -rf '{}'", fx.pool.join("accounts/alpha").display());
+    assert!(report.cleanup.contains(&rm), "{:?}", report.cleanup);
+    assert!(
+        report
+            .cleanup
+            .iter()
+            .any(|c| c.starts_with("# kept in bro") && c.contains("tuning")),
+        "{:?}",
+        report.cleanup
+    );
+}
+
+#[test]
+fn pool_rm_withheld_when_an_account_already_exists() {
+    let (fx, kc) = fully_importable();
+    fx.paths.ensure().unwrap();
+    let reg = Registry::load(&fx.paths).unwrap();
+    reg.upsert(AccountMeta::new(id("alpha"), ProviderId::Anthropic))
+        .unwrap();
+    let report = import(&fx, &kc);
+    assert_eq!(
+        report.account("alpha").unwrap().outcome,
+        AccountOutcome::AlreadyExists
+    );
+    let pool_rm = format!("rm -rf '{}'", fx.pool.display());
+    assert!(!report.cleanup.contains(&pool_rm), "{:?}", report.cleanup);
+    // bro's alpha may be a different identity: its dir is never offered for deletion.
+    assert!(!report
+        .cleanup
+        .iter()
+        .any(|c| c.starts_with("rm") && c.contains("accounts/alpha")));
+    assert!(report
+        .cleanup
+        .iter()
+        .any(|c| c.starts_with("# kept in bro") && c.contains("'alpha'")));
+}
+
+#[test]
+fn kept_names_cannot_escape_the_comment() {
+    let (fx, kc) = fully_importable();
+    let evil = fx.pool.join("accounts").join("x\nrm -rf ~ #");
+    fs::create_dir_all(&evil).unwrap();
+    let report = import(&fx, &kc);
+    let pool_rm = format!("rm -rf '{}'", fx.pool.display());
+    assert!(!report.cleanup.contains(&pool_rm), "{:?}", report.cleanup);
+    assert!(
+        report.cleanup.iter().all(|c| !c.contains('\n')),
+        "{:?}",
+        report.cleanup
+    );
+    let kept = report
+        .cleanup
+        .iter()
+        .find(|c| c.starts_with("# kept in bro"))
+        .expect("kept line");
+    assert!(kept.contains("'x?rm -rf ~ #'"), "{kept}");
 }
 
 #[test]

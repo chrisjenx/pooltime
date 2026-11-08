@@ -617,11 +617,15 @@ pub enum AccountOutcome {
 }
 
 impl AccountOutcome {
-    /// bro still holds the only copy of this account (so bro's files must not be deleted).
+    /// bro still holds the only copy of this account (so bro's files must not be deleted). An
+    /// existing pooltime account with the same id may be a different identity, so bro's copy
+    /// counts as not imported.
     fn kept_in_bro(&self) -> bool {
         matches!(
             self,
-            AccountOutcome::Skipped { .. } | AccountOutcome::Failed { .. }
+            AccountOutcome::AlreadyExists
+                | AccountOutcome::Skipped { .. }
+                | AccountOutcome::Failed { .. }
         )
     }
 }
@@ -1013,17 +1017,23 @@ fn flush(store: &Store) -> anyhow::Result<()> {
 }
 
 /// What the user may delete once pooltime serves the accounts. bro's pool dir is only offered
-/// for deletion as a whole when bro holds nothing that was not imported (accounts already in
-/// pooltime count as imported); otherwise only the imported accounts' dirs are listed. Likewise
-/// for snapshot files and Keychain items.
+/// for deletion as a whole when bro holds nothing that was not imported (every account
+/// imported, models and tuning imported or absent); otherwise only the imported accounts' dirs
+/// are listed. Likewise for snapshot files and Keychain items.
 fn cleanup_commands(plan: &ImportPlan, report: &ImportReport) -> Vec<String> {
     let mut out = vec!["bro pool down".to_string()];
-    let kept: Vec<&str> = report
+    let mut kept: Vec<String> = report
         .accounts
         .iter()
         .filter(|a| a.outcome.kept_in_bro())
-        .map(|a| a.name.as_str())
+        .map(|a| comment_safe(&a.name))
         .collect();
+    let settled = |o: &ItemOutcome| matches!(o, ItemOutcome::Imported | ItemOutcome::Absent);
+    for (what, o) in [("models", &report.models), ("tuning", &report.tuning)] {
+        if !settled(o) {
+            kept.push(what.to_string());
+        }
+    }
     let imported: Vec<&PlannedAccount> = plan
         .accounts
         .iter()
@@ -1396,6 +1406,16 @@ fn node_resolve(p: &Path) -> PathBuf {
     out
 }
 
+/// A name for a `#` comment line: control characters (a newline would end the comment and
+/// start a command) become `?`, then the whole is shell-quoted.
+fn comment_safe(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    shell_quote(&clean)
+}
+
 /// POSIX single-quoting.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -1441,6 +1461,7 @@ mod tests {
     fn shell_quote_escapes_single_quotes() {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(comment_safe("a\nb\r"), "'a?b?'");
     }
 
     #[test]
