@@ -245,5 +245,97 @@
       "journal_requests": 18342,
       "storage": { "home": "/Users/example/.pooltime", "db_bytes": 13631488, "logs_bytes": 4194304 }
     }
+  },
+  "analytics": {
+    "burn": {
+      "weeks": [
+        { "week": "2026-W34", "start": "2026-08-17", "subs_used": 4.22, "per_account": [
+            { "account": "lapsed", "consumed": 0.64 },
+            { "account": "org-seat", "consumed": 0.88 },
+            { "account": "personal", "consumed": 0.92, "plan": "max" },
+            { "account": "team-1", "consumed": 0.81, "plan": "team" },
+            { "account": "team-2", "consumed": 0.97, "plan": "team" }
+          ] },
+        { "week": "2026-W35", "start": "2026-08-24", "subs_used": 4.26, "per_account": [
+            { "account": "lapsed", "consumed": 0.71 },
+            { "account": "org-seat", "consumed": 0.83 },
+            { "account": "personal", "consumed": 0.95, "plan": "max" },
+            { "account": "team-1", "consumed": 0.77, "plan": "team" },
+            { "account": "team-2", "consumed": 1.0, "plan": "team" }
+          ] },
+        { "week": "2026-W36", "start": "2026-08-31", "subs_used": 4.2, "per_account": [
+            { "account": "lapsed", "consumed": 0.52 },
+            { "account": "org-seat", "consumed": 0.91 },
+            { "account": "personal", "consumed": 0.88, "plan": "max" },
+            { "account": "team-1", "consumed": 0.9, "plan": "team" },
+            { "account": "team-2", "consumed": 0.99, "plan": "team" }
+          ] },
+        { "week": "2026-W37", "start": "2026-09-07", "subs_used": 4.3, "per_account": [
+            { "account": "lapsed", "consumed": 0.68 },
+            { "account": "org-seat", "consumed": 0.79 },
+            { "account": "personal", "consumed": 1.0, "plan": "max" },
+            { "account": "team-1", "consumed": 0.86, "plan": "team" },
+            { "account": "team-2", "consumed": 0.97, "plan": "team" }
+          ] },
+        { "week": "2026-W38", "start": "2026-09-14", "subs_used": 4.59, "per_account": [
+            { "account": "lapsed", "consumed": 0.74 },
+            { "account": "org-seat", "consumed": 0.95 },
+            { "account": "personal", "consumed": 0.97, "plan": "max" },
+            { "account": "team-1", "consumed": 0.93, "plan": "team" },
+            { "account": "team-2", "consumed": 1.0, "plan": "team" }
+          ] },
+        { "week": "2026-W39", "start": "2026-09-21", "subs_used": 4.45, "per_account": [
+            { "account": "lapsed", "consumed": 0.81 },
+            { "account": "org-seat", "consumed": 0.9 },
+            { "account": "personal", "consumed": 0.9, "plan": "max" },
+            { "account": "team-1", "consumed": 0.88, "plan": "team" },
+            { "account": "team-2", "consumed": 0.96, "plan": "team" }
+          ] },
+        { "week": "2026-W40", "start": "2026-09-28", "subs_used": 4.65, "per_account": [
+            { "account": "lapsed", "consumed": 0.77 },
+            { "account": "org-seat", "consumed": 0.97 },
+            { "account": "personal", "consumed": 0.99, "plan": "max" },
+            { "account": "team-1", "consumed": 0.92, "plan": "team" },
+            { "account": "team-2", "consumed": 1.0, "plan": "team" }
+          ] },
+        { "week": "2026-W41", "start": "2026-10-05", "subs_used": 4.73, "per_account": [
+            { "account": "lapsed", "consumed": 0.85 },
+            { "account": "org-seat", "consumed": 0.94 },
+            { "account": "personal", "consumed": 1.0, "plan": "max" },
+            { "account": "team-1", "consumed": 0.95, "plan": "team" },
+            { "account": "team-2", "consumed": 0.99, "plan": "team" }
+          ] },
+        { "week": "2026-W42", "start": "2026-10-12", "subs_used": 4.54, "per_account": [
+            { "account": "lapsed", "consumed": 0.79 },
+            { "account": "org-seat", "consumed": 0.92 },
+            { "account": "personal", "consumed": 0.94, "plan": "max" },
+            { "account": "team-1", "consumed": 0.89, "plan": "team" },
+            { "account": "team-2", "consumed": 1.0, "plan": "team" }
+          ] },
+        { "week": "2026-W43", "start": "2026-10-19", "subs_used": 4.79, "per_account": [
+            { "account": "lapsed", "consumed": 0.88 },
+            { "account": "org-seat", "consumed": 0.96 },
+            { "account": "personal", "consumed": 0.98, "plan": "max" },
+            { "account": "team-1", "consumed": 0.97, "plan": "team" },
+            { "account": "team-2", "consumed": 1.0, "plan": "team" }
+          ] },
+        { "week": "2026-W44", "start": "2026-10-26", "subs_used": 4.81, "per_account": [
+            { "account": "lapsed", "consumed": 0.9 },
+            { "account": "org-seat", "consumed": 0.98 },
+            { "account": "personal", "consumed": 1.0, "plan": "max" },
+            { "account": "team-1", "consumed": 0.94, "plan": "team" },
+            { "account": "team-2", "consumed": 0.99, "plan": "team" }
+          ] },
+        { "week": "2026-W45", "start": "2026-11-02", "subs_used": 4.87, "per_account": [
+            { "account": "lapsed", "consumed": 0.55 },
+            { "account": "org-seat", "consumed": 0.78 },
+            { "account": "personal", "consumed": 1.21, "plan": "max" },
+            { "account": "team-1", "consumed": 1.0, "plan": "team" },
+            { "account": "team-2", "consumed": 1.33, "plan": "team" }
+          ] }
+      ],
+      "forecast": { "week": "2026-W45", "subs_used_so_far": 4.87, "elapsed_fraction": 0.7857, "projected": 6.1982, "accounts": 7 },
+      "idle_accounts": ["old-laptop", "spare"]
+    }
   }
 }

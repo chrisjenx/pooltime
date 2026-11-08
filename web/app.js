@@ -59,6 +59,8 @@
     view: "overview",
     // Debugging views (Requests / Events): fetched only while one of them is shown, key holders only.
     journal: { requests: null, stats: null, events: null, errorsOnly: false, open: {}, details: {}, error: null },
+    // Weekly burn (Overview, key holders only): refetched at most every BURN_MS.
+    burn: null, burnAt: 0, burnError: null,
   };
 
   let manage = false;
@@ -213,6 +215,86 @@
     return h("div", { class: cls }, fill);
   }
 
+  // ---- weekly burn chart (plain SVG via createElementNS; no inline style, CSP-safe) ----------
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  function s(tag, attrs) {
+    const el = document.createElementNS(SVG_NS, tag);
+    if (attrs) {
+      for (const k of Object.keys(attrs)) {
+        const v = attrs[k];
+        if (v === null || v === undefined || v === false) continue;
+        if (k === "text") el.textContent = v;
+        else el.setAttribute(k, String(v));
+      }
+    }
+    for (let i = 2; i < arguments.length; i++) {
+      const c = arguments[i];
+      if (c) [].concat(c).forEach((x) => x && el.appendChild(x));
+    }
+    return el;
+  }
+  function subs(x) { return (typeof x === "number" ? x : 0).toFixed(1); }
+
+  // One bar per ISO week (subs used); the current week adds a dashed "projected" outline; a
+  // dashed rule marks the pool size (N subs). Native <title> tooltips per bar.
+  function burnChart(b) {
+    const weeks = (b.weeks || []).slice(-12);
+    const f = b.forecast || {};
+    const n = f.accounts || 0;
+    const W = 640, H = 200, padL = 30, padR = 8, padT = 14, padB = 22;
+    const top = Math.max(1, n, f.projected || 0, ...weeks.map((w) => w.subs_used || 0));
+    const max = Math.ceil(top);
+    const y = (v) => padT + (H - padT - padB) * (1 - v / max);
+    const slot = (W - padL - padR) / Math.max(1, weeks.length);
+    const bw = Math.max(6, Math.min(36, slot * 0.6));
+    const ticks = [];
+    const step = max <= 4 ? 1 : Math.ceil(max / 4);
+    for (let v = 0; v <= max; v += step) {
+      ticks.push(s("line", { class: "grid", x1: padL, x2: W - padR, y1: y(v), y2: y(v) }));
+      ticks.push(s("text", { class: "axis", x: padL - 6, y: y(v) + 4, "text-anchor": "end", text: String(v) }));
+    }
+    const marks = weeks.map((w, i) => {
+      const x = padL + slot * i + (slot - bw) / 2;
+      const cur = i === weeks.length - 1 && w.week === f.week;
+      const v = w.subs_used || 0;
+      const parts = (w.per_account || []).map((a) => a.account + " " + subs(a.consumed)).join(", ");
+      const g = s("g", null, s("title", { text: w.week + " (from " + w.start + "): " + subs(v) + " subs" + (parts ? " · " + parts : "") }));
+      if (cur && typeof f.projected === "number" && f.projected > v) {
+        g.appendChild(s("rect", { class: "proj", x, y: y(f.projected), width: bw, height: Math.max(0, y(v) - y(f.projected)), rx: 3 }));
+      }
+      g.appendChild(s("rect", { class: cur ? "used cur" : "used", x, y: y(v), width: bw, height: Math.max(0, y(0) - y(v)), rx: 3 }));
+      // Hit target the full slot height, so thin bars are easy to hover.
+      g.appendChild(s("rect", { class: "hit", x: padL + slot * i, y: padT, width: slot, height: H - padT - padB }));
+      g.appendChild(s("text", { class: "axis", x: x + bw / 2, y: H - 6, "text-anchor": "middle", text: (w.week || "").slice(5) }));
+      if (cur || i % 4 === 0) g.appendChild(s("text", { class: "val", x: x + bw / 2, y: y(v) - 4, "text-anchor": "middle", text: subs(v) }));
+      return g;
+    });
+    const cap = n ? [
+      s("line", { class: "cap", x1: padL, x2: W - padR, y1: y(n), y2: y(n) }),
+      s("text", { class: "axis", x: W - padR, y: y(n) - 4, "text-anchor": "end", text: n + " subs" }),
+    ] : null;
+    return s("svg", { class: "burn", viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": "Subscriptions used per week" },
+      ticks, cap, marks);
+  }
+
+  function burnPanel() {
+    const b = ui.burn;
+    const title = h("h2", { text: "Weekly burn" });
+    if (!b) return h("div", { class: "panel" }, title, h("p", { class: "empty", text: ui.burnError ? "Cannot load the weekly burn: " + ui.burnError : "Loading…" }));
+    const f = b.forecast || {};
+    const idle = b.idle_accounts || [];
+    const pace = typeof f.projected === "number"
+      ? "On pace for ~" + subs(f.projected) + " of " + f.accounts + " subs this week"
+      : "This week just started: no forecast yet";
+    return h("div", { class: "panel" }, title,
+      h("p", { class: "sub" }, h("strong", { text: pace }), " · " + subs(f.subs_used_so_far) + " used so far (" + pct(f.elapsed_fraction || 0) + " of the week)"),
+      burnChart(b),
+      idle.length
+        ? h("p", { class: "dim" }, idle.length + (idle.length === 1 ? " sub" : " subs") + " mostly idle this week: ",
+            idle.map((id, i) => h("span", null, i ? ", " : "", h("strong", { text: id }))))
+        : h("p", { class: "dim", text: "No idle subs this week." }));
+  }
+
   // ---- API ----------------------------------------------------------------------------------
   async function api(method, path, body) {
     const ctl = new AbortController();
@@ -272,6 +354,18 @@
     }
   }
 
+  const BURN_MS = 60000;
+  async function loadBurn() {
+    if (!manage || ui.view !== "overview" || Date.now() - ui.burnAt < BURN_MS) return;
+    try {
+      ui.burn = await api("GET", "/api/v1/analytics/burn?weeks=12");
+      ui.burnError = null;
+    } catch (e) {
+      ui.burnError = e.message;
+    }
+    ui.burnAt = Date.now();
+  }
+
   async function toggleRequest(id) {
     const j = ui.journal;
     if (j.open[id]) { delete j.open[id]; render(); return; }
@@ -299,6 +393,7 @@
       ui.lastOk = Date.now();
       if (data && data.now) ui.skew = Date.parse(data.now) - Date.now();
       await loadJournal();
+      await loadBurn();
       render();
     } catch (e) {
       ui.error = e.message;
@@ -426,7 +521,7 @@
       const list = h("div", { class: "panel" },
         h("h2", { text: "Accounts by severity" }),
         attention.length ? h("table", null, h("tbody", null, attention)) : h("p", { class: "empty", text: "—" }));
-      return [hero, bars, list];
+      return [hero, manage ? burnPanel() : lockedPanel("Weekly burn"), bars, list];
     },
 
     accounts(d) {
