@@ -1,0 +1,167 @@
+---
+source: tests/mgmt_api.rs
+expression: "serde_json::to_string_pretty(&v).unwrap()"
+---
+{
+  "accounts": [
+    {
+      "id": "alpha",
+      "provider": "anthropic",
+      "status": "ready",
+      "status_since": "2026-11-05T08:30:00Z",
+      "reason": null,
+      "until": null,
+      "priority": 10,
+      "weight": 2.0,
+      "weight_override": {
+        "weight": 5.0,
+        "until": "2026-11-08T00:00:00Z"
+      },
+      "effective_weight": 5.0,
+      "windows": [
+        {
+          "key": "5h",
+          "model": null,
+          "utilization": 0.25,
+          "reset": "2026-11-07T15:00:00Z"
+        },
+        {
+          "key": "7d",
+          "model": null,
+          "utilization": 0.37,
+          "reset": "2026-11-12T09:00:00Z"
+        },
+        {
+          "key": "7d-fable",
+          "model": "fable",
+          "utilization": 0.9,
+          "reset": "2026-11-12T09:00:00Z"
+        }
+      ],
+      "seven_day_left": 0.63,
+      "expires_at": "2026-11-07T18:00:00Z",
+      "refresh_expires_at": "2026-12-01T00:00:00Z",
+      "identity": {
+        "email": "alpha@example.com"
+      },
+      "in_flight": 2,
+      "sessions": 3,
+      "last_error": null
+    },
+    {
+      "id": "bravo",
+      "provider": "anthropic",
+      "status": "rate_limited",
+      "status_since": "2026-11-07T11:58:00Z",
+      "reason": "quota:5h",
+      "until": "2026-11-07T15:00:00Z",
+      "priority": 100,
+      "weight": 1.0,
+      "weight_override": null,
+      "effective_weight": 1.0,
+      "windows": [
+        {
+          "key": "5h",
+          "model": null,
+          "utilization": 1.0,
+          "reset": "2026-11-07T15:00:00Z"
+        },
+        {
+          "key": "7d",
+          "model": null,
+          "utilization": 0.9,
+          "reset": "2026-11-12T09:00:00Z"
+        }
+      ],
+      "seven_day_left": 0.1,
+      "expires_at": "2026-11-07T18:00:00Z",
+      "refresh_expires_at": "2026-12-01T00:00:00Z",
+      "identity": {
+        "email": null
+      },
+      "in_flight": 0,
+      "sessions": 0,
+      "last_error": {
+        "at": "2026-11-07T11:58:00Z",
+        "reason": "quota"
+      }
+    },
+    {
+      "id": "charlie",
+      "provider": "anthropic",
+      "status": "needs_login",
+      "status_since": "2026-11-06T00:00:00Z",
+      "reason": "refresh_token_dead",
+      "until": null,
+      "priority": 100,
+      "weight": 1.0,
+      "weight_override": null,
+      "effective_weight": 1.0,
+      "windows": [],
+      "seven_day_left": null,
+      "expires_at": "2026-11-07T18:00:00Z",
+      "refresh_expires_at": "2026-12-01T00:00:00Z",
+      "identity": {
+        "email": null
+      },
+      "in_flight": 0,
+      "sessions": 0,
+      "last_error": null
+    },
+    {
+      "id": "delta",
+      "provider": "anthropic",
+      "status": "billing",
+      "status_since": null,
+      "reason": "billing",
+      "until": null,
+      "priority": 100,
+      "weight": 1.0,
+      "weight_override": null,
+      "effective_weight": 1.0,
+      "windows": [],
+      "seven_day_left": null,
+      "expires_at": null,
+      "refresh_expires_at": null,
+      "identity": {
+        "email": null
+      },
+      "in_flight": 0,
+      "sessions": 0,
+      "last_error": null
+    }
+  ],
+  "pool": {
+    "seven_day_left_total": 0.73,
+    "accounts": 4,
+    "available": 1
+  },
+  "tuning": {
+    "five_hour_exp": 1.0,
+    "min_headroom": 0.1,
+    "headroom_taper_start": 0.2
+  },
+  "mapping": {
+    "enabled": false,
+    "mappings": [
+      {
+        "from": "fable",
+        "to": "gpt-6-astra"
+      },
+      {
+        "from": "opus",
+        "to": "gpt-6-sol"
+      },
+      {
+        "from": "sonnet",
+        "to": "gpt-6-sol"
+      },
+      {
+        "from": "haiku",
+        "to": "gpt-6-luna"
+      }
+    ]
+  },
+  "version": "0.1.0",
+  "now": "2026-11-07T12:00:00Z"
+}

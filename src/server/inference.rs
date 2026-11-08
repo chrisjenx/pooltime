@@ -246,7 +246,7 @@ fn cap_for(app: &AppState, provider: ProviderId) -> u32 {
 async fn choose_mapped_provider(app: &Arc<AppState>, req: &InboundRequest) -> Option<ProviderId> {
     let now = OffsetDateTime::now_utc();
     let accts = load_accounts(app, now).await;
-    let tuning = Tuning::from(&app.cfg.routing);
+    let tuning = app.tuning();
     let user = req.session_user_id.as_deref();
     let order = [ProviderId::Anthropic, ProviderId::OpenAi];
     let pins: Vec<(ProviderId, AccountId)> = user
@@ -323,7 +323,7 @@ async fn serve_provider(
     } else {
         None
     };
-    let tuning = Tuning::from(&app.cfg.routing);
+    let tuning = app.tuning();
     let idle = match pid {
         ProviderId::Anthropic => app.cfg.timeouts.anthropic_idle,
         ProviderId::OpenAi => app.cfg.timeouts.codex_idle,
