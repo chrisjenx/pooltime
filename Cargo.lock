@@ -1164,6 +1164,7 @@ dependencies = [
  "clap",
  "filetime",
  "futures-util",
+ "h2",
  "hex",
  "http",
  "http-body-util",

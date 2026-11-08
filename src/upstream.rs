@@ -45,6 +45,9 @@ impl Upstream {
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(90))
+            // Never follow redirects: auth headers must not travel cross-origin and the caller
+            // (failover logic) decides what a 3xx means.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("static reqwest client configuration is valid");
         Self { client }
@@ -205,6 +208,14 @@ fn classify_chain(
             || msg.contains("invalid peer")
             || msg.contains("received fatal alert");
         reset |= msg.contains("connection closed before message completed");
+        // HTTP/2 RST_STREAM / GOAWAY surface as h2::Error with no io source.
+        if let Some(h2e) = err.downcast_ref::<h2::Error>() {
+            reset |= h2e.reason().is_some(); // RST_STREAM, GOAWAY or bare reason
+        }
+        reset |= msg.contains("stream error received")
+            || msg.contains("connection error received")
+            || msg.contains("connection error detected")
+            || msg.contains("go away");
         cur = err.source();
     }
     if dns {
@@ -315,9 +326,11 @@ mod tests {
         let err = resp.body.next_chunk().await.unwrap().unwrap_err();
         let waited = t0.elapsed();
         assert_eq!(err, TransportKind::IdleTimeout);
+        // Lower bound only: an upper bound would flake on a loaded CI box. That empty frames do
+        // not re-arm the timer is proven deterministically by the paused-time test below.
         assert!(
-            waited >= IDLE - Duration::from_millis(20) && waited < IDLE * 2,
-            "fired at {waited:?}, expected ~{IDLE:?}"
+            waited >= IDLE - Duration::from_millis(20),
+            "fired at {waited:?}, expected >= ~{IDLE:?}"
         );
     }
 
@@ -330,13 +343,18 @@ mod tests {
         });
         let mut s = Box::pin(s);
         let t0 = Instant::now();
-        let r = next_nonempty(
-            &mut s,
-            Duration::from_millis(200),
-            t0 + Duration::from_secs(60),
-            |_: &String| TransportKind::Other,
+        // Outer timeout (virtual time) so a re-arming regression fails instead of hanging.
+        let r = tokio::time::timeout(
+            Duration::from_secs(10),
+            next_nonempty(
+                &mut s,
+                Duration::from_millis(200),
+                t0 + Duration::from_secs(60),
+                |_: &String| TransportKind::Other,
+            ),
         )
-        .await;
+        .await
+        .expect("idle timer was re-armed by empty frames");
         assert_eq!(r.unwrap().unwrap_err(), TransportKind::IdleTimeout);
         assert_eq!(t0.elapsed(), Duration::from_millis(200));
 
@@ -503,6 +521,38 @@ mod tests {
         assert_eq!(resp.body.text().await.unwrap(), "hello");
     }
 
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        let url = serve(|req| async move {
+            if req.uri().path() == "/moved" {
+                let mut r = Response::new(timed_body(vec![], Duration::ZERO));
+                *r.status_mut() = StatusCode::FOUND;
+                r.headers_mut()
+                    .insert("location", "http://127.0.0.1:9/elsewhere".parse().unwrap());
+                r
+            } else {
+                panic!("redirect target must not be requested");
+            }
+        })
+        .await;
+        let up = Upstream::new();
+        let lim = limits(
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        );
+        let mut req = get(&format!("{url}/moved"));
+        *req.method_mut() = reqwest::Method::POST;
+        req.headers_mut()
+            .insert("x-api-key", "not-a-real-key".parse().unwrap());
+        let resp = up.send(req, &lim).await.unwrap();
+        assert_eq!(resp.status, StatusCode::FOUND);
+        assert_eq!(
+            resp.headers.get("location").unwrap(),
+            "http://127.0.0.1:9/elsewhere"
+        );
+    }
+
     #[test]
     fn join_url_cases() {
         let cases = [
@@ -572,6 +622,24 @@ mod tests {
             Some(Box::new(Msg("dns error", Some(io(ErrorKind::Other))))),
         );
         assert_eq!(classify_chain(&e, false, true), TransportKind::Dns);
+
+        // HTTP/2 RST_STREAM / GOAWAY (no io source in the chain).
+        let rst = h2::Error::from(h2::Reason::REFUSED_STREAM);
+        assert!(rst.reason().is_some());
+        assert_eq!(classify_chain(&rst, false, false), TransportKind::Reset);
+        let wrapped = Msg("error reading a body from connection", Some(Box::new(rst)));
+        assert_eq!(classify_chain(&wrapped, false, false), TransportKind::Reset);
+        for m in [
+            "stream error received: refused stream before processing any application logic",
+            "connection error received: not a result of an error",
+            "connection error detected: unspecific protocol error detected",
+        ] {
+            assert_eq!(
+                classify_chain(&Msg(m, None), false, false),
+                TransportKind::Reset,
+                "{m}"
+            );
+        }
 
         let e = Msg(
             "client error (Connect)",
