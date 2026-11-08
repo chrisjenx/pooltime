@@ -3,9 +3,40 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
+
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Follow symlinks on the final path component so writes go to the real file
+/// instead of replacing the link (dotfile-managed `settings.json`). Relative
+/// link targets are joined onto the link's parent directory. A dangling link
+/// resolves to its (absent) target, which then gets created. Errors on a loop
+/// or after more than 40 hops. Symlinked parent directories need no handling:
+/// the OS follows them.
+fn resolve_final(path: &Path) -> io::Result<PathBuf> {
+    let mut cur = path.to_path_buf();
+    for _ in 0..=MAX_SYMLINK_HOPS {
+        match fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let target = fs::read_link(&cur)?;
+                cur = if target.is_absolute() {
+                    target
+                } else {
+                    parent_of(&cur).join(target)
+                };
+            }
+            Ok(_) => return Ok(cur),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(cur),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::other(format!(
+        "too many levels of symbolic links resolving {}",
+        path.display()
+    )))
+}
 
 fn parent_of(path: &Path) -> &Path {
     match path.parent() {
@@ -32,8 +63,11 @@ fn fsync_dir(dir: &Path) -> io::Result<()> {
 /// Atomically replace `path` with `bytes`: temp file in the same directory,
 /// fsync, rename, fsync of the parent directory. The result has exactly `mode`
 /// (permission bits, regardless of umask). Readers see the old or the new
-/// content, never a partial file; the temp file is removed on failure.
+/// content, never a partial file; the temp file is removed on failure. If
+/// `path` is a symlink the file it points to is replaced and the link is kept.
 pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    let path = resolve_final(path)?;
+    let path = path.as_path();
     let tmp = staged_temp(path, bytes, mode)?;
     tmp.persist(path).map_err(|e| e.error)?;
     fsync_dir(parent_of(path))
@@ -112,7 +146,8 @@ fn current_stamp(path: &Path) -> io::Result<Option<Stamp>> {
 ///
 /// A write landing in the few microseconds between the re-stat and the rename
 /// cannot be detected without a lock Claude Code does not take; that window is
-/// inherent to the approach.
+/// inherent to the approach. Symlinks are followed (see [`resolve_final`]) so
+/// the link itself is never replaced.
 pub fn guarded_patch(
     path: &Path,
     mode: u32,
@@ -120,6 +155,8 @@ pub fn guarded_patch(
     mut f: impl FnMut(Option<&[u8]>) -> anyhow::Result<Patch>,
 ) -> anyhow::Result<WriteOutcome> {
     for _ in 0..=retries {
+        let path = resolve_final(path)?;
+        let path = path.as_path();
         let read = read_with_stamp(path)?;
         let (current, stamp, file_mode) = match &read {
             Some((bytes, stamp, m)) => (Some(bytes.as_slice()), Some(*stamp), *m),
@@ -335,5 +372,120 @@ mod tests {
         assert_eq!(mode_of(&p), 0o600);
         ensure_mode(&p, 0o600).unwrap();
         assert_eq!(mode_of(&p), 0o600);
+    }
+
+    #[test]
+    fn atomic_write_through_absolute_symlink_keeps_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("dotfiles");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let target = repo.join("settings.json");
+        fs::write(&target, b"old").unwrap();
+        let link = home.join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        atomic_write(&link, b"new", 0o600).unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(mode_of(&target), 0o600);
+        assert_eq!(dir_names(&repo), vec!["settings.json"]);
+        assert_eq!(dir_names(&home), vec!["settings.json"]);
+    }
+
+    #[test]
+    fn guarded_patch_through_absolute_symlink_keeps_link_and_target_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("dotfiles");
+        let home = dir.path().join("home");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let target = repo.join("settings.json");
+        fs::write(&target, b"old").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = home.join("settings.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let out = guarded_patch(&link, 0o600, 3, |cur| {
+            assert_eq!(cur, Some(&b"old"[..]));
+            Ok(Patch::Write(b"new".to_vec()))
+        })
+        .unwrap();
+        assert_eq!(out, WriteOutcome::Written);
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(mode_of(&target), 0o644);
+        assert_eq!(dir_names(&repo), vec!["settings.json"]);
+        assert_eq!(dir_names(&home), vec!["settings.json"]);
+    }
+
+    #[test]
+    fn relative_and_chained_symlinks_are_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("a")).unwrap();
+        fs::create_dir_all(dir.path().join("b")).unwrap();
+        let real = dir.path().join("a/real.json");
+        fs::write(&real, b"old").unwrap();
+        // b/mid -> ../a/real.json ; link -> b/mid (relative, chained)
+        std::os::unix::fs::symlink("../a/real.json", dir.path().join("b/mid")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink("b/mid", &link).unwrap();
+        atomic_write(&link, b"w1", 0o600).unwrap();
+        assert_eq!(fs::read(&real).unwrap(), b"w1");
+        guarded_patch(&link, 0o600, 3, |_| Ok(Patch::Write(b"w2".to_vec()))).unwrap();
+        assert_eq!(fs::read(&real).unwrap(), b"w2");
+        assert_eq!(fs::read_link(&link).unwrap(), Path::new("b/mid"));
+        assert_eq!(
+            fs::read_link(dir.path().join("b/mid")).unwrap(),
+            Path::new("../a/real.json")
+        );
+    }
+
+    #[test]
+    fn dangling_symlink_creates_target_and_keeps_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("later.json");
+        let link = dir.path().join("l1");
+        std::os::unix::fs::symlink("later.json", &link).unwrap();
+        atomic_write(&link, b"made", 0o600).unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"made");
+        assert_eq!(mode_of(&target), 0o600);
+
+        fs::remove_file(&target).unwrap();
+        let out = guarded_patch(&link, 0o640, 3, |cur| {
+            assert!(cur.is_none());
+            Ok(Patch::Write(b"patched".to_vec()))
+        })
+        .unwrap();
+        assert_eq!(out, WriteOutcome::Written);
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"patched");
+        assert_eq!(mode_of(&target), 0o640);
+    }
+
+    #[test]
+    fn symlink_loop_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::os::unix::fs::symlink("b", &a).unwrap();
+        std::os::unix::fs::symlink("a", &b).unwrap();
+        assert!(atomic_write(&a, b"x", 0o600).is_err());
+        assert!(guarded_patch(&a, 0o600, 3, |_| Ok(Patch::Write(b"x".to_vec()))).is_err());
+        assert!(fs::symlink_metadata(&a).unwrap().file_type().is_symlink());
     }
 }
