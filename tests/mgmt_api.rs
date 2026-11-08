@@ -775,6 +775,7 @@ mod mgmt {
             tuning: Tuning::default(),
             mapping_enabled: table.mapping_enabled(),
             mappings: table.mappings().to_vec(),
+            inert_mappings: vec![],
         };
         let v = build_status(&inputs, now);
         insta::assert_snapshot!(serde_json::to_string_pretty(&v).unwrap());
@@ -800,6 +801,7 @@ mod mgmt {
             tuning: Tuning::default(),
             mapping_enabled: false,
             mappings: vec![],
+            inert_mappings: vec![],
         };
         let live = build_status(&inputs, now);
         assert_eq!(live["accounts"][0]["weight_override"]["weight"], 5.0);

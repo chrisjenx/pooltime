@@ -205,8 +205,8 @@ impl OpenAiProvider {
 }
 
 /// Ask every signed-in OpenAI account for its catalog and merge it into the live model table
-/// (runtime-only, see the module docs). Does not re-sync profiles (see [`refresh_codex_catalog`]; the mgmt refresh
-/// endpoint syncs once for both providers).
+/// (runtime-only, see the module docs). Does not re-sync profiles (see
+/// [`refresh_codex_catalog`]; the mgmt refresh endpoint syncs once for both providers).
 ///
 /// No OpenAI provider or no signed-in account: an empty report. Every account failing: `Err`
 /// (classified reason, table unchanged).
@@ -294,6 +294,24 @@ pub async fn refresh_codex_catalog(app: &Arc<AppState>) {
         }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %format!("{e:#}"), "codex model discovery failed"),
+    }
+    warn_inert_mappings(app);
+}
+
+/// After a discovery attempt (boot, hourly, `models refresh`): warn about each mapping that is
+/// enabled but targets a missing row ([`crate::models::ModelTable::inert_mappings`]); it keeps
+/// falling back to passthrough. Logs the mapping's family and target id only.
+pub fn warn_inert_mappings(app: &AppState) {
+    let table = app.models.read().unwrap_or_else(|e| e.into_inner());
+    if !table.mapping_enabled() {
+        return;
+    }
+    for m in table.inert_mappings() {
+        tracing::warn!(
+            from = %m.from,
+            to = %m.to,
+            "model mapping is inert: its target is not a known route (passthrough until it is discovered)"
+        );
     }
 }
 

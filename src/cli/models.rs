@@ -57,8 +57,9 @@ pub async fn run(paths: &Paths, cmd: ModelsCmd) -> anyhow::Result<i32> {
 ///
 /// A Claude live-catalog failure (`live_error`) or a Codex discovery failure (`codex.error`,
 /// per-account `codex.failed`) is only a warning while the other catalog answered; the command
-/// fails (exit 1) only when every catalog failed (the API answers 502 then, which the client
-/// reports as an error) or the connected profiles could not be re-synced.
+/// fails (exit 1) only when no catalog answered (the API answers 502 then, which the client
+/// reports as an error) or the connected profiles could not be re-synced. Codex counts as asked
+/// only with at least one signed-in ChatGPT account (`codex.accounts > 0`).
 fn refresh_report(v: &serde_json::Value) -> (Vec<String>, Vec<String>, bool) {
     let mut lines = vec![format!(
         "refreshed: {} live Claude models, {} listed; {} connected profiles re-synced",
@@ -114,7 +115,8 @@ fn refresh_report(v: &serde_json::Value) -> (Vec<String>, Vec<String>, bool) {
                     f["reason"].as_str().unwrap_or("unknown")
                 ));
             }
-            false
+            // No signed-in ChatGPT account: Codex was not asked, so it did not answer either.
+            n == 0
         }
         // No Codex provider: the Claude catalog was the only one asked.
         None => true,
@@ -204,6 +206,9 @@ mod tests {
         assert!(w[0].contains("Claude") && w[0].contains("status:500"));
         // Every catalog failed: the command fails.
         v["codex"] = json!({"error": "x"});
+        assert!(refresh_report(&v).2);
+        // No ChatGPT account: Codex was not asked, so a Claude failure fails the command.
+        v["codex"] = json!({"accounts": 0, "added": [], "failed": []});
         assert!(refresh_report(&v).2);
     }
 }
