@@ -1,7 +1,7 @@
 # Intended differences between bro and pooltime (see harness/README.md).
 #
 # Each entry: `scenario`, `field`, `bro`, `pooltime` are anchored regexes (`<absent>` = the field is
-# missing on that side); `reason` says why the difference is intended; `source` cites the INV §10
+# missing on that side); `reason` says why the difference is intended; `source` cites the INV
 # item, spec §16 passage, docs/parity.md decision or ledger ruling it comes from. A pooltime bug is
 # never allowlisted: it is fixed in pooltime with a regression test (harness/fixed.toml).
 
@@ -14,28 +14,86 @@ reason = "bro drops X-Pool-Account when it replays the last failed attempt's res
 source = "spec §16 Differential harness (X-Pool-Account is an expected difference)"
 
 [[allow]]
+scenario = "pool_exhausted"
+field = 'step0\.header\.request-id'
+bro = "<absent>"
+pooltime = "req_fake_upstream"
+reason = "When the whole pool is exhausted bro replays the last 429 body without the upstream headers; pooltime keeps the upstream request-id on the replayed error."
+source = "spec §16 Differential harness (request ids are an expected difference)"
+
+[[allow]]
 scenario = "midstream_cut|codex_midstream_cut"
 field = 'step0\.end'
 bro = "clean"
 pooltime = "reset"
-reason = "Upstream resets after commit. bro errors its ReadableStream, but Bun still ends the chunked body cleanly, so the client cannot tell a truncated turn from a finished one; pooltime aborts the response (INV §1: EOF before a terminal event is a truncation and the stream errors) and logs it with account and request id."
-source = "INV §10.6 (mid-stream upstream failures left to the runtime)"
+reason = "Upstream resets after commit. bro errors its ReadableStream, but Bun still ends the chunked body cleanly, so the client cannot tell a truncated turn from a finished one; pooltime aborts the response so the truncation is visible, and logs it with account and request id (INV §10.6)."
+source = "INV §1 Streaming (EOF before a terminal event = truncation, the stream errors); INV §10.6"
+
+# codex_failed_after_created: one entry per field, each with its exact pair.
+[[allow]]
+scenario = "codex_failed_after_created"
+field = 'step0\.status'
+bro = "200"
+pooltime = "502"
+reason = "response.created then response.failed before any output is settled pre-commit as a terminal 502 instead of a 200 stream."
+source = "docs/parity.md Decisions (Codex pre-commit holds message_start), Task 38"
 
 [[allow]]
 scenario = "codex_failed_after_created"
-field = 'step0\.(status|header\.content-type|json|sse|end|pings)'
-bro = '200|text/event-stream|<absent>|message_start \| error:server_error|clean|none'
-pooltime = '502|application/json|error:api_error|<absent>'
-reason = "Codex pre-commit holds message_start: response.created then response.failed before any output is settled as a terminal 502 with an Anthropic error type, instead of a 200 carrying only message_start + an error frame with the raw Codex code."
-source = "docs/parity.md Decisions (Codex pre-commit holds message_start; Codex error types mapped to the Anthropic set), Task 38"
+field = 'step0\.header\.content-type'
+bro = "text/event-stream"
+pooltime = "application/json"
+reason = "The settled error is a JSON error envelope, not a stream."
+source = "docs/parity.md Decisions (Codex pre-commit holds message_start), Task 38"
+
+[[allow]]
+scenario = "codex_failed_after_created"
+field = 'step0\.json'
+bro = "<absent>"
+pooltime = "error:api_error"
+reason = "The settled error carries an Anthropic error type (bro streamed the raw Codex code server_error)."
+source = "docs/parity.md Decisions (Codex pre-commit holds message_start; Codex error types are mapped to the Anthropic set)"
+
+[[allow]]
+scenario = "codex_failed_after_created"
+field = 'step0\.sse'
+bro = 'message_start:gpt-5\.5:usage=0/0 \| error:server_error'
+pooltime = "<absent>"
+reason = "bro committed on message_start and streamed a lone error frame inside a 200; pooltime sends no stream."
+source = "docs/parity.md Decisions (Codex pre-commit holds message_start), Task 38"
+
+[[allow]]
+scenario = "codex_failed_after_created"
+field = 'step0\.end'
+bro = "clean"
+pooltime = "<absent>"
+reason = "No stream on the pooltime side (see step0.sse)."
+source = "docs/parity.md Decisions (Codex pre-commit holds message_start), Task 38"
+
+[[allow]]
+scenario = "codex_failed_after_created"
+field = 'step0\.pings'
+bro = "none"
+pooltime = "<absent>"
+reason = "No stream on the pooltime side (see step0.sse)."
+source = "docs/parity.md Decisions (Codex pre-commit holds message_start), Task 38"
 
 [[allow]]
 scenario = "codex_server_error"
 field = 'upstream\.inference'
 bro = "responses@cx"
-pooltime = "responses@cx(, responses@cx){1,4}"
+# 1 attempt + OVERLOAD_RETRY_MAX (3, harness/src/daemons.rs) same-account retries.
+pooltime = "responses@cx, responses@cx, responses@cx, responses@cx"
 reason = "Codex 5xx is retried on the same account with the overload backoff before it is surfaced as terminal (bro surfaced it on the first attempt). Neither tries the second Codex account, and the client status is the same."
 source = "docs/parity.md Decisions (Codex 5xx is terminal within the Codex pool, after a same-account backoff)"
+
+[[allow]]
+scenario = "codex_oversized_created_single_read"
+field = 'step0\.pings'
+bro = "none"
+pooltime = "some"
+reason = "The 200 KiB response.created arrives in one write: bro's Bun read gets it whole and parses it before checking the 64 KiB cap, so it never forces message_start; pooltime's cap counts bytes as they arrive, forces message_start, and the late real response.created becomes an in-place ping. The event sequence is identical."
+source = "docs/parity.md Decisions (Codex 64 KiB pre-commit cap counts upstream bytes as they arrive)"
 
 [[allow]]
 scenario = "codex_invalid_grant"
@@ -52,11 +110,3 @@ bro = 'json\{error\}'
 pooltime = "error:not_found_error"
 reason = "Unknown inbound paths get an Anthropic-shaped 404 error envelope (and are logged so new Claude Code endpoints show up); bro answers {\"error\":\"not found\"}."
 source = "spec §16 Errors (unknown inbound paths -> Anthropic-shaped 404 JSON)"
-
-[[allow]]
-scenario = ".*"
-field = 'step\d+\.header\.request-id'
-bro = ".*"
-pooltime = ".*"
-reason = "Request ids are per-request and expected to differ; when the whole pool is exhausted bro replays the last 429 body without the upstream headers while pooltime keeps the upstream request-id on it."
-source = "spec §16 Differential harness (request ids are an expected difference)"

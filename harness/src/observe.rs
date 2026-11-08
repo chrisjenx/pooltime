@@ -183,8 +183,8 @@ pub fn summarize(events: &[(String, Value)]) -> Vec<String> {
     // (index, delta type, accumulated text) of the delta run being coalesced.
     let mut run: Option<(i64, String, String)> = None;
     let flush = |run: &mut Option<(i64, String, String)>, out: &mut Vec<String>| {
-        if let Some((_, ty, text)) = run.take() {
-            out.push(format!("delta:{ty}:{text:?}"));
+        if let Some((idx, ty, text)) = run.take() {
+            out.push(format!("delta:{idx}:{ty}:{text:?}"));
         }
     };
     for (event, data) in events {
@@ -216,16 +216,30 @@ pub fn summarize(events: &[(String, Value)]) -> Vec<String> {
         out.push(match event.as_str() {
             "content_block_start" => {
                 let b = &data["content_block"];
-                let ty = b["type"].as_str().unwrap_or("?");
-                match b["name"].as_str() {
-                    Some(n) => format!("block_start:{ty}:{n}"),
-                    None => format!("block_start:{ty}"),
+                let mut s = format!(
+                    "block_start:{}:{}",
+                    data["index"].as_i64().unwrap_or(-1),
+                    b["type"].as_str().unwrap_or("?")
+                );
+                for k in ["name", "id"] {
+                    if let Some(v) = b[k].as_str() {
+                        s.push_str(&format!(":{v}"));
+                    }
                 }
+                s
             }
-            "content_block_stop" => "block_stop".into(),
+            "content_block_stop" => {
+                format!("block_stop:{}", data["index"].as_i64().unwrap_or(-1))
+            }
+            "message_start" => format!(
+                "message_start:{}:usage={}",
+                data["message"]["model"].as_str().unwrap_or("-"),
+                usage(&data["message"]["usage"])
+            ),
             "message_delta" => format!(
-                "message_delta:{}",
-                data["delta"]["stop_reason"].as_str().unwrap_or("null")
+                "message_delta:{}:usage={}",
+                data["delta"]["stop_reason"].as_str().unwrap_or("null"),
+                usage(&data["usage"])
             ),
             "error" => format!("error:{}", data["error"]["type"].as_str().unwrap_or("?")),
             other => other.to_string(),
@@ -233,6 +247,18 @@ pub fn summarize(events: &[(String, Value)]) -> Vec<String> {
     }
     flush(&mut run, &mut out);
     out
+}
+
+/// `in/out` token counts plus any cache fields (`-` for a missing count).
+fn usage(u: &Value) -> String {
+    let n = |k: &str| u[k].as_u64().map_or("-".to_string(), |n| n.to_string());
+    let mut s = format!("{}/{}", n("input_tokens"), n("output_tokens"));
+    for k in ["cache_creation_input_tokens", "cache_read_input_tokens"] {
+        if let Some(v) = u[k].as_u64() {
+            s.push_str(&format!(",{k}={v}"));
+        }
+    }
+    s
 }
 
 /// Comparable projection of a non-SSE body.
@@ -279,6 +305,12 @@ pub fn project_json(body: &[u8]) -> String {
                                     b["thinking"].as_str().unwrap_or(""),
                                     b["signature"].as_str().is_some()
                                 ),
+                                "tool_use" => format!(
+                                    "tool_use:{}:{}:{}",
+                                    b["name"].as_str().unwrap_or("-"),
+                                    b["id"].as_str().unwrap_or("-"),
+                                    b["input"]
+                                ),
                                 t => t.to_string(),
                             }
                         })
@@ -286,8 +318,10 @@ pub fn project_json(body: &[u8]) -> String {
                 })
                 .unwrap_or_default();
             format!(
-                "message stop={} content=[{}]",
+                "message model={} stop={} usage={} content=[{}]",
+                v["model"].as_str().unwrap_or("-"),
                 v["stop_reason"].as_str().unwrap_or("null"),
+                usage(&v["usage"]),
                 content.join(", ")
             )
         }
@@ -315,24 +349,24 @@ mod tests {
     #[test]
     fn pings_dropped_and_deltas_coalesced() {
         let ev = frames(concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":5,\"output_tokens\":1,\"cache_read_input_tokens\":2}}}\n\n",
             "event: ping\ndata: {\"type\":\"ping\"}\n\n",
-            "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
-            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_start\ndata: {\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"name\":\"ls\",\"id\":\"tu_1\"}}\n\n",
+            "event: content_block_delta\ndata: {\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
             "event: ping\ndata: {\"type\":\"ping\"}\n\n",
-            "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\n",
-            "event: content_block_stop\ndata: {\"index\":0}\n\n",
-            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: content_block_delta\ndata: {\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\n",
+            "event: content_block_stop\ndata: {\"index\":1}\n\n",
+            "event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
             "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"secret prompt\"}}\n\n",
         ));
         assert_eq!(
             summarize(&ev),
             vec![
-                "message_start",
-                "block_start:text",
-                "delta:text_delta:\"Hi there\"",
-                "block_stop",
-                "message_delta:end_turn",
+                "message_start:m:usage=5/1,cache_read_input_tokens=2",
+                "block_start:1:tool_use:ls:tu_1",
+                "delta:1:text_delta:\"Hi there\"",
+                "block_stop:1",
+                "message_delta:end_turn:usage=-/3",
                 "error:api_error",
             ]
         );

@@ -199,6 +199,7 @@ pub fn scenarios() -> Vec<Scenario> {
                     RESPONSES,
                     vec![
                         codex_allowed(Reply::sse(frames_now(codex_tool_call_frames()))),
+                        codex_allowed(Reply::sse(frames_now(codex_tool_call_frames()))),
                         codex_ok(),
                     ],
                 )
@@ -207,6 +208,11 @@ pub fn scenarios() -> Vec<Scenario> {
         .accounts(one())
         .steps(vec![
             Step::messages(tool_call_body()),
+            Step::messages({
+                let mut b = tool_call_body();
+                b["stream"] = json!(false);
+                b
+            }),
             Step::messages(tool_result_body()),
         ])
         .detail(responses_shape),
@@ -256,6 +262,20 @@ pub fn scenarios() -> Vec<Scenario> {
                 fs.extend(frames_now(rest));
                 up.openai
                     .script(RESPONSES, vec![codex_allowed(Reply::sse(fs))]);
+            },
+        )
+        .accounts(one())
+        .steps(vec![Step::messages(codex_body(GPT, true))]),
+        Scenario::new(
+            "codex_oversized_created_single_read",
+            "the same ~200 KiB response.created written in one piece (bro can parse it in one read and never needs the forced message_start)",
+            |up| {
+                let big = "x".repeat(200 * 1024);
+                let mut fs = vec![codex_created(Some(&big))];
+                fs.extend(codex_text_item());
+                fs.push(codex_completed());
+                up.openai
+                    .script(RESPONSES, vec![codex_allowed(Reply::sse(frames_now(fs)))]);
             },
         )
         .accounts(one())

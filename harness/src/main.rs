@@ -131,15 +131,8 @@ fn upstream_fields(up: &Upstreams, sc: &Scenario) -> Observation {
     let mut inference = Vec::new();
     let mut refresh = Vec::new();
     let mut details = Vec::new();
-    let mut reqs: Vec<(&str, fake::Recorded)> = Vec::new();
-    reqs.extend(
-        up.anthropic
-            .requests()
-            .into_iter()
-            .map(|r| ("anthropic", r)),
-    );
-    reqs.extend(up.openai.requests().into_iter().map(|r| ("openai", r)));
-    for (side, r) in &reqs {
+    // Arrival order across both fakes (shared log), so a cross-provider hop's order is compared.
+    for (side, r) in &up.arrivals() {
         match r.path.as_str() {
             MESSAGES | RESPONSES => {
                 let kind = if r.path == MESSAGES {
@@ -156,7 +149,6 @@ fn upstream_fields(up: &Upstreams, sc: &Scenario) -> Observation {
             _ => {}
         }
     }
-    // The two fakes record independently; anthropic hits are listed before openai hits.
     out.insert("upstream.inference".into(), inference.join(", "));
     out.insert("upstream.refresh".into(), refresh.join(", "));
     for (i, d) in details.into_iter().enumerate() {
@@ -624,6 +616,18 @@ mod tests {
         );
         assert!(c.contains_key("account.A.status"));
         assert!(c.contains_key("account.B.status"));
+    }
+
+    #[test]
+    fn codex_5xx_allowance_is_one_attempt_plus_the_retry_budget() {
+        let allow = Allowlist::load(&workspace_root().join("harness/allowlist.toml")).unwrap();
+        let e = allow
+            .entries
+            .iter()
+            .find(|e| e.scenario == "codex_server_error")
+            .expect("codex_server_error entry");
+        let hits = vec!["responses@cx"; 1 + daemons::OVERLOAD_RETRY_MAX as usize].join(", ");
+        assert_eq!(e.pooltime, hits);
     }
 
     #[test]
