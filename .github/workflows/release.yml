@@ -1,0 +1,148 @@
+name: Release
+
+# Push a tag `vX.Y.Z` whose version matches Cargo.toml to build the four release binaries and
+# publish them as a GitHub Release (tarballs, per-asset .sha256 and a combined SHA256SUMS).
+# install.sh and packaging/homebrew/update-formula.sh consume exactly these asset names.
+# A manual run (workflow_dispatch) builds and uploads the artifacts without publishing, to check
+# the four targets build before tagging.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Check the tag matches Cargo.toml
+        id: version
+        shell: bash
+        env:
+          REF: ${{ github.ref }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "pooltime") | .version')
+          if [[ "$REF" == refs/tags/* && "v${version}" != "${TAG}" ]]; then
+            echo "::error::tag ${TAG} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          # C dependencies (bundled SQLite, aws-lc) compile against musl on the Linux targets.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        # Only the pooltime binary: the workspace default-members include the parity harness.
+        run: cargo build --release --locked -p pooltime --bin pooltime --target "$TARGET"
+
+      - name: Smoke test
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          out=$("target/${TARGET}/release/pooltime" --version)
+          echo "$out"
+          [ "$out" = "pooltime ${VERSION}" ]
+
+      - name: Package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          asset="pooltime-${VERSION}-${TARGET}.tar.gz"
+          stage=$(mktemp -d)
+          cp "target/${TARGET}/release/pooltime" LICENSE README.md "$stage/"
+          chmod 755 "$stage/pooltime"
+          mkdir -p dist
+          tar -C "$stage" -czf "dist/${asset}" pooltime LICENSE README.md
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "${asset}.sha256"
+          else
+            shasum -a 256 "$asset" > "${asset}.sha256"
+          fi
+          cat "${asset}.sha256"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          cat ./*.tar.gz.sha256 | sort -k2 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "pooltime ${TAG}" \
+            --generate-notes \
+            --verify-tag
