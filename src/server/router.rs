@@ -22,7 +22,7 @@ use http_body::Frame;
 use serde_json::Value;
 
 use super::inference::{self, RequestId, REQUEST_ID_HEADER};
-use super::{auth, health, AppState, PendingGuard};
+use super::{auth, health, models_route, AppState, PendingGuard};
 use crate::logging::new_request_id;
 use crate::providers::anthropic::anthropic_error;
 
@@ -49,7 +49,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/v1/messages", messages)
         .route(
             "/v1/models",
-            get(models).fallback(|| async { method_not_allowed("GET") }),
+            get(models_route::models).fallback(|| async { method_not_allowed("GET") }),
         )
         .fallback(not_found)
         .with_state(state)
@@ -93,15 +93,6 @@ fn method_not_allowed(allow: &'static str) -> Response {
     r.headers_mut()
         .insert(ALLOW, HeaderValue::from_static(allow));
     r
-}
-
-/// `GET /v1/models`. Task 23 replaces this.
-async fn models(State(_app): State<Arc<AppState>>) -> Response {
-    anthropic_error(
-        501,
-        "api_error",
-        "pooltime: /v1/models is not implemented yet",
-    )
 }
 
 /// Read and parse a JSON request body: 413 past [`BODY_LIMIT`] (a declared oversize length is

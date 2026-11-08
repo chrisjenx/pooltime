@@ -467,8 +467,13 @@ impl Provider for AnthropicProvider {
     }
 
     async fn catalog(&self, _acct: &AccountMeta) -> anyhow::Result<Vec<RouteDef>> {
-        // TODO(T23): live model catalog.
+        // Claude rows are not routes: unknown ids already pass through to Anthropic, and the
+        // `/v1/models` listing comes from `live_models`.
         Ok(Vec::new())
+    }
+
+    async fn live_models(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        AnthropicProvider::live_models(self).await
     }
 }
 
