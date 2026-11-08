@@ -17,10 +17,70 @@ Leave out `--pooltime` and the bench runs `cargo build --release` itself. Defaul
 50 streams × 5 s, 15 timed boots of each kind, 300 TTFB requests per side at concurrency 4. A run
 takes a few minutes. `--only bro|pooltime` measures one daemon.
 
-## Results
+`--realistic` measures a long-running pool instead of a fresh one-account daemon (about 15 minutes):
 
-Current numbers: two full runs (default parameters), back to back, after `run/mgmt.key` moved to
-the relaxed write (see [first boot](#first-boot)):
+```sh
+cargo run -p harness -- bench --bro <bro-cli checkout> --pooltime target/release/pooltime --realistic
+```
+
+- Both daemons get 3 healthy Claude accounts and keep the periodic usage poll on (a fake
+  `/api/oauth/usage`), and idle for at least 360 s. That covers the 300 s usage-sampler flush, the
+  120 s usage TTL and the 60 s health, alerts, status-cache and profile-sync ticks. The process-tree
+  RSS is sampled every 5 s. The bench reports it at 60 s and at the end, plus the peak.
+- pooltime also gets one connected Claude Code profile, created right after boot through
+  `POST /api/v1/profiles/connect` with the status line and MCP. The profile is a temp dir inside
+  the sandbox home, never a real `~/.claude*`. Its `.claude.json` is about 5.5 MiB of realistic
+  shape: several hundred `projects` entries, each with prompt history, tool allowlists and last-session
+  stats. This exercises profile sync and its unchanged-file memo every minute. Once a profile is
+  connected pooltime enforces the proxy key, so the TTFB and load requests send that key, the way
+  Claude Code does.
+- bro has no equivalent of a connected profile, so it gets only the accounts and polling.
+- The cold starts use the same 3-account, polling-on setup (no profile).
+
+## v1.0.0 results
+
+Measured on 2026-11-08 with the v1.0.0 release build: commit `243fa5c` plus the version bump in the
+`release: v1.0.0` commit, which changes no code paths. One default run and one `--realistic` run.
+
+| Metric | pooltime default | bro default | pooltime realistic | bro realistic |
+|---|---|---|---|---|
+| **Idle RSS** at the end of the idle window | **19.0 MiB** (60 s) | 48.9 MiB (60 s) | **46.8 MiB** (360 s) | 57.7 MiB (360 s) |
+| Idle RSS at 60 s | 19.0 MiB | 48.9 MiB | **51.9 MiB** | 55.3 MiB |
+| Peak idle RSS (5 s samples) | - | - | **51.9 MiB** | 57.8 MiB |
+| RSS right after boot | 18.9 MiB | 48.9 MiB | 19.2 MiB | 55.3 MiB |
+| **RSS under 50 concurrent streams** (peak) | **27.0 MiB** | 127.0 MiB | **53.2 MiB** | 129.2 MiB |
+| **Cold start, first boot** (median of 15) | **17.5 ms** | 26.9 ms | **16.2 ms** | 27.1 ms |
+| **Cold start, restart** (median of 15) | **9.6 ms** | 25.6 ms | **10.1 ms** | 26.0 ms |
+| Added TTFB p50 | 0.33 ms | 0.55 ms | 0.45 ms | 0.47 ms |
+| Added TTFB p95 | 0.12 ms | 0.60 ms | 0.32 ms | 0.55 ms |
+| TTFB direct to the fake, p50 / p95 | 2.75 / 3.23 ms | 2.68 / 3.27 ms | 2.74 / 3.21 ms | 2.66 / 3.28 ms |
+| TTFB through the daemon, p50 / p95 | 3.08 / 3.35 ms | 3.23 / 3.88 ms | 3.19 / 3.53 ms | 3.13 / 3.83 ms |
+| Usage polls answered while idle | - | - | 9 | 9 |
+| Streams completed (with `message_stop`) | 50/50 | 50/50 | 50/50 | 50/50 |
+| Processes in the daemon's tree | 1 | 1 | 1 | 1 |
+
+In short:
+
+- **Default** (fresh daemon, one account): the same picture as the earlier runs below. pooltime
+  idles at about 40% of bro's memory, uses about a fifth of bro's memory under 50 streams, and
+  starts 1.5× (first boot) to 2.7× (restart) faster.
+- **Realistic**: pooltime still uses less memory than bro at every sample and starts faster, but
+  the idle gap narrows to about 11 MiB, from 30 MiB in the default run. Almost all of pooltime's
+  growth comes from the connected profile. RSS rises from 19 MiB at boot to 52 MiB once the
+  5.5 MiB `.claude.json` has been parsed and rewritten (connect, then the first sync). It settles at
+  about 47 MiB from 120 s on and stays flat to 360 s: the per-minute sync's memo skips the
+  unchanged file, and nothing grows. Three accounts with usage polling add little (bro's boot RSS
+  rises from 49 to 55 MiB for the same change). The connected profile also carries into the load
+  number: 53 MiB peak, against 129 MiB for bro.
+- bro's realistic idle RSS crept from 55 to 58 MiB over the 6 minutes. pooltime's did not grow
+  after the first sync.
+- The first, discarded warm-up boot of the realistic cold-start series took 199 ms for pooltime
+  (the file cache was cold after the build). The median of the 15 timed boots is 16.2 ms.
+
+## Earlier results (Task 42)
+
+Two full runs (default parameters), back to back, after `run/mgmt.key` moved to the relaxed write
+(see [first boot](#first-boot)):
 
 | Metric | pooltime run 3 | bro run 3 | pooltime run 4 | bro run 4 |
 |---|---|---|---|---|
@@ -98,6 +158,7 @@ still 0600, but it calls plain `fsync(2)` instead of `F_FULLFSYNC`. Every other 
 - Machine: Mac15,9 (MacBook Pro), Apple M3 Max, 16 cores, 128 GiB RAM, macOS 26.7.2 (25G332).
   Other user processes were running, including the user's live bro on port 3456, which the
   bench never touches.
+- pooltime v1.0.0 runs: commit `243fa5c` plus the version bump, release profile.
 - pooltime: runs 1–2 at `src/` `e954da7` (bench code from commit `5d5d422`, run from the working
   tree just before that commit); runs 3–4 with the relaxed `mgmt.key` write (commit
   `perf(server): relaxed fsync for regenerable mgmt.key`, measured from the working tree just
@@ -112,9 +173,9 @@ still 0600, but it calls plain `fsync(2)` instead of `F_FULLFSYNC`. Every other 
   temp `HOME`/`TMPDIR` (and bro's `CLAUDE_POOL_DIR`/`CLAUDE_CONFIG_DIR`, pooltime's
   `POOLTIME_HOME`), a fresh port that is never 3456 or 3460, a `PATH` that starts with a
   `security` shim that fails (bro cannot reach the Keychain; the run fails if it was called),
-  every upstream URL on a 127.0.0.1 fake, and fake tokens. One Claude account each. Usage polling
-  is off in both (`CLAUDE_USAGE_REFRESH=0`, `usage_refresh = false`), so neither daemon makes
-  background upstream calls while idle.
+  every upstream URL on a 127.0.0.1 fake, and fake tokens. Default bench: one Claude account
+  each, usage polling off in both (`CLAUDE_USAGE_REFRESH=0`, `usage_refresh = false`), so neither
+  daemon makes background upstream calls while idle. `--realistic`: three accounts, polling on.
 - **Cold start**: time from just before the harness's start call (sandbox seeding of a few small
   files, then spawn) to the first `/health` 200; the harness polls every 5 ms. The two daemons
   boot alternately, run by run, so drift in machine load hits both alike. *First boot*: a new
@@ -140,7 +201,8 @@ still 0600, but it calls plain `fsync(2)` instead of `F_FULLFSYNC`. Every other 
 
 - One machine, one OS. Linux (and musl builds) are not measured here.
 - No real upstream: the fakes answer instantly, so the numbers isolate proxy overhead and say
-  nothing about Anthropic/OpenAI latency. One account each, so routing work is minimal.
+  nothing about Anthropic/OpenAI latency. One account each in the default bench (three with
+  `--realistic`), so routing work is minimal.
 - Times are wall clock on a desktop with other work running; run-to-run spread is visible above
   (pooltime restart medians range from 9.4 to 17.3 ms). Both daemons were measured in the same runs.
 - RSS counts resident pages only (shared libraries included). bun's JIT and GC make bro's RSS

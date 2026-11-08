@@ -176,6 +176,6 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
       }
     ]
   },
-  "version": "0.1.0",
+  "version": "1.0.0",
   "now": "2026-11-07T12:00:00Z"
 }

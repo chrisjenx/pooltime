@@ -29,6 +29,8 @@ refused.
 
 Requests, Events and the weekly burn need the key (they are not in the read-only view).
 
+![Requests](img/dashboard-requests.png)
+
 ## Reading the overview
 
 - **7-day left** is the account's remaining headroom in its provider's weekly window, as a

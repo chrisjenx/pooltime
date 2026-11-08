@@ -118,6 +118,9 @@ pub struct Scenario {
     pub accounts: Vec<AccountSpec>,
     /// Turn on the Claude-family -> Codex mappings (bundled default rows) in both daemons.
     pub mapping: bool,
+    /// Leave the periodic Claude usage poll on in both daemons (`harness bench --realistic`);
+    /// off in every comparison scenario.
+    pub usage_polling: bool,
     /// Script one daemon's fakes (called once per daemon, on fresh fakes).
     pub script: fn(&Upstreams),
     pub steps: Vec<Step>,
@@ -136,6 +139,7 @@ impl Scenario {
             about,
             accounts: Vec::new(),
             mapping: false,
+            usage_polling: false,
             script,
             steps: Vec::new(),
             canonical_accounts: false,

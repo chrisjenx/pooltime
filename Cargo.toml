@@ -6,7 +6,7 @@ default-members = [".", "harness"]
 
 [package]
 name = "pooltime"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Pool Claude Max and ChatGPT/Codex accounts behind one local Anthropic-compatible endpoint"
 license = "MIT"

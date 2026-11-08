@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/chrisjenx/pooltime/main/install.sh | sh
 #
 # Environment:
-#   POOLTIME_VERSION       version to install, e.g. 0.1.0 (default: the latest release)
+#   POOLTIME_VERSION       version to install, e.g. 1.0.0 (default: the latest release)
 #   POOLTIME_INSTALL_DIR   where to put the binary (default: $HOME/.local/bin)
 #   POOLTIME_RELEASE_BASE  release download base URL
 #                          (default: https://github.com/chrisjenx/pooltime/releases/download)
