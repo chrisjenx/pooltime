@@ -87,14 +87,24 @@ struct Counts {
     expiring_today: u64,
 }
 
+/// The cache bytes `cache` (`None`: no file) parsed, unless unreadable or stale at unix time `now`.
+fn fresh_cache(cache: Option<&[u8]>, now: i64) -> Option<Cache> {
+    let c = cache.and_then(|b| serde_json::from_slice::<Cache>(b).ok())?;
+    (now.saturating_sub(c.written_at) <= STALE_AFTER.as_secs() as i64).then_some(c)
+}
+
+/// Whether the status line would show the pool (not [`POOL_DOWN`]) for the cache file under
+/// `paths` at unix time `now`.
+pub fn cache_is_fresh(paths: &Paths, now: i64) -> bool {
+    let bytes = std::fs::read(cache_path(paths)).ok();
+    fresh_cache(bytes.as_deref(), now).is_some()
+}
+
 /// The segment for the cache bytes `cache` (`None`: no file) at unix time `now`.
 pub fn segment(cache: Option<&[u8]>, now: i64) -> String {
-    let Some(c) = cache.and_then(|b| serde_json::from_slice::<Cache>(b).ok()) else {
+    let Some(c) = fresh_cache(cache, now) else {
         return POOL_DOWN.into();
     };
-    if now.saturating_sub(c.written_at) > STALE_AFTER.as_secs() as i64 {
-        return POOL_DOWN.into();
-    }
     let mut out = format!("pool {}/{}", c.pool.available, c.pool.total);
     if let Some(left) = c.seven_day_left {
         out.push_str(&format!(
@@ -234,20 +244,57 @@ fn sh_word(s: &str) -> String {
 /// One `sh` word as [`sh_word`] writes it (plain, or single-quoted with `'\''` escapes) at the
 /// start of `s`; returns the rest. `None` if `s` does not start with one.
 fn take_word(s: &str) -> Option<&str> {
+    read_word(s).map(|(_, rest)| rest)
+}
+
+/// [`take_word`], with the word's value (quotes removed).
+fn read_word(s: &str) -> Option<(String, &str)> {
     if let Some(mut rest) = s.strip_prefix('\'') {
+        let mut word = String::new();
         loop {
             let end = rest.find('\'')?;
+            word.push_str(&rest[..end]);
             rest = &rest[end + 1..];
             match rest.strip_prefix(r"\''") {
-                Some(more) => rest = more,
-                None => return Some(rest),
+                Some(more) => {
+                    word.push('\'');
+                    rest = more;
+                }
+                None => return Some((word, rest)),
             }
         }
     }
     let end = s
         .find(|c: char| !(c.is_ascii_alphanumeric() || "/._-+:@%=,".contains(c)))
         .unwrap_or(s.len());
-    (end > 0).then(|| &s[end..])
+    (end > 0).then(|| (s[..end].to_string(), &s[end..]))
+}
+
+/// What a wrapper `statusLine` ([`is_wrapper`]) names: its `POOLTIME_HOME` (if any) and binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrapperParts {
+    pub home: Option<PathBuf>,
+    pub bin: PathBuf,
+}
+
+/// The parts of `v` when it is our wrapper for profile `id`; `None` otherwise.
+pub fn wrapper_parts(v: &Value, id: &str) -> Option<WrapperParts> {
+    if !is_wrapper(v, id) {
+        return None;
+    }
+    let c = v.get("command")?.as_str()?;
+    let (home, c) = match c.strip_prefix("POOLTIME_HOME=") {
+        Some(rest) => {
+            let (h, r) = read_word(rest)?;
+            (Some(PathBuf::from(h)), r.strip_prefix(' ')?)
+        }
+        None => (None, c),
+    };
+    let (bin, _) = read_word(c)?;
+    Some(WrapperParts {
+        home,
+        bin: PathBuf::from(bin),
+    })
 }
 
 /// The `statusLine` command for `id`: `[POOLTIME_HOME=<home> ]<bin> statusline --wrap <id>`.
@@ -478,6 +525,18 @@ mod tests {
         ] {
             assert!(!is_wrapper(&line(user), "claude-work"), "{user}");
         }
+        // The doctor reads back what was written, quotes removed.
+        let parts = |c: &str, id: &str| wrapper_parts(&line(c), id).unwrap();
+        assert_eq!(
+            parts(&homed, "claude-work"),
+            WrapperParts {
+                home: Some("/tmp/pt home".into()),
+                bin: bin.into()
+            }
+        );
+        assert_eq!(parts(&spaced, "it's").bin, Path::new("/My Apps/pooltime"));
+        assert_eq!(parts(&cmd, "claude-work").home, None);
+        assert!(wrapper_parts(&line(&cmd), "other").is_none());
     }
 
     #[test]

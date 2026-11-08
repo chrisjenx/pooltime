@@ -155,12 +155,26 @@ exit 0"#,
             .env("XDG_CONFIG_HOME", self.home().join(".config"))
             .env("POOLTIME_NO_BROWSER", "1")
             // Never a real desktop notification from a test daemon.
-            .env("POOLTIME_ALERTS_NOTIFY", "false");
+            .env("POOLTIME_ALERTS_NOTIFY", "false")
+            // Never the real GitHub API from a test doctor.
+            .env("POOLTIME_NO_VERSION_CHECK", "1");
         c
     }
 
     fn run(&self, args: &[&str]) -> (bool, String) {
-        let out = procs::output(self.command(args).stdin(Stdio::null()));
+        self.run_env(args, &[])
+    }
+
+    /// [`Machine::run`] with extra environment (`None`: removed).
+    fn run_env(&self, args: &[&str], env: &[(&str, Option<&str>)]) -> (bool, String) {
+        let mut c = self.command(args);
+        for (k, v) in env {
+            match v {
+                Some(v) => c.env(k, v),
+                None => c.env_remove(k),
+            };
+        }
+        let out = procs::output(c.stdin(Stdio::null()));
         let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
         s.push_str(&String::from_utf8_lossy(&out.stderr));
         (out.status.success(), s)
@@ -589,4 +603,131 @@ async fn doctor_probes_codex_hosts_only_with_an_openai_account() {
     assert!(l.starts_with('✓'), "{out}");
     let l = line_with(&out, &format!("upstream {closed}:"));
     assert!(l.starts_with('✗'), "{out}");
+}
+
+/// A "pool" on the fake: `/health` says pooltime, `/api/v1/status` lists `accounts`.
+fn fake_pool(fake: &FakeAnthropic, accounts: &[&str]) {
+    fake.script(
+        "/health",
+        vec![Reply::json(
+            200,
+            &json!({"service": "pooltime", "status": "ok"}),
+        )],
+    );
+    let rows: Vec<Value> = accounts
+        .iter()
+        .map(|a| json!({"id": a, "provider": "anthropic", "status": "ready"}))
+        .collect();
+    fake.script(
+        "/api/v1/status",
+        vec![Reply::json(200, &json!({"accounts": rows}))],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doctor_reports_recent_error_rate() {
+    let fake = FakeAnthropic::start().await;
+    fake_pool(&fake, &["work", "home", "quiet"]);
+    fake.script(
+        "/api/v1/stats",
+        vec![Reply::json(
+            200,
+            &json!({
+                "window_secs": 86400,
+                "accounts": [
+                    {"account": "home", "provider": "anthropic", "attempts": 5, "errors": 5,
+                     "error_rate": 1.0, "p50_ms": 300, "p95_ms": 900},
+                    {"account": "quiet", "provider": "anthropic", "attempts": 50, "errors": 1,
+                     "error_rate": 0.02, "p50_ms": 400, "p95_ms": 1200},
+                    {"account": "work", "provider": "anthropic", "attempts": 40, "errors": 8,
+                     "error_rate": 0.2, "p50_ms": 500, "p95_ms": 2500,
+                     "top_error": "upstream_overloaded"},
+                ],
+                "journal_requests": 1234,
+                "storage": {"db_bytes": 0, "logs_bytes": 0},
+            }),
+        )],
+    );
+    let port: u16 = fake.url().rsplit(':').next().unwrap().parse().unwrap();
+    let m = Machine::with(port, &fake.url(), "");
+    // The stats need the management key the pool would have written.
+    let key = pooltime::server::mgmt::mgmt_key_path(&m.paths());
+    fs::write(&key, "k\n").unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let (_, out) = tokio::task::block_in_place(|| m.run(&["doctor"]));
+    let l = line_with(&out, "errors work:");
+    assert!(l.starts_with('!'), "{out}");
+    assert!(l.contains("20%") && l.contains("8 of 40"), "{out}");
+    assert!(l.contains("upstream_overloaded"), "{out}");
+    // Under 20 attempts: too few to judge, however bad.
+    assert!(!out.contains("errors home:"), "{out}");
+    assert!(!out.contains("errors quiet:"), "{out}");
+    // A flagged account replaces the summary line.
+    assert!(!out.lines().any(|l| l.starts_with("✓ errors")), "{out}");
+    // Rows against the ceiling, from the same answer.
+    assert!(
+        line_with(&out, "storage:").contains("journal 1234 of 100000 requests"),
+        "{out}"
+    );
+    assert_eq!(fake.requests_to("/api/v1/stats").len(), 1);
+
+    // No pool: the check is skipped with an info line, never a failure of its own.
+    drop(fake);
+    let m = Machine::new("http://127.0.0.1:9");
+    let (_, out) = tokio::task::block_in_place(|| m.run(&["doctor"]));
+    let l = line_with(&out, "errors:");
+    assert!(
+        l.starts_with('i') && l.contains("pool not running"),
+        "{out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doctor_version_check_opt_out() {
+    const RELEASES: &str = "/repos/chrisjenx/pooltime/releases/latest";
+    let fake = fake_upstream().await;
+    let gh = FakeAnthropic::start().await;
+    gh.script(
+        RELEASES,
+        vec![Reply::json(200, &json!({"tag_name": "v99.0.0"}))],
+    );
+    let m = Machine::new(&fake.url());
+    let api = format!("{}{RELEASES}", gh.url());
+    let opted_in = [
+        ("POOLTIME_NO_VERSION_CHECK", None),
+        ("POOLTIME_RELEASES_API", Some(api.as_str())),
+    ];
+
+    // Checked: a newer release is a warning with the upgrade command.
+    let (_, out) = tokio::task::block_in_place(|| m.run_env(&["doctor"], &opted_in));
+    let l = line_with(&out, "version:");
+    assert!(l.starts_with('!'), "{out}");
+    assert!(l.contains("99.0.0 available"), "{out}");
+    assert!(l.contains("brew upgrade pooltime"), "{out}");
+    assert_eq!(gh.requests_to(RELEASES).len(), 1);
+
+    // The flag opts out: no request at all.
+    let (_, out) =
+        tokio::task::block_in_place(|| m.run_env(&["doctor", "--no-version-check"], &opted_in));
+    assert!(line_with(&out, "version:").starts_with('i'), "{out}");
+    // So does the environment variable.
+    let env_out = [
+        ("POOLTIME_NO_VERSION_CHECK", Some("1")),
+        ("POOLTIME_RELEASES_API", Some(api.as_str())),
+    ];
+    let (_, out) = tokio::task::block_in_place(|| m.run_env(&["doctor"], &env_out));
+    assert!(line_with(&out, "version:").starts_with('i'), "{out}");
+    assert_eq!(gh.requests_to(RELEASES).len(), 1, "opted out: no request");
+
+    // Unreachable release API: an info line, never a warning.
+    let closed = [
+        ("POOLTIME_NO_VERSION_CHECK", None),
+        (
+            "POOLTIME_RELEASES_API",
+            Some("http://127.0.0.1:9/releases/latest"),
+        ),
+    ];
+    let (_, out) = tokio::task::block_in_place(|| m.run_env(&["doctor"], &closed));
+    assert!(line_with(&out, "version:").starts_with('i'), "{out}");
 }

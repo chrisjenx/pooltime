@@ -24,6 +24,7 @@
 //! headers were ready; `total_ms` runs until the row is finalised (the end of a streamed body);
 //! an attempt's `ms` runs from the attempt start to its outcome (commit for a served attempt).
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
@@ -109,6 +110,8 @@ pub struct AccountStats {
     /// Attempt latency (start to outcome) percentiles, over attempts that have one.
     pub p50_ms: Option<i64>,
     pub p95_ms: Option<i64>,
+    /// The most frequent error outcome (ties: the alphabetically first); `None` without errors.
+    pub top_error: Option<String>,
 }
 
 // ---- SQL ---------------------------------------------------------------------------------------
@@ -262,10 +265,10 @@ pub fn account_stats(conn: &Connection, since: i64) -> anyhow::Result<Vec<Accoun
             row.get::<_, Option<i64>>(3)?,
         ))
     })?;
-    let mut out: Vec<(AccountStats, Vec<i64>)> = Vec::new();
+    let mut out: Vec<(AccountStats, Vec<i64>, BTreeMap<String, u64>)> = Vec::new();
     for row in rows {
         let (account, provider, outcome, ms) = row?;
-        if out.last().is_none_or(|(s, _)| s.account != account) {
+        if out.last().is_none_or(|(s, _, _)| s.account != account) {
             out.push((
                 AccountStats {
                     account,
@@ -275,20 +278,29 @@ pub fn account_stats(conn: &Connection, since: i64) -> anyhow::Result<Vec<Accoun
                     error_rate: 0.0,
                     p50_ms: None,
                     p95_ms: None,
+                    top_error: None,
                 },
                 Vec::new(),
+                BTreeMap::new(),
             ));
         }
-        let (s, lat) = out.last_mut().expect("pushed above");
+        let (s, lat, kinds) = out.last_mut().expect("pushed above");
         s.attempts += 1;
         if outcome != "completed" && outcome != "client_cancelled" {
             s.errors += 1;
+            *kinds.entry(outcome).or_default() += 1;
         }
         lat.extend(ms);
     }
     Ok(out
         .into_iter()
-        .map(|(mut s, mut lat)| {
+        .map(|(mut s, mut lat, kinds)| {
+            // `max_by_key` keeps the last maximum: reversed, that is the alphabetically first.
+            s.top_error = kinds
+                .into_iter()
+                .rev()
+                .max_by_key(|(_, n)| *n)
+                .map(|(k, _)| k);
             s.error_rate = if s.attempts == 0 {
                 0.0
             } else {

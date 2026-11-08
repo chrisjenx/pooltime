@@ -63,7 +63,7 @@ pub(super) fn refresh_entry(obj: &mut Map<String, Value>, url: &str, token: &str
 }
 
 /// Whether `p`'s snapshot says the pool is registered there.
-pub(super) fn is_registered(paths: &Paths, p: &Profile) -> bool {
+pub(crate) fn is_registered(paths: &Paths, p: &Profile) -> bool {
     matches!(
         snapshot::read(&snapshot::snapshot_path(paths, p)),
         SnapshotState::Present(s) if s.mcp_registered

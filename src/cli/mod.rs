@@ -80,7 +80,11 @@ pub enum Command {
     /// First-run wizard: accounts, background service, Claude Code profiles, then doctor.
     Setup(setup::SetupArgs),
     /// Check the installation: one line per check, exit 1 on any failure.
-    Doctor,
+    Doctor {
+        /// Skip asking GitHub for the latest release (also `POOLTIME_NO_VERSION_CHECK=1`).
+        #[arg(long)]
+        no_version_check: bool,
+    },
     /// Print the pool segment for Claude Code's status line (from the daemon's cache).
     Statusline {
         /// Run this profile's original status line command (Claude Code's stdin passed on) and
@@ -148,7 +152,9 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
             // Blocking file and Keychain reads, then the identity fetches.
             Command::Import(cmd) => import::run(&paths, cmd).await,
             Command::Setup(args) => setup::run(&paths, args).await,
-            Command::Doctor => doctor::run(&paths).await,
+            Command::Doctor { no_version_check } => {
+                doctor::run(&paths, &doctor::Options::from_env(no_version_check)).await
+            }
             Command::Statusline { .. } => unreachable!("handled before the runtime starts"),
         }
     })
