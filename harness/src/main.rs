@@ -36,7 +36,10 @@ use fake::{account_of, refresh_account_of, Upstreams, MESSAGES, OAUTH_TOKEN, RES
 use scenarios::Scenario;
 
 #[derive(Parser)]
-#[command(about = "Run bro-cli and pooltime side by side against fake upstreams and compare")]
+#[command(
+    about = "Run bro-cli and pooltime side by side against fake upstreams and compare (`harness bench`: resource and latency benchmark)",
+    after_help = "Benchmark (idle RSS, RSS under load, cold start, added TTFB): `harness bench --bro <bro-cli>`; see `harness bench --help`."
+)]
 struct Args {
     /// bro-cli checkout (must contain pool/src/index.ts and pool/node_modules).
     #[arg(long)]

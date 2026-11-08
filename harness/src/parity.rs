@@ -25,25 +25,58 @@ fn words(text: &str) -> String {
         .join(" ")
 }
 
-/// Every inventory item's key, in document order.
-fn inventory_keys(inv: &str) -> Vec<String> {
-    let mut section: Option<String> = None;
+fn is_number(n: &str) -> bool {
+    !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+}
+
+/// `n. text` -> `n`.
+fn numbered_item(line: &str) -> Option<&str> {
+    line.split_once(". ")
+        .map(|(n, _)| n)
+        .filter(|n| is_number(n))
+}
+
+/// Every inventory item's key, in document order, or every line that looks like an item but has
+/// no recognised form (so a new kind of bullet cannot slip past the check unmapped).
+///
+/// Recognised: `- ` bullets, table rows (header and separator ignored), `**Name**:` paragraphs,
+/// numbered items in §10, whole-line bold group headings (ignored) and prose/continuation lines
+/// (ignored). Rejected inside a numbered section: indented or `*`/`+` bullets, numbered items
+/// outside §10 or indented, `**Name:**` (colon inside the bold). Rejected anywhere: content under
+/// an unnumbered `##` heading. Text before the first `##` (title, preamble) is ignored.
+fn inventory_keys(inv: &str) -> Result<Vec<String>, Vec<String>> {
+    enum Section {
+        Preamble,
+        Numbered(String),
+        Unnumbered,
+    }
+    let mut section = Section::Preamble;
     let mut keys = Vec::new();
-    for line in inv.lines() {
+    let mut bad = Vec::new();
+    for (i, line) in inv.lines().enumerate() {
+        let at = || format!("line {}: {line}", i + 1);
         if let Some(h) = line.strip_prefix("## ") {
-            section = h
-                .split_once(". ")
-                .map(|(n, _)| n.to_string())
-                .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+            section = match numbered_item(h) {
+                Some(n) => Section::Numbered(n.to_string()),
+                None => Section::Unnumbered,
+            };
             continue;
         }
-        let Some(s) = &section else { continue };
+        let s = match &section {
+            Section::Preamble => continue,
+            Section::Unnumbered => {
+                if !line.trim().is_empty() && line.trim() != "---" {
+                    bad.push(format!("content under an unnumbered heading, {}", at()));
+                }
+                continue;
+            }
+            Section::Numbered(s) => s,
+        };
+        let trimmed = line.trim_start();
+        let indented = trimmed.len() != line.len();
         if let Some(bullet) = line.strip_prefix("- ") {
             keys.push(format!("§{s} {}", words(bullet)));
-        } else if let Some((n, _)) = line
-            .split_once(". ")
-            .filter(|(n, _)| s == "10" && !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
-        {
+        } else if let Some(n) = numbered_item(line).filter(|_| s == "10") {
             keys.push(format!("§10.{n}"));
         } else if let Some(row) = line.strip_prefix("| ") {
             let cell = row.split('|').next().unwrap_or("");
@@ -51,13 +84,25 @@ fn inventory_keys(inv: &str) -> Vec<String> {
             if cell.trim() != "Upstream" {
                 keys.push(format!("§{s} row: {}", words(cell)));
             }
-        } else if let Some(rest) = line.strip_prefix("**") {
-            if let Some((name, _)) = rest.split_once("**:") {
-                keys.push(format!("§{s} {}", words(name)));
-            }
+        } else if let Some((name, _)) = line.strip_prefix("**").and_then(|r| r.split_once("**:")) {
+            keys.push(format!("§{s} {}", words(name)));
+        } else if line.starts_with("**") && line.contains(":**") {
+            bad.push(format!(
+                "`**Name:**` paragraph (colon inside the bold), {}",
+                at()
+            ));
+        } else if ["- ", "* ", "+ "].iter().any(|m| trimmed.starts_with(m)) {
+            let kind = if indented { "indented" } else { "`*`/`+`" };
+            bad.push(format!("{kind} bullet, {}", at()));
+        } else if numbered_item(trimmed).is_some() {
+            bad.push(format!("numbered item outside §10 or indented, {}", at()));
         }
     }
-    keys
+    if bad.is_empty() {
+        Ok(keys)
+    } else {
+        Err(bad)
+    }
 }
 
 /// A checklist row of `docs/parity.md`.
@@ -139,7 +184,7 @@ fn inventory_keys_cover_bullets_rows_paragraphs_and_gaps() {
                | Upstream | Behavior |\n|---|---|\n| 429 **without** x | y |\n\
                **Exhaustion**: text\n## 10. Gaps\n1. first\n   continued\n2. second\n";
     assert_eq!(
-        inventory_keys(inv),
+        inventory_keys(inv).unwrap(),
         vec![
             "§1 Bold code a/b c",
             "§1 row: 429 without x",
@@ -151,8 +196,35 @@ fn inventory_keys_cover_bullets_rows_paragraphs_and_gaps() {
 }
 
 #[test]
+fn unrecognised_list_like_lines_are_rejected() {
+    for (inv, why) in [
+        ("## 2. S\n- ok\n  - nested\n", "indented bullet"),
+        ("## 2. S\n* star\n", "`*`/`+` bullet"),
+        ("## 2. S\n+ plus\n", "`*`/`+` bullet"),
+        ("## 2. S\n1. numbered\n", "numbered item outside §10"),
+        (
+            "## 10. G\n1. ok\n   2. nested\n",
+            "numbered item outside §10 or indented",
+        ),
+        ("## 2. S\n**Name:** text\n", "colon inside the bold"),
+        (
+            "## 2. S\n- ok\n## Appendix\n- hidden\n",
+            "unnumbered heading",
+        ),
+    ] {
+        let bad = inventory_keys(inv).expect_err(inv);
+        assert_eq!(bad.len(), 1, "{inv}: {bad:?}");
+        assert!(bad[0].contains(why), "{inv}: {bad:?}");
+    }
+    // Known-ignored forms: preamble, group headings, prose, continuations, separators.
+    let ok = "# Title\n- preamble bullet\n## 3. S\n**Group**\nprose line\n   continued\n---\n";
+    assert_eq!(inventory_keys(ok).unwrap(), Vec::<String>::new());
+}
+
+#[test]
 fn parity_doc_has_one_row_per_inventory_item() {
-    let inv = inventory_keys(&read("docs/specs/2026-11-07-pooltime-parity-inventory.md"));
+    let inv = inventory_keys(&read("docs/specs/2026-11-07-pooltime-parity-inventory.md"))
+        .unwrap_or_else(|bad| panic!("unrecognised list-like INV lines: {bad:#?}"));
     let unique: BTreeSet<&String> = inv.iter().collect();
     assert_eq!(unique.len(), inv.len(), "inventory keys must be unique");
     assert!(
