@@ -244,21 +244,12 @@ fn rollup(
             rows.extend(row);
         }
         rows.sort_by(|a, b| a.first.ts.cmp(&b.first.ts).then(a.last.ts.cmp(&b.last.ts)));
-        let Some((consumed, first, last)) = usage_history::fold(&rows) else {
+        let Some(mut bucket) = usage_history::fold(&rows) else {
             continue;
         };
-        usage_history::insert_bucket(
-            tx,
-            &HistRow {
-                account,
-                window,
-                gran: dst,
-                ts: start,
-                consumed,
-                first,
-                last,
-            },
-        )?;
+        bucket.gran = dst;
+        bucket.ts = start;
+        usage_history::insert_bucket(tx, &bucket)?;
     }
     Ok((rolled, created))
 }

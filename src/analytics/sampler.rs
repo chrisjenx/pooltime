@@ -4,8 +4,10 @@
 //! account per [`MIN_GAP_SECS`]. A detected reset ([`usage_history::is_reset`]) bypasses the
 //! throttle: the last pre-reset reading (when it was throttled away) and the new one are both
 //! recorded at once, so the consumption before the reset is not lost. The background task
-//! ([`spawn_sampler`]) wakes on [`StateBook::changes`] and queues rows on the store writer; the
-//! request path never waits on it.
+//! A reading held back by the throttle is written (with its own time) once the gap has passed,
+//! even with no further change. The background task ([`spawn_sampler`]) wakes on
+//! [`StateBook::changes`] and at least every [`MIN_GAP_SECS`], and queues rows on the store
+//! writer; the request path never waits on it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,6 +25,8 @@ use crate::store::Store;
 pub const MIN_GAP_SECS: i64 = 300;
 /// Coalesce bursts of state changes (every served request bumps the change counter).
 const COALESCE: Duration = Duration::from_secs(1);
+/// Wake at least this often without a state change, to flush a throttled final reading.
+const FLUSH_EVERY: Duration = Duration::from_secs(MIN_GAP_SECS as u64);
 
 #[derive(Debug, Clone, Copy)]
 struct Track {
@@ -59,6 +63,13 @@ impl Sampler {
 
     /// Feed the account's current reading; returns the readings to record now, oldest first.
     pub fn observe(&mut self, account: &str, p: Point) -> Vec<Point> {
+        self.observe_at(account, p, p.ts)
+    }
+
+    /// [`observe`](Self::observe) at clock `now`: an unchanged reading that was throttled away is
+    /// written (with its own `ts`) once [`MIN_GAP_SECS`] have passed since the last write, so the
+    /// final reading before a quiet spell is not held back indefinitely.
+    pub fn observe_at(&mut self, account: &str, p: Point, now: i64) -> Vec<Point> {
         let Some(t) = self.tracks.get_mut(account) else {
             self.tracks.insert(
                 account.to_string(),
@@ -73,6 +84,11 @@ impl Sampler {
         let prev = t.last_seen;
         let unchanged = (p.util - prev.util).abs() < 1e-9 && p.reset == prev.reset;
         if unchanged || p.ts < prev.ts {
+            if !t.recorded && now.max(p.ts) - t.last_recorded_ts >= MIN_GAP_SECS {
+                t.recorded = true;
+                t.last_recorded_ts = prev.ts;
+                return vec![prev];
+            }
             return Vec::new();
         }
         let mut out = Vec::new();
@@ -116,7 +132,7 @@ fn sample_all(sampler: &mut Sampler, registry: &Registry, state: &StateBook, sto
             continue;
         };
         let account = meta.id.to_string();
-        let points = sampler.observe(&account, p);
+        let points = sampler.observe_at(&account, p, now.unix_timestamp());
         if points.is_empty() {
             continue;
         }
@@ -169,11 +185,17 @@ pub fn spawn_sampler(
                     return;
                 }
             };
-            if changes.changed().await.is_err() {
-                return;
+            // Wake on a change, or after MIN_GAP_SECS anyway to flush a held reading.
+            tokio::select! {
+                r = changes.changed() => {
+                    if r.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(COALESCE).await;
+                    changes.borrow_and_update();
+                }
+                _ = tokio::time::sleep(FLUSH_EVERY) => {}
             }
-            tokio::time::sleep(COALESCE).await;
-            changes.borrow_and_update();
         }
     })
 }
@@ -188,6 +210,27 @@ mod tests {
             util,
             reset: Some(reset),
         }
+    }
+
+    #[test]
+    fn throttled_final_reading_is_flushed() {
+        let r1 = 1_000_000;
+        let mut s = Sampler::default();
+        assert_eq!(s.observe("a", p(0, 0.1, r1)).len(), 1);
+        assert!(s.observe("a", p(60, 0.5, r1)).is_empty(), "throttled");
+        // No further change: once MIN_GAP has passed, the held reading is written as it was.
+        assert!(
+            s.observe_at("a", p(60, 0.5, r1), 200).is_empty(),
+            "too early"
+        );
+        assert_eq!(s.observe_at("a", p(60, 0.5, r1), 300), [p(60, 0.5, r1)]);
+        assert!(
+            s.observe_at("a", p(60, 0.5, r1), 900).is_empty(),
+            "only once"
+        );
+        // and the throttle restarts from it
+        assert!(s.observe_at("a", p(100, 0.6, r1), 950).is_empty());
+        assert_eq!(s.observe_at("a", p(400, 0.7, r1), 1000).len(), 1);
     }
 
     #[test]
