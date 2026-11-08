@@ -480,6 +480,13 @@ impl Ctx {
                 }
                 (stored, new) => stored.or(new),
             },
+            // The token endpoint sends no refresh expiry; a recorded one that has passed was
+            // disproven by this refresh succeeding (same rule as Anthropic).
+            refresh_expires_at: crate::providers::anthropic::expiry_after_refresh(
+                cur.refresh_expires_at,
+                None,
+                now,
+            ),
             ..cur
         };
         // Persist (atomically, before anyone uses the new token). The old refresh token may now be
@@ -1004,7 +1011,10 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_posts_json_grant_and_persists_rotation() {
-        let fx = fx(creds_expiring_in(60));
+        let mut c = creds_expiring_in(60);
+        // A recorded refresh expiry that has passed is disproven by the refresh succeeding.
+        c.refresh_expires_at = Some(OffsetDateTime::now_utc() - time::Duration::days(1));
+        let fx = fx(c);
         let fake = fake_token_endpoint(|_| {
             reply(
                 200,
@@ -1044,6 +1054,7 @@ mod tests {
             "plan follows the new id_token"
         );
         assert_eq!(c.openai_account_id.as_deref(), Some("acct-1"));
+        assert_eq!(c.refresh_expires_at, None);
 
         // Fresh now: no second call.
         assert_eq!(p.access_token(&fx.meta, false).await.unwrap(), "new-access");

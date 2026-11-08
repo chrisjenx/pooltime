@@ -15,7 +15,8 @@
 //! clients read `.error.message` everywhere. Status words are spec §4's, one per account in
 //! severity order (`needs_login | billing | access_denied | erroring | rate_limited | expiring |
 //! ready`); see [`crate::health::states`]. `expiring` carries its expiry in `until`, `erroring`
-//! its `class` and `count`; `counts` holds the dashboard banner's numbers.
+//! its `class` and `count`; `counts` holds the dashboard banner's numbers and
+//! `expiry_warn_secs` the warn window behind them.
 //!
 //! [`build_status`] is a pure function of [`StatusInputs`] and a clock, which is what makes the
 //! status shape snapshot-testable; [`gather`] does the I/O. For authorized requests (bearer or session cookie) the HTTP
@@ -507,6 +508,7 @@ pub fn build_status(inputs: &StatusInputs, now: OffsetDateTime) -> Value {
             "available": available,
         },
         "counts": banner_counts(inputs, now),
+        "expiry_warn_secs": inputs.expiry_warn.whole_seconds(),
         "tuning": tuning_json(&inputs.tuning),
         "mapping": mapping_json(inputs.mapping_enabled, &inputs.mappings, &inputs.inert_mappings),
         "version": env!("CARGO_PKG_VERSION"),

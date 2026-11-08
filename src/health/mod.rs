@@ -3,13 +3,19 @@
 //! # Expiry probe
 //! The recorded refresh-token expiry is only a clock. When it passes, [`ExpiryProbe::tick`] (run
 //! from the daemon's health tick, every [`HEALTH_TICK`], never on the request path) spends one
-//! *forced* refresh on the account, once per expiry value, through the provider's normal refresh
-//! path (so the dead-marker and single-flight gates apply):
+//! *forced* refresh on the account through the provider's normal refresh path (so the
+//! dead-marker and single-flight gates apply):
 //!
-//! - success: the account keeps working (`ready`/`expiring` by the clock);
+//! - success: the passed expiry is disproven and replaced by the server's new value (unknown if
+//!   it sent none), so the account is `ready` (or `expiring` by the new clock) and is not
+//!   probed again;
 //! - `invalid_grant` / `refresh_token_reused`: the refresh path marks the token dead, so the
 //!   account is `needs_login` (confirmed, and sidelined);
-//! - anything else (network, 5xx, ...): `erroring` until a success; never `needs_login`.
+//! - `account_on_hold`: the refresh path marks it `billing`;
+//! - anything else (network, 5xx, ...): `erroring`, never `needs_login`. The probe retries after
+//!   [`states::ERRORING_WINDOW`] (at most one token POST per 15 minutes per account while
+//!   unconfirmed), and the failure shows for [`states::PROBE_FAILURE_TTL`], so it stays visible
+//!   between retries but lapses if probing stops.
 //!
 //! An unknown expiry is never probed. Accounts already `needs_login` are skipped.
 
@@ -35,20 +41,27 @@ pub enum ProbeOutcome {
     Refreshed,
     /// The provider refused the refresh token: confirmed `needs_login`.
     NeedsLogin,
-    /// Unconfirmed failure (class, e.g. `refresh:server:503`): `erroring`.
+    /// The provider put the account on hold: `billing` (not a probe failure).
+    Billing,
+    /// Unconfirmed failure (class, e.g. `refresh:server:503`): `erroring`, retried later.
     Erroring(String),
 }
+
+/// Per account: the expiry value last probed, and when an unconfirmed (erroring) probe may be
+/// retried (`None` = settled for that expiry).
+type Probed = HashMap<AccountId, (OffsetDateTime, Option<OffsetDateTime>)>;
 
 /// Remembers which expiry value each account was probed for. In memory: a restart probes a
 /// still-expired account once more.
 #[derive(Default)]
 pub struct ExpiryProbe {
-    probed: Mutex<HashMap<AccountId, OffsetDateTime>>,
+    probed: Mutex<Probed>,
 }
 
 impl ExpiryProbe {
     /// Probe every account whose recorded expiry is at or before `now` and that was not probed
-    /// for that expiry yet. Returns what each probe concluded (empty when nothing was due).
+    /// for that expiry yet (or whose unconfirmed probe is due a retry). Returns what each probe
+    /// concluded (empty when nothing was due).
     pub async fn tick(
         &self,
         app: &AppState,
@@ -58,10 +71,12 @@ impl ExpiryProbe {
         for (meta, expiry) in due(app, now).await {
             {
                 let mut probed = self.probed.lock().unwrap_or_else(|e| e.into_inner());
-                if probed.get(&meta.id) == Some(&expiry) {
-                    continue;
+                if let Some((seen, retry_at)) = probed.get(&meta.id) {
+                    if *seen == expiry && retry_at.is_none_or(|r| now < r) {
+                        continue;
+                    }
                 }
-                probed.insert(meta.id.clone(), expiry);
+                probed.insert(meta.id.clone(), (expiry, None));
             }
             let Some(provider) = app.providers.get(&meta.provider) else {
                 continue;
@@ -72,6 +87,11 @@ impl ExpiryProbe {
             };
             if let ProbeOutcome::Erroring(class) = &outcome {
                 app.state.record_probe_failure(&meta.id, class, now);
+                let retry_at = now + states::ERRORING_WINDOW;
+                self.probed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(meta.id.clone(), (expiry, Some(retry_at)));
             }
             tracing::info!(
                 account = %meta.id,
@@ -109,6 +129,7 @@ async fn due(
 fn outcome_of(kind: RefreshErrorKind) -> ProbeOutcome {
     match kind {
         RefreshErrorKind::InvalidGrant | RefreshErrorKind::TokenReused => ProbeOutcome::NeedsLogin,
+        RefreshErrorKind::AccountOnHold => ProbeOutcome::Billing,
         other => ProbeOutcome::Erroring(FailReason::Refresh(other).detail()),
     }
 }

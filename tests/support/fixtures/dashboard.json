@@ -157,6 +157,7 @@
     }
   ],
   "counts": { "needs_login": 2, "expiring_today": 0, "expiring": 1 },
+  "expiry_warn_secs": 259200,
   "pool": {
     "seven_day_left_total": 2.21,
     "accounts": 7,

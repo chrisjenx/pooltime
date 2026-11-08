@@ -506,13 +506,29 @@ async fn doctor_trusts_a_ready_account_past_its_recorded_expiry() {
 
     let (ok, out) = tokio::task::block_in_place(|| {
         let _d = m.serve();
+        // Wait for the boot health tick's probe to land (it runs off the request path).
+        let reg = Registry::load(&m.paths()).unwrap();
+        let id = "work".parse().unwrap();
+        let start = Instant::now();
+        while reg
+            .read_creds(&id)
+            .unwrap()
+            .unwrap()
+            .refresh_expires_at
+            .is_some()
+        {
+            assert!(start.elapsed() < BOOT_BUDGET, "expiry probe never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         m.run(&["doctor"])
     });
+    // The daemon's expiry probe (health tick, at boot) refreshed the account successfully,
+    // which disproves the passed expiry and replaces it (Task F1): doctor sees a ready account.
     let l = line_with(&out, "account work:");
-    assert!(l.starts_with('!'), "{out}");
-    assert!(l.contains("still works"), "{out}");
+    assert!(l.starts_with('✓'), "{out}");
+    assert!(l.contains("ready"), "{out}");
     assert!(!out.lines().any(|l| l.starts_with('✗')), "{out}");
-    assert!(ok, "only warnings, so exit 0:\n{out}");
+    assert!(ok, "{out}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

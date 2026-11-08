@@ -41,8 +41,10 @@ pub(super) type InFlight = Shared<BoxFuture<'static, RefreshResult>>;
 /// Keyed by (account, force): a forced caller must not be satisfied by an unforced run.
 pub(super) type InFlightMap = Arc<Mutex<HashMap<(AccountId, bool), InFlight>>>;
 
-/// New `refresh_expires_at`: the earlier of the old value and `now + new_secs`. Either side may be
-/// absent; both absent stays absent.
+/// New `refresh_expires_at` after a *successful* refresh at `now`: the earlier of the old value
+/// and `now + new_secs`. Either side may be absent; both absent stays absent. An old value at or
+/// before `now` was disproven by this refresh succeeding, so it is replaced by the server's value
+/// (or becomes unknown when the server sent none).
 pub fn expiry_after_refresh(
     old: Option<OffsetDateTime>,
     new_secs: Option<i64>,
@@ -50,6 +52,7 @@ pub fn expiry_after_refresh(
 ) -> Option<OffsetDateTime> {
     let new = new_secs.map(|s| now + time::Duration::seconds(s.clamp(0, MAX_LIFETIME_SECS)));
     match (old, new) {
+        (Some(o), n) if o <= now => n,
         (Some(o), Some(n)) => Some(o.min(n)),
         (o, n) => o.or(n),
     }
@@ -885,11 +888,8 @@ mod tests {
         // Forced refresh still tries, succeeds, and the account stays ready.
         assert_eq!(p.access_token(&fx.meta, true).await.unwrap(), "still-works");
         assert_eq!(fx.status(), AccountStatus::Ready);
-        // The past refresh expiry is preserved (min rule), never acted on.
-        assert_eq!(
-            fx.creds().refresh_expires_at,
-            Some(datetime!(2020-01-01 0:00 UTC))
-        );
+        // The refresh disproved the passed expiry: with no server value it becomes unknown.
+        assert_eq!(fx.creds().refresh_expires_at, None);
     }
 
     #[tokio::test]
@@ -1096,6 +1096,17 @@ mod tests {
             Some(in_days(1))
         );
         assert_eq!(expiry_after_refresh(None, None, now), None);
+        // A passed old value was disproven by the successful refresh: the server's value
+        // replaces it (unknown when the server sent none). Exactly `now` counts as passed.
+        assert_eq!(
+            expiry_after_refresh(Some(in_days(-1)), Some(30 * 86_400), now),
+            Some(in_days(30))
+        );
+        assert_eq!(
+            expiry_after_refresh(Some(now), Some(86_400), now),
+            Some(in_days(1))
+        );
+        assert_eq!(expiry_after_refresh(Some(in_days(-1)), None, now), None);
         // Absurd server values cannot overflow date arithmetic.
         assert!(expiry_after_refresh(None, Some(i64::MAX), now).is_some());
     }
