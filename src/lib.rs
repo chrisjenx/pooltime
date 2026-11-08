@@ -4,6 +4,7 @@ pub mod config;
 pub mod errors;
 pub mod fsutil;
 pub mod logging;
+pub mod models;
 pub mod providers;
 pub mod routing;
 pub mod sse;
