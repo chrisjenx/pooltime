@@ -1,0 +1,62 @@
+# Intended differences between bro and pooltime (see harness/README.md).
+#
+# Each entry: `scenario`, `field`, `bro`, `pooltime` are anchored regexes (`<absent>` = the field is
+# missing on that side); `reason` says why the difference is intended; `source` cites the INV §10
+# item, spec §16 passage, docs/parity.md decision or ledger ruling it comes from. A pooltime bug is
+# never allowlisted: it is fixed in pooltime with a regression test (harness/fixed.toml).
+
+[[allow]]
+scenario = ".*"
+field = 'step\d+\.header\.x-pool-account'
+bro = "<absent>"
+pooltime = "[a-z0-9_-]+"
+reason = "bro drops X-Pool-Account when it replays the last failed attempt's response (exhausted pool, Codex terminal 5xx); pooltime names the account that produced the error. Which account was tried is compared through upstream.inference instead."
+source = "spec §16 Differential harness (X-Pool-Account is an expected difference)"
+
+[[allow]]
+scenario = "midstream_cut|codex_midstream_cut"
+field = 'step0\.end'
+bro = "clean"
+pooltime = "reset"
+reason = "Upstream resets after commit. bro errors its ReadableStream, but Bun still ends the chunked body cleanly, so the client cannot tell a truncated turn from a finished one; pooltime aborts the response (INV §1: EOF before a terminal event is a truncation and the stream errors) and logs it with account and request id."
+source = "INV §10.6 (mid-stream upstream failures left to the runtime)"
+
+[[allow]]
+scenario = "codex_failed_after_created"
+field = 'step0\.(status|header\.content-type|json|sse|end|pings)'
+bro = '200|text/event-stream|<absent>|message_start \| error:server_error|clean|none'
+pooltime = '502|application/json|error:api_error|<absent>'
+reason = "Codex pre-commit holds message_start: response.created then response.failed before any output is settled as a terminal 502 with an Anthropic error type, instead of a 200 carrying only message_start + an error frame with the raw Codex code."
+source = "docs/parity.md Decisions (Codex pre-commit holds message_start; Codex error types mapped to the Anthropic set), Task 38"
+
+[[allow]]
+scenario = "codex_server_error"
+field = 'upstream\.inference'
+bro = "responses@cx"
+pooltime = "responses@cx(, responses@cx){1,4}"
+reason = "Codex 5xx is retried on the same account with the overload backoff before it is surfaced as terminal (bro surfaced it on the first attempt). Neither tries the second Codex account, and the client status is the same."
+source = "docs/parity.md Decisions (Codex 5xx is terminal within the Codex pool, after a same-account backoff)"
+
+[[allow]]
+scenario = "codex_invalid_grant"
+field = 'account\.cx\.status'
+bro = "ready"
+pooltime = "needs_login"
+reason = "A Codex refresh rejected with invalid_grant marks the refresh token dead (needs login); bro has no Codex dead-refresh detection and keeps the account Ready, failing every request on it."
+source = "INV §10.4"
+
+[[allow]]
+scenario = "unknown_path"
+field = 'step0\.json'
+bro = 'json\{error\}'
+pooltime = "error:not_found_error"
+reason = "Unknown inbound paths get an Anthropic-shaped 404 error envelope (and are logged so new Claude Code endpoints show up); bro answers {\"error\":\"not found\"}."
+source = "spec §16 Errors (unknown inbound paths -> Anthropic-shaped 404 JSON)"
+
+[[allow]]
+scenario = ".*"
+field = 'step\d+\.header\.request-id'
+bro = ".*"
+pooltime = ".*"
+reason = "Request ids are per-request and expected to differ; when the whole pool is exhausted bro replays the last 429 body without the upstream headers while pooltime keeps the upstream request-id on it."
+source = "spec §16 Differential harness (request ids are an expected difference)"

@@ -1,0 +1,8 @@
+# pooltime bugs the differential harness found, each fixed with a regression test (rendered into
+# docs/harness-report.md). One [[fixed]] table per bug:
+#
+# [[fixed]]
+# scenario = "<scenario name>"
+# summary = "<what was wrong>"
+# commit = "<short sha> <subject>"
+# test = "tests/<file>.rs::<test name>"
