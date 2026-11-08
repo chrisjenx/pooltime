@@ -113,6 +113,28 @@ impl Store {
             .map_err(|_| anyhow!("store writer thread dropped the reply"))?
     }
 
+    /// Queue `f` on the writer thread without waiting for it (fire-and-forget).
+    /// Needs no async runtime. Jobs run in submission order, strictly serialized
+    /// with every `exec`, so `exec(|_| Ok(()))` afterwards acts as a flush. A
+    /// failing or panicking `f` is logged (`warn`), never propagated.
+    pub fn submit<F>(&self, f: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut Connection) -> anyhow::Result<()> + Send + 'static,
+    {
+        let job: Job = Box::new(
+            move |conn| match catch_unwind(AssertUnwindSafe(|| f(conn))) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %format!("{e:#}"), "queued store write failed")
+                }
+                Err(_) => tracing::warn!("queued store write panicked"),
+            },
+        );
+        self.tx
+            .send(job)
+            .map_err(|_| anyhow!("store writer thread has stopped"))
+    }
+
     /// Run `f` on a read-only connection. Blocking; keep it short.
     pub fn read<T>(&self, f: impl FnOnce(&Connection) -> anyhow::Result<T>) -> anyhow::Result<T> {
         let pooled = self.readers.lock().unwrap_or_else(|e| e.into_inner()).pop();
@@ -252,6 +274,34 @@ mod tests {
             .read(|c| Ok(c.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))?))
             .unwrap();
         assert_eq!(n, 100);
+    }
+
+    #[tokio::test]
+    async fn submit_runs_in_order_without_waiting_and_exec_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("pooltime.db")).unwrap();
+        for i in 0..50i64 {
+            store
+                .submit(move |c| {
+                    c.execute(
+                        "INSERT INTO alerts_sent(key, ts) VALUES ('k', ?1)
+                         ON CONFLICT(key) DO UPDATE SET ts = excluded.ts",
+                        [i],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        // failing and panicking jobs are swallowed and do not stop later ones
+        store.submit(|_| anyhow::bail!("nope")).unwrap();
+        store.submit(|_| panic!("boom")).unwrap();
+        store.exec(|_| Ok(())).await.unwrap(); // flush
+        let ts: i64 = store
+            .read(
+                |c| Ok(c.query_row("SELECT ts FROM alerts_sent WHERE key='k'", [], |r| r.get(0))?),
+            )
+            .unwrap();
+        assert_eq!(ts, 49);
     }
 
     #[tokio::test]
