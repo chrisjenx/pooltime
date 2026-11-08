@@ -36,9 +36,10 @@
 //!
 //! # Errors ([`finish`])
 //! In priority order: upstream error event; a tool call whose non-empty arguments are not a JSON
-//! object ([`StreamError::MalformedToolArgs`], deferred to `finish` and excused when the
-//! terminal was an incomplete/token-cap one); EOF without a terminal event; EOF without
-//! `message_start`. Error values never carry prompt/response content.
+//! object ([`StreamError::MalformedToolArgs`], deferred to `finish` and excused only when the
+//! terminal was a token-cap incomplete, reason `max_output_tokens`); EOF without a terminal
+//! event; EOF without `message_start`. Error values never carry prompt/response content, and
+//! neither does `Debug` (of the error, the translator or [`Finished`]).
 //!
 //! # Contract for the proxy (Task 38)
 //! - Feed each parsed upstream event to [`on_event`] and forward the returned frames. When it
@@ -50,14 +51,16 @@
 //!   real `response.created` then becomes a no-op. It returns empty bytes once started.
 //! - After every event check [`is_terminal`]; once true, stop reading upstream (tear down; do
 //!   not wait for EOF) and call [`finish`]. At EOF call [`finish`] too.
-//! - [`finish`] `Ok(frames)`: send them (closing stop for an open block, `message_delta`,
-//!   `message_stop`); success. `Err(e)`: if committed send `e.to_frame()` (the only error frame
-//!   — `on_event` never emits one); if not committed settle without streaming (never a lone
-//!   error frame inside a 200). [`StreamError::Upstream`] -> classify `error_type()`/`message()`
-//!   for rate limiting; the other variants are failover / terminal per Task 38.
-//! - Read [`usage`] and [`context_tokens`] before `finish` (it consumes `self`; neither changes
-//!   in `finish`). Record usage and `ContextCarry::record(context_tokens)` only when `finish`
-//!   (or [`into_message`]) is `Ok` and `context_tokens()` is `Some`.
+//! - [`finish`] `Ok(`[`Finished`]`)`: send its `frames` (closing stop for an open block,
+//!   `message_delta`, `message_stop`); success: record its `usage`, and
+//!   `ContextCarry::record(context_tokens)` when that is `Some`. `Err(e)`: if committed send
+//!   `e.to_frame()` (the only error frame — `on_event` never emits one); if not committed settle
+//!   without streaming (never a lone error frame inside a 200). [`StreamError::Upstream`] ->
+//!   classify `error_type()`/`message()` for rate limiting; the other variants are failover /
+//!   terminal per Task 38. The frame's error `type` is mapped onto the Anthropic set by
+//!   [`anthropic_error_type`].
+//! - For [`into_message`] read [`usage`] and [`context_tokens`] first (it consumes `self`);
+//!   record them only when it is `Ok`.
 //! - Non-streaming clients: [`into_message`] = `finish` checks + the folded message.
 //!
 //! [`finish`]: CodexToAnthropic::finish
@@ -73,7 +76,7 @@ use bytes::Bytes;
 use serde_json::{json, Map, Value};
 
 use crate::accounts::TokenUsage;
-use crate::providers::anthropic::codex_stash_signature;
+use crate::providers::anthropic::{codex_stash_signature, has_rate_limit_wording};
 use crate::sse::{encode, SseEvent};
 
 /// Cap on an upstream error message carried to the client.
@@ -81,9 +84,9 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 300;
 /// Cap on an upstream error type/code.
 const MAX_ERROR_TYPE_CHARS: usize = 64;
 
-/// Why a Codex stream did not end cleanly. `Display` names only the class (and the upstream
-/// error code), never upstream text.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// Why a Codex stream did not end cleanly. `Display` and `Debug` name only the class (and the
+/// upstream error code), never upstream text.
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StreamError {
     #[error("codex stream ended before a terminal event")]
     MissingTerminal,
@@ -97,11 +100,37 @@ pub enum StreamError {
     Upstream { type_: String, message: String },
 }
 
+impl std::fmt::Debug for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamError::MissingTerminal => f.write_str("MissingTerminal"),
+            StreamError::NoMessageStart => f.write_str("NoMessageStart"),
+            StreamError::MalformedToolArgs => f.write_str("MalformedToolArgs"),
+            StreamError::Upstream { type_, .. } => f
+                .debug_struct("Upstream")
+                .field("type_", type_)
+                .field("message", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
 impl StreamError {
-    /// Anthropic error `type` for the client frame.
+    /// The upstream error code/type as Codex sent it (≤ 64 chars; `api_error` for the
+    /// synthesized variants). For classification; the client frame carries
+    /// [`StreamError::anthropic_type`].
     pub fn error_type(&self) -> &str {
         match self {
             StreamError::Upstream { type_, .. } => type_,
+            _ => "api_error",
+        }
+    }
+
+    /// [`StreamError::error_type`] mapped onto the Anthropic error-type set
+    /// ([`anthropic_error_type`]).
+    pub fn anthropic_type(&self) -> &'static str {
+        match self {
+            StreamError::Upstream { type_, message } => anthropic_error_type(type_, message),
             _ => "api_error",
         }
     }
@@ -122,9 +151,76 @@ impl StreamError {
             "error",
             json!({
                 "type": "error",
-                "error": { "type": self.error_type(), "message": self.message() },
+                "error": { "type": self.anthropic_type(), "message": self.message() },
             }),
         )
+    }
+}
+
+/// Map a Codex / OpenAI error code or type onto the Anthropic error-type set
+/// (`rate_limit_error`, `overloaded_error`, `invalid_request_error`, `authentication_error`,
+/// `permission_error`, `not_found_error`, `request_too_large`, `api_error`). Rate-limit wording
+/// in the type or `message` (bro `isRateLimit`) wins; unknown codes are `api_error`.
+pub fn anthropic_error_type(codex_type: &str, message: &str) -> &'static str {
+    const ANTHROPIC: [&str; 8] = [
+        "rate_limit_error",
+        "overloaded_error",
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+        "request_too_large",
+        "api_error",
+    ];
+    let t = codex_type.to_ascii_lowercase();
+    if has_rate_limit_wording(&format!("{t}\n{message}"))
+        || matches!(
+            t.as_str(),
+            "usage_limit_reached" | "insufficient_quota" | "quota_exceeded"
+        )
+    {
+        return "rate_limit_error";
+    }
+    if let Some(known) = ANTHROPIC.iter().find(|k| **k == t) {
+        return known;
+    }
+    if t.contains("overload") || t == "slow_down" || t == "server_busy" {
+        "overloaded_error"
+    } else if t.contains("context_length")
+        || t.starts_with("invalid")
+        || t.contains("unsupported")
+        || t == "bad_request"
+    {
+        "invalid_request_error"
+    } else if t.contains("auth") || t.contains("api_key") {
+        "authentication_error"
+    } else if t.contains("permission") || t == "forbidden" {
+        "permission_error"
+    } else if t == "not_found" || t == "model_not_found" {
+        "not_found_error"
+    } else {
+        "api_error"
+    }
+}
+
+/// What a clean [`CodexToAnthropic::finish`] yields.
+#[derive(Clone)]
+pub struct Finished {
+    /// Closing frames: `content_block_stop` for an open block, `message_delta`, `message_stop`.
+    pub frames: Vec<Bytes>,
+    /// Account-view usage ([`CodexToAnthropic::usage`]).
+    pub usage: TokenUsage,
+    /// Context to carry into the next turn ([`CodexToAnthropic::context_tokens`]).
+    pub context_tokens: Option<u64>,
+}
+
+impl std::fmt::Debug for Finished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Finished")
+            .field("frames", &self.frames.len())
+            .field("usage", &self.usage)
+            .field("context_tokens", &self.context_tokens)
+            .finish()
     }
 }
 
@@ -164,14 +260,15 @@ impl Block {
     }
 }
 
-/// Translator state for one Codex response. See the module docs.
-#[derive(Debug, Clone)]
+/// Translator state for one Codex response. See the module docs. `Debug` shows flags and
+/// counters only, never accumulated content.
+#[derive(Clone)]
 pub struct CodexToAnthropic {
     model: String,
     msg_id: Option<String>,
     started: bool,
     terminal: bool,
-    /// Terminal was `incomplete` (token cap or content filter): malformed args are excused.
+    /// Terminal was a token-cap incomplete (`max_output_tokens`): malformed args are excused.
     incomplete: bool,
     stop_reason: Option<&'static str>,
     saw_tool_use: bool,
@@ -184,6 +281,24 @@ pub struct CodexToAnthropic {
     output_tokens: u64,
     cache_read: Option<u64>,
     terminal_usage: bool,
+}
+
+impl std::fmt::Debug for CodexToAnthropic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexToAnthropic")
+            .field("started", &self.started)
+            .field("terminal", &self.terminal)
+            .field("incomplete", &self.incomplete)
+            .field("stop_reason", &self.stop_reason)
+            .field("blocks", &self.blocks.len())
+            .field("open", &self.open)
+            .field("args_error", &self.args_error)
+            .field("upstream_error", &self.upstream_error)
+            .field("input_tokens", &self.input_tokens)
+            .field("output_tokens", &self.output_tokens)
+            .field("cache_read", &self.cache_read)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CodexToAnthropic {
@@ -234,7 +349,7 @@ impl CodexToAnthropic {
     }
 
     /// End of the response (terminal event seen or upstream EOF). See the module docs.
-    pub fn finish(mut self) -> Result<Vec<Bytes>, StreamError> {
+    pub fn finish(mut self) -> Result<Finished, StreamError> {
         let mut frames = self.close_block(None);
         self.check()?;
         frames.push(frame(
@@ -246,7 +361,11 @@ impl CodexToAnthropic {
             }),
         ));
         frames.push(frame("message_stop", json!({ "type": "message_stop" })));
-        Ok(frames)
+        Ok(Finished {
+            frames,
+            usage: self.usage(),
+            context_tokens: self.context_tokens(),
+        })
     }
 
     /// Account-view usage: input includes cached tokens (0 without terminal input usage).
@@ -386,13 +505,16 @@ impl CodexToAnthropic {
                 let status_incomplete =
                     response.get("status").and_then(Value::as_str) == Some("incomplete");
                 if status_incomplete || ty == "response.incomplete" {
-                    // Truncation must not read as a clean finish; truncated tool args are
-                    // expected under a token cap and the stop reason already says so.
-                    self.incomplete = true;
-                    self.args_error = false;
+                    // Truncation must not read as a clean finish. Truncated tool args are
+                    // expected under a token cap (the stop reason already says so), but not
+                    // under any other incompleteness, e.g. a content filter (INV §4).
                     let reason = response
                         .pointer("/incomplete_details/reason")
                         .and_then(Value::as_str);
+                    if reason == Some("max_output_tokens") {
+                        self.incomplete = true;
+                        self.args_error = false;
+                    }
                     self.stop_reason = Some(if reason == Some("content_filter") {
                         "refusal"
                     } else {

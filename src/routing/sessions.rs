@@ -35,8 +35,15 @@ pub struct Sessions {
     map: Mutex<HashMap<String, Entry>>,
 }
 
-fn key(provider: ProviderId, user_id: &str) -> String {
+/// The hashed key of a client session on `provider`: `hash_session("<provider>:<user_id>")`.
+/// Shared by sticky sessions and the Codex context carry so both key a session identically and
+/// never hold the raw user id.
+pub fn session_key(provider: ProviderId, user_id: &str) -> String {
     hash_session(&format!("{provider}:{user_id}"))
+}
+
+fn key(provider: ProviderId, user_id: &str) -> String {
+    session_key(provider, user_id)
 }
 
 impl Sessions {
