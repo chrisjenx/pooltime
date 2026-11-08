@@ -31,6 +31,32 @@ struct ProfileAccount {
 #[derive(Deserialize)]
 struct ProfileOrg {
     uuid: Option<String>,
+    organization_type: Option<String>,
+    rate_limit_tier: Option<String>,
+}
+
+/// What `/api/oauth/profile` told us about a token: who, and which plan.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProfileInfo {
+    /// May be empty of uuid and email (callers decide whether that is usable).
+    pub identity: Identity,
+    /// `organization.organization_type` mapped to pooltime's plan names (see [`plan_name`]).
+    pub plan: Option<String>,
+    /// `organization.rate_limit_tier`.
+    pub tier: Option<String>,
+}
+
+/// `claude_max` -> `max`, `claude_pro` -> `pro`, `claude_team` -> `team`, `claude_enterprise` ->
+/// `enterprise` (docs/spikes.md S1); anything else verbatim.
+pub fn plan_name(organization_type: &str) -> String {
+    match organization_type {
+        "claude_max" => "max",
+        "claude_pro" => "pro",
+        "claude_team" => "team",
+        "claude_enterprise" => "enterprise",
+        other => other,
+    }
+    .to_string()
 }
 
 /// `GET {api_base}/api/oauth/profile` with `token`, as Claude Code does (Bearer, its UA,
@@ -42,6 +68,21 @@ pub async fn fetch_identity(
     token: &str,
     ua: &str,
 ) -> anyhow::Result<Identity> {
+    let id = fetch_profile(up, api_base, token, ua).await?.identity;
+    if id.account_uuid.is_none() && id.email.is_none() {
+        bail!("profile response carries no account identity");
+    }
+    Ok(id)
+}
+
+/// Like [`fetch_identity`] but also returns the plan and tier, and does not insist on an
+/// identity being present.
+pub async fn fetch_profile(
+    up: &Upstream,
+    api_base: &str,
+    token: &str,
+    ua: &str,
+) -> anyhow::Result<ProfileInfo> {
     let url: reqwest::Url = join_url(api_base, "/api/oauth/profile")
         .parse()
         .context("profile URL is not valid")?;
@@ -93,15 +134,19 @@ pub async fn fetch_identity(
         .account
         .map(|a| (nonempty(a.uuid), nonempty(a.email)))
         .unwrap_or_default();
-    let id = Identity {
-        account_uuid,
-        email,
-        org_uuid: p.organization.and_then(|o| nonempty(o.uuid)),
-    };
-    if id.account_uuid.is_none() && id.email.is_none() {
-        bail!("profile response carries no account identity");
-    }
-    Ok(id)
+    let org = p.organization;
+    Ok(ProfileInfo {
+        identity: Identity {
+            account_uuid,
+            email,
+            org_uuid: org.as_ref().and_then(|o| nonempty(o.uuid.clone())),
+        },
+        plan: org
+            .as_ref()
+            .and_then(|o| nonempty(o.organization_type.clone()))
+            .map(|t| plan_name(&t)),
+        tier: org.and_then(|o| nonempty(o.rate_limit_tier)),
+    })
 }
 
 /// Outcome of comparing a fresh login's identity with the account's stored baseline.
@@ -154,6 +199,15 @@ mod tests {
             email: email.map(Into::into),
             org_uuid: org.map(Into::into),
         }
+    }
+
+    #[test]
+    fn plan_names() {
+        assert_eq!(plan_name("claude_max"), "max");
+        assert_eq!(plan_name("claude_pro"), "pro");
+        assert_eq!(plan_name("claude_team"), "team");
+        assert_eq!(plan_name("claude_enterprise"), "enterprise");
+        assert_eq!(plan_name("something_new"), "something_new");
     }
 
     #[test]

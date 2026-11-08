@@ -11,7 +11,7 @@ pub mod status;
 
 pub use creds::{Credentials, CredsError};
 pub use id::{AccountId, InvalidAccountId};
-pub use identity::{fetch_identity, verify, Verify};
+pub use identity::{fetch_identity, fetch_profile, plan_name, verify, ProfileInfo, Verify};
 pub use registry::{AccountMeta, Identity, Registry, TimedOverride};
 pub use status::{
     AccountState, AccountStatus, Counters, ErrorRecord, RateLimitSnapshot, StateBook, TokenUsage,
