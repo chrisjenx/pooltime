@@ -1,0 +1,18 @@
+---
+source: tests/service.rs
+expression: "render_systemd_unit(Path::new(\"/usr/local/bin/pooltime\"), &fake_paths())"
+---
+[Unit]
+Description=pooltime: pooled Claude and Codex accounts behind one local endpoint
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pooltime serve
+Environment=POOLTIME_HOME=/Users/test/.pooltime
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=600
+
+[Install]
+WantedBy=default.target
