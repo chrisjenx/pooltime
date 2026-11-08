@@ -300,6 +300,8 @@ pub struct StatusInputs {
     pub tuning: Tuning,
     pub mapping_enabled: bool,
     pub mappings: Vec<Mapping>,
+    /// `from` families of mappings whose target is missing ([`crate::models::ModelTable::inert_mappings`]).
+    pub inert_mappings: Vec<String>,
 }
 
 fn round4(x: f64) -> f64 {
@@ -406,11 +408,28 @@ fn tuning_json(t: &Tuning) -> Value {
     })
 }
 
-fn mapping_json(enabled: bool, mappings: &[Mapping]) -> Value {
-    json!({
-        "enabled": enabled,
-        "mappings": serde_json::to_value(mappings).unwrap_or(Value::Null),
-    })
+/// The mapping block; a row whose target is missing (`inert`, by `from` family) carries
+/// `"inert": true` (it falls back to passthrough until the target exists).
+fn mapping_json(enabled: bool, mappings: &[Mapping], inert: &[String]) -> Value {
+    let rows: Vec<Value> = mappings
+        .iter()
+        .map(|m| {
+            let mut v = serde_json::to_value(m).unwrap_or(Value::Null);
+            if inert.contains(&m.from) {
+                v["inert"] = json!(true);
+            }
+            v
+        })
+        .collect();
+    json!({ "enabled": enabled, "mappings": rows })
+}
+
+/// `from` families of the table's inert mappings.
+fn inert_families(t: &crate::models::ModelTable) -> Vec<String> {
+    t.inert_mappings()
+        .into_iter()
+        .map(|m| m.from.clone())
+        .collect()
 }
 
 /// The `GET /api/v1/status` document at `now`. Pure: no clock, no I/O.
@@ -441,7 +460,7 @@ pub fn build_status(inputs: &StatusInputs, now: OffsetDateTime) -> Value {
             "available": available,
         },
         "tuning": tuning_json(&inputs.tuning),
-        "mapping": mapping_json(inputs.mapping_enabled, &inputs.mappings),
+        "mapping": mapping_json(inputs.mapping_enabled, &inputs.mappings, &inputs.inert_mappings),
         "version": env!("CARGO_PKG_VERSION"),
         "now": ts(now),
     })
@@ -516,15 +535,20 @@ pub async fn gather(app: &Arc<AppState>, now: OffsetDateTime) -> Result<StatusIn
             .collect::<Vec<_>>()
     })
     .await?;
-    let (mapping_enabled, mappings) = {
+    let (mapping_enabled, mappings, inert_mappings) = {
         let models = app.models.read().unwrap_or_else(|e| e.into_inner());
-        (models.mapping_enabled(), models.mappings().to_vec())
+        (
+            models.mapping_enabled(),
+            models.mappings().to_vec(),
+            inert_families(&models),
+        )
     };
     Ok(StatusInputs {
         accounts,
         tuning: app.tuning(),
         mapping_enabled,
         mappings,
+        inert_mappings,
     })
 }
 
@@ -975,7 +999,11 @@ async fn mappings(State(app): State<Arc<AppState>>, headers: HeaderMap, body: Bo
             tracing::error!(error = %format!("{e:#}"), "could not save models.toml");
             internal("could not save models.toml")
         })?;
-        let out = mapping_json(next.mapping_enabled(), next.mappings());
+        let out = mapping_json(
+            next.mapping_enabled(),
+            next.mappings(),
+            &inert_families(&next),
+        );
         *live = next;
         Ok(out)
     })
@@ -1287,22 +1315,25 @@ async fn profiles_disconnect(
 /// discovery (runtime rows, applied live), independently of each other, then re-derive the pins
 /// of every connected profile.
 ///
-/// A failed Claude fetch keeps the last good list for the listing and is reported as a classified
-/// `live_error` with `live: 0`. The Codex outcome is under `codex`: `{accounts, added, updated,
-/// failed: [{account, reason}]}`, or `{error}` when every account failed. 502 (classified reasons
-/// only) when every catalog that was asked failed; 503 when neither provider runs.
+/// A failed Claude fetch keeps the last good list for the listing (`models` is what `/v1/models`
+/// serves) and is reported as a classified `live_error` with `live: 0`. The Codex outcome is
+/// under `codex`: `{accounts, added, updated, failed: [{account, reason}]}`, or `{error}` when
+/// every account failed. Codex counts as answered only with `accounts > 0`. 502 (classified
+/// reasons only) when no catalog answered; 503 when neither provider runs.
 async fn models_refresh(State(app): State<Arc<AppState>>) -> Response {
     let anthropic = app.providers.get(&ProviderId::Anthropic).cloned();
     let has_openai = app.providers.contains_key(&ProviderId::OpenAi);
     if anthropic.is_none() && !has_openai {
         return anthropic_error(503, "api_error", "pooltime: no model provider is running");
     }
-    let live = match anthropic {
+    let live = match &anthropic {
         Some(p) => Some(p.refresh_live_models().await),
         None => None,
     };
     let discovery = if has_openai {
-        Some(crate::providers::openai::discover_codex_models(&app).await)
+        let d = crate::providers::openai::discover_codex_models(&app).await;
+        crate::providers::openai::warn_inert_mappings(&app);
+        Some(d)
     } else {
         None
     };
@@ -1315,25 +1346,38 @@ async fn models_refresh(State(app): State<Arc<AppState>>) -> Response {
         .and_then(|r| r.as_ref().err())
         .map(|e| format!("{e:#}"));
     let live_ok = live.as_ref().is_some_and(|r| r.is_ok());
-    let codex_ok = discovery.as_ref().is_some_and(|r| r.is_ok());
+    // Codex counts as answered only when at least one ChatGPT account was asked.
+    let codex_ok = matches!(&discovery, Some(Ok(d)) if d.accounts > 0);
     if !live_ok && !codex_ok {
-        let reasons: Vec<String> = [live_err, codex_err].into_iter().flatten().collect();
+        let mut reasons: Vec<String> = [live_err, codex_err].into_iter().flatten().collect();
+        if reasons.is_empty() {
+            reasons.push("no model catalog could be asked".into());
+        }
         return anthropic_error(
             502,
             "api_error",
             &format!("pooltime: {}", reasons.join("; ")),
         );
     }
-    let live = live.and_then(Result::ok);
+    let live_n = live
+        .as_ref()
+        .and_then(|r| r.as_ref().ok())
+        .map_or(0, Vec::len);
+    // What `/v1/models` serves: after a failed refresh, the last good (cached) live list.
+    let listed_live = match (live.and_then(Result::ok), &anthropic) {
+        (Some(l), _) => Some(l),
+        (None, Some(p)) => p.live_models().await.ok(),
+        (None, None) => None,
+    }
+    .filter(|v| !v.is_empty());
     let codex = discovery.map(codex_json);
     let ids: Vec<Value> = {
         let table = app.models.read().unwrap_or_else(|e| e.into_inner());
-        build_listing(live.as_deref(), &table.rows_for_listing())
+        build_listing(listed_live.as_deref(), &table.rows_for_listing())
             .into_iter()
             .map(|m| m["id"].clone())
             .collect()
     };
-    let live_n = live.as_ref().map_or(0, Vec::len);
     let mut out = json!({ "ok": true, "live": live_n, "models": ids });
     if let Some(e) = live_err {
         out["live_error"] = json!(e);

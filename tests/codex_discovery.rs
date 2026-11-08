@@ -394,12 +394,139 @@ async fn additive_only() {
     assert!(row(&srv.app.models.read().unwrap(), "gpt-new").is_some());
 }
 
+/// Production registers both providers. With no ChatGPT account, Codex was not asked, so a Claude
+/// failure is a failed refresh (502), not a success.
+#[tokio::test]
+async fn claude_failure_without_codex_accounts_is_502() {
+    let claude = FakeAnthropic::start().await;
+    claude.route("/v1/models", |_, _| {
+        Reply::error(500, "api_error", "SECRET boom")
+    });
+    let fake = FakeOpenAi::start().await;
+    let pool = Pool::new(); // only the Anthropic `work` account
+    let (policy, _) = fast_policy();
+    let srv = pool
+        .boot(
+            Boot::default()
+                .provider(Arc::new(pool.provider(&claude, policy)))
+                .provider(boxed(provider(&pool, &fake))),
+        )
+        .await;
+    let r = mgmt_post(srv.addr, "/api/v1/models/refresh").await;
+    assert_eq!(r.status, 502, "{}", r.text());
+    assert!(r.text().contains("status:500"), "{}", r.text());
+    assert!(!r.text().contains("SECRET"), "{}", r.text());
+    assert!(fake.requests_to(MODELS).is_empty());
+}
+
+/// A mapping whose target is not (yet) a row stays a passthrough, is flagged `inert` in the
+/// status listing, and warned about after a discovery run; discovering the target activates it.
+#[tokio::test]
+async fn mapping_to_missing_row_is_flagged_inert() {
+    let fake = FakeOpenAi::start().await;
+    fake.script(
+        MODELS,
+        vec![catalog(vec![model_entry(
+            "gpt-later",
+            "list",
+            &["low"],
+            None,
+            None,
+        )])],
+    );
+    let pool = Pool::new().without_default_account();
+    add_codex_account(&pool, "a", 1, TOKEN_A);
+    let table = ModelTable::from_toml_str(
+        r#"
+        mapping_enabled = true
+        [[mappings]]
+        from = "opus"
+        to = "gpt-later"
+        "#,
+    );
+    let srv = pool
+        .boot(Boot {
+            models: Some(table),
+            ..Boot::default().provider(boxed(provider(&pool, &fake)))
+        })
+        .await;
+    let opus = |v: &Value| -> Value {
+        v["mapping"]["mappings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["from"] == "opus")
+            .unwrap()
+            .clone()
+    };
+    let v = http_get(srv.addr, "/api/v1/status", &[]).await.json();
+    assert_eq!(opus(&v)["inert"], true, "{v}");
+    let sonnet = v["mapping"]["mappings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["from"] == "sonnet")
+        .unwrap()
+        .clone();
+    assert!(sonnet.get("inert").is_none(), "{sonnet}");
+    // Passthrough fallback: no mapped route while the target is missing.
+    assert!(srv
+        .app
+        .models
+        .read()
+        .unwrap()
+        .mapped_route("claude-opus-5")
+        .is_none());
+
+    // A discovery run that still lacks the target warns (mapping and target only).
+    fake.script(MODELS, vec![catalog(vec![])]);
+    refresh_codex_catalog(&srv.app).await;
+    assert!(captured_logs().lines().any(|l| l.contains("inert")
+        && l.contains("\"from\":\"opus\"")
+        && l.contains("\"to\":\"gpt-later\"")));
+
+    // Once discovered, the mapping is live and no longer inert.
+    fake.script(
+        MODELS,
+        vec![catalog(vec![model_entry(
+            "gpt-later",
+            "list",
+            &["low"],
+            None,
+            None,
+        )])],
+    );
+    refresh_codex_catalog(&srv.app).await;
+    let v = http_get(srv.addr, "/api/v1/status", &[]).await.json();
+    assert!(opus(&v).get("inert").is_none(), "{v}");
+    assert_eq!(
+        srv.app
+            .models
+            .read()
+            .unwrap()
+            .mapped_route("claude-opus-5")
+            .unwrap()
+            .def
+            .upstream_model,
+        "gpt-later"
+    );
+}
+
 /// Claude's live catalog failing does not stop Codex discovery (both providers registered).
 #[tokio::test]
 async fn refresh_runs_codex_discovery_when_claude_catalog_fails() {
     let claude = FakeAnthropic::start().await;
-    claude.route("/v1/models", |_, _| {
-        Reply::error(500, "api_error", "SECRET boom")
+    // The first listing succeeds (a last good live list), every later fetch fails.
+    claude.route("/v1/models", |_, i| {
+        if i == 0 {
+            Reply::json(
+                200,
+                &json!({"data": [{"id": "claude-live-x", "created_at": "2026-06-01T00:00:00Z"}],
+                        "has_more": false}),
+            )
+        } else {
+            Reply::error(500, "api_error", "SECRET boom")
+        }
     });
     let fake = FakeOpenAi::start().await;
     fake.script(
@@ -422,10 +549,21 @@ async fn refresh_runs_codex_discovery_when_claude_catalog_fails() {
                 .provider(boxed(provider(&pool, &fake))),
         )
         .await;
+    assert!(listed(&http_get(srv.addr, "/v1/models", &[]).await).contains(&"claude-live-x".into()));
     let r = mgmt_post(srv.addr, "/api/v1/models/refresh").await;
     assert_eq!(r.status, 200, "{}", r.text());
     let v = r.json();
     assert_eq!(v["live"], 0);
+    // `models` is what /v1/models serves: the last good live list plus the table.
+    let served = listed(&http_get(srv.addr, "/v1/models", &[]).await);
+    let reported: Vec<String> = v["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(reported, served);
+    assert!(reported.contains(&"claude-live-x".into()), "{v}");
     assert!(
         v["live_error"].as_str().unwrap().contains("status:500"),
         "{v}"

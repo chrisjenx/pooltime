@@ -220,8 +220,25 @@ impl ModelTable {
         Ok(())
     }
 
+    /// Mappings whose target is not a row and not a Claude id (an Anthropic opt-out), e.g. a Codex
+    /// model not (yet) discovered. They fall back to passthrough until the target appears. Listed
+    /// whether or not mapping is enabled; opt-outs (`to == from`) are never inert.
+    pub fn inert_mappings(&self) -> Vec<&Mapping> {
+        self.mappings
+            .iter()
+            .filter(|m| {
+                m.to != m.from
+                    && find_row(&self.rows, &m.to).is_none()
+                    && family_of(&m.to).is_none()
+            })
+            .collect()
+    }
+
     /// Add routes whose id is not yet present (never replaces); returns how many were added.
-    pub fn add_discovered(&mut self, defs: Vec<RouteDef>) -> usize {
+    /// Persisted by [`Self::save`] like user rows (test helper; discovery uses
+    /// [`Self::merge_discovered`], whose rows are runtime-only).
+    #[cfg(test)]
+    pub(crate) fn add_discovered(&mut self, defs: Vec<RouteDef>) -> usize {
         let mut added = 0;
         for d in defs {
             if self.rows.iter().all(|r| r.id != d.id) {

@@ -28,8 +28,8 @@ mod usage;
 pub mod windows;
 
 pub use catalog::{
-    discover_codex_models, refresh_codex_catalog, CodexDiscovery, CATALOG_REFRESH_EVERY,
-    CATALOG_TIMEOUT, CODEX_CLIENT_VERSION, MODELS_PATH,
+    discover_codex_models, refresh_codex_catalog, warn_inert_mappings, CodexDiscovery,
+    CATALOG_REFRESH_EVERY, CATALOG_TIMEOUT, CODEX_CLIENT_VERSION, MODELS_PATH,
 };
 pub use usage::{map_codex_usage, spawn_usage_sweeper};
 
