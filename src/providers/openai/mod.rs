@@ -5,7 +5,8 @@
 //! [`crate::signin::openai`]. Task 36/37 add request ([`translate_req`]) and stream
 //! ([`translate_stream`]) translation; Task 38 adds `impl Provider` ([`proxy`]: the upstream
 //! call and response classification, [`windows`]: rate-limit headers, [`stream`]: pre-commit
-//! buffering, the keep-alive pump and non-streaming folding).
+//! buffering, the keep-alive pump and non-streaming folding). Task 39 adds the `wham/usage` poll
+//! and its sweeper ([`usage`]) and `codex/models` catalog discovery with hot reload ([`catalog`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,13 +17,21 @@ use crate::config::OpenAiCfg;
 use crate::providers::anthropic::OverloadPolicy;
 use crate::upstream::Upstream;
 
+mod catalog;
 mod context;
 mod oauth;
 mod proxy;
 mod stream;
 mod translate_req;
 mod translate_stream;
+mod usage;
 pub mod windows;
+
+pub use catalog::{
+    discover_codex_models, refresh_codex_catalog, CodexDiscovery, CATALOG_REFRESH_EVERY,
+    CATALOG_TIMEOUT, CODEX_CLIENT_VERSION, MODELS_PATH,
+};
+pub use usage::{map_codex_usage, spawn_usage_sweeper};
 
 pub use context::ContextCarry;
 #[cfg(test)]
@@ -61,11 +70,18 @@ pub struct OpenAiProvider {
     keepalive: Duration,
     /// Previous-turn context per (session, route) (see [`context`]).
     carry: ContextCarry,
+    /// `wham/usage` polling on/off, its per-account TTL and per-request bound (see [`usage`]).
+    usage_refresh: bool,
+    usage_ttl: Duration,
+    usage_fetch_timeout: Duration,
+    /// One in-flight usage poll per account within this process (see [`usage`]).
+    usage_gates: Mutex<HashMap<AccountId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl OpenAiProvider {
     /// Defaults: 300 s skew, 30 s token timeout (the `Timeouts` defaults), default overload
-    /// policy, 1 h rate-limit cooldown, 1 s keep-alive; override with the `with_*` builders.
+    /// policy, 1 h rate-limit cooldown, 1 s keep-alive, usage polling on with a 120 s TTL and a
+    /// 2.5 s bound (the `[anthropic]` usage defaults); override with the `with_*` builders.
     pub fn new(
         cfg: OpenAiCfg,
         reg: Arc<Registry>,
@@ -85,6 +101,10 @@ impl OpenAiProvider {
             rate_limit_cooldown: time::Duration::hours(1),
             keepalive: DEFAULT_KEEPALIVE,
             carry: ContextCarry::new(),
+            usage_refresh: true,
+            usage_ttl: Duration::from_secs(120),
+            usage_fetch_timeout: Duration::from_millis(2500),
+            usage_gates: Mutex::new(HashMap::new()),
         }
     }
 
@@ -93,6 +113,16 @@ impl OpenAiProvider {
     pub fn with_refresh_timing(mut self, skew: Duration, timeout: Duration) -> Self {
         self.skew = time::Duration::try_from(skew).unwrap_or(time::Duration::MAX);
         self.refresh_timeout = timeout;
+        self
+    }
+
+    /// `wham/usage` polling: on/off, the minimum time between two polls of one account, and the
+    /// per-request bound (floored at 250 ms). The daemon passes the shared `[anthropic]`
+    /// `usage_refresh` / `usage_ttl` / `usage_fetch_timeout` knobs (bro shares them too).
+    pub fn with_usage_timing(mut self, enabled: bool, ttl: Duration, timeout: Duration) -> Self {
+        self.usage_refresh = enabled;
+        self.usage_ttl = ttl;
+        self.usage_fetch_timeout = timeout;
         self
     }
 }

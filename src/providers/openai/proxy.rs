@@ -172,7 +172,7 @@ impl OpenAiProvider {
     }
 
     /// The stored ChatGPT account id (read off the async runtime). `None` when unknown.
-    async fn chatgpt_account_id(&self, id: &AccountId) -> Option<String> {
+    pub(super) async fn chatgpt_account_id(&self, id: &AccountId) -> Option<String> {
         let (reg, id) = (self.reg.clone(), id.clone());
         tokio::task::spawn_blocking(move || reg.read_creds(&id))
             .await
@@ -293,7 +293,7 @@ impl OpenAiProvider {
 
     /// Token for the resend after a 401/403 on `rejected`: someone else's fresh rotation if there
     /// is one, otherwise a forced refresh.
-    async fn token_after_reject(
+    pub(super) async fn token_after_reject(
         &self,
         acct: &AccountMeta,
         rejected: &str,
@@ -426,14 +426,15 @@ impl Provider for OpenAiProvider {
         self.attempt_responses(ctx, req, state).await
     }
 
-    async fn poll_usage(&self, _acct: &AccountMeta) -> Result<RateLimitSnapshot, UsageError> {
-        // TODO(Task 39): `wham/usage` poll.
-        Err(UsageError::NotSupported)
+    async fn poll_usage(&self, acct: &AccountMeta) -> Result<RateLimitSnapshot, UsageError> {
+        OpenAiProvider::poll_usage(self, acct).await
     }
 
-    async fn catalog(&self, _acct: &AccountMeta) -> anyhow::Result<Vec<RouteDef>> {
-        // TODO(Task 39): `codex/models` discovery. Until then the bundled rows serve.
-        Ok(Vec::new())
+    async fn catalog(&self, acct: &AccountMeta) -> anyhow::Result<Vec<RouteDef>> {
+        // The error carries only a classified reason (see `catalog`).
+        OpenAiProvider::fetch_catalog(self, acct)
+            .await
+            .map_err(|reason| anyhow::anyhow!(reason))
     }
 }
 

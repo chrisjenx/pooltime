@@ -22,7 +22,7 @@ use crate::models::ModelTable;
 use crate::providers::anthropic::{
     spawn_usage_sweeper, AnthropicProvider, OverloadPolicy, SWEEP_INTERVAL,
 };
-use crate::providers::openai::OpenAiProvider;
+use crate::providers::openai::{self, OpenAiProvider, CATALOG_REFRESH_EVERY};
 use crate::providers::{Provider, ProviderId};
 use crate::routing::reserve::Reservations;
 use crate::routing::sessions::Sessions;
@@ -99,14 +99,20 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
         .with_refresh_timing(t.token_refresh_skew, t.token_refresh_timeout)
         .with_rate_limit_cooldown(t.rate_limit_cooldown)
         .with_overload_policy(overload)
-        .with_keepalive(t.stream_keepalive),
+        .with_keepalive(t.stream_keepalive)
+        // Codex usage polling shares the `[anthropic]` usage knobs (like bro's single setting).
+        .with_usage_timing(
+            cfg.anthropic.usage_refresh,
+            cfg.anthropic.usage_ttl,
+            cfg.anthropic.usage_fetch_timeout,
+        ),
     );
     let providers: HashMap<ProviderId, Arc<dyn Provider>> = HashMap::from([
         (
             ProviderId::Anthropic,
             anthropic.clone() as Arc<dyn Provider>,
         ),
-        (ProviderId::OpenAi, openai as Arc<dyn Provider>),
+        (ProviderId::OpenAi, openai.clone() as Arc<dyn Provider>),
     ]);
 
     let retention_cfg = cfg.retention.clone();
@@ -136,6 +142,16 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
     );
     let tasks = Tasks(vec![
         spawn_usage_sweeper(anthropic, SWEEP_INTERVAL),
+        openai::spawn_usage_sweeper(openai, SWEEP_INTERVAL),
+        // Codex catalog discovery: at boot (providers are registered by now), then hourly. New
+        // routes go live in the model table and trigger a profile re-sync.
+        spawn_every(CATALOG_REFRESH_EVERY, {
+            let app = app.clone();
+            move || {
+                let app = app.clone();
+                async move { openai::refresh_codex_catalog(&app).await }
+            }
+        }),
         crate::claude_code::spawn_profile_sync(app.clone()),
         spawn_every(SESSION_PRUNE_EVERY, move || {
             sessions.prune(OffsetDateTime::now_utc());

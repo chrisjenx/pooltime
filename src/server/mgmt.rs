@@ -1283,25 +1283,44 @@ async fn profiles_disconnect(
     }
 }
 
-/// Re-fetch the live Claude catalog now (bypassing the listing cache), then re-derive the pins
-/// of every connected profile from it. A failed fetch is a 502 carrying only a classified reason;
-/// the last good list keeps being served.
+/// Re-fetch the live Claude catalog now (bypassing the listing cache) and run Codex catalog
+/// discovery (new routes go live and are persisted), then re-derive the pins of every connected
+/// profile. A failed Claude fetch is a 502 carrying only a classified reason (nothing changes; the
+/// last good list keeps being served). The Codex outcome is reported under `codex`:
+/// `{accounts, added, failed: [{account, reason}]}`, or `{accounts, error}` when every account
+/// failed. 503 when neither provider runs.
 async fn models_refresh(State(app): State<Arc<AppState>>) -> Response {
-    let Some(provider) = app.providers.get(&ProviderId::Anthropic).cloned() else {
-        return anthropic_error(503, "api_error", "pooltime: no Claude provider is running");
+    let anthropic = app.providers.get(&ProviderId::Anthropic).cloned();
+    let has_openai = app.providers.contains_key(&ProviderId::OpenAi);
+    if anthropic.is_none() && !has_openai {
+        return anthropic_error(503, "api_error", "pooltime: no model provider is running");
+    }
+    let live = match anthropic {
+        Some(p) => match p.refresh_live_models().await {
+            Ok(live) => Some(live),
+            Err(e) => return anthropic_error(502, "api_error", &format!("pooltime: {e:#}")),
+        },
+        None => None,
     };
-    let live = match provider.refresh_live_models().await {
-        Ok(live) => live,
-        Err(e) => return anthropic_error(502, "api_error", &format!("pooltime: {e:#}")),
+    let codex = if has_openai {
+        Some(codex_json(
+            crate::providers::openai::discover_codex_models(&app).await,
+        ))
+    } else {
+        None
     };
     let ids: Vec<Value> = {
         let table = app.models.read().unwrap_or_else(|e| e.into_inner());
-        build_listing(Some(&live), &table.rows_for_listing())
+        build_listing(live.as_deref(), &table.rows_for_listing())
             .into_iter()
             .map(|m| m["id"].clone())
             .collect()
     };
-    let mut out = json!({ "ok": true, "live": live.len(), "models": ids });
+    let live_n = live.as_ref().map_or(0, Vec::len);
+    let mut out = json!({ "ok": true, "live": live_n, "models": ids });
+    if let Some(c) = codex {
+        out["codex"] = c;
+    }
     match crate::claude_code::sync_once(&app).await {
         Ok(v) => out["profiles_synced"] = json!(v.len()),
         Err(e) => {
@@ -1311,8 +1330,22 @@ async fn models_refresh(State(app): State<Arc<AppState>>) -> Response {
             out["sync_error"] = json!("profile_sync_failed");
         }
     }
-    tracing::info!(live = live.len(), "model catalog refreshed");
+    tracing::info!(live = live_n, "model catalog refreshed");
     ok(out)
+}
+
+/// The `codex` part of the refresh response (classified reasons only).
+fn codex_json(r: anyhow::Result<crate::providers::openai::CodexDiscovery>) -> Value {
+    match r {
+        Ok(d) => json!({
+            "accounts": d.accounts,
+            "added": d.added,
+            "failed": d.failed.iter()
+                .map(|(a, reason)| json!({ "account": a.as_str(), "reason": reason }))
+                .collect::<Vec<_>>(),
+        }),
+        Err(e) => json!({ "error": format!("{e:#}") }),
+    }
 }
 
 // ---- sign-in ---------------------------------------------------------------------------------
