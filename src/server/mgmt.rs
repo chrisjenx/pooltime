@@ -61,6 +61,7 @@ use crate::providers::anthropic::anthropic_error;
 use crate::providers::ProviderId;
 use crate::routing::Tuning;
 use crate::signin::claude::ClaudeSignIn;
+use crate::signin::openai::OpenAiSignIn;
 use crate::signin::{
     PendingSignIn, SignInFlow, SignInHandle, SignInMode, SignInResult, SubmitError,
 };
@@ -1463,12 +1464,6 @@ async fn login(
         (Some(m), _) => m.provider,
         (None, p) => p.unwrap_or(ProviderId::Anthropic),
     };
-    if provider != ProviderId::Anthropic {
-        return bad(format!(
-            "sign-in for {provider} accounts is not yet supported"
-        ));
-    }
-
     let created = existing.is_none();
     if created {
         let (a, rid) = (app.clone(), id.clone());
@@ -1482,12 +1477,20 @@ async fn login(
             Err(r) => return r,
         }
     }
-    let flow = ClaudeSignIn::new(
-        app.cfg.anthropic.clone(),
-        app.registry.clone(),
-        app.state.clone(),
-        app.upstream.clone(),
-    );
+    let flow: Box<dyn SignInFlow> = match provider {
+        ProviderId::Anthropic => Box::new(ClaudeSignIn::new(
+            app.cfg.anthropic.clone(),
+            app.registry.clone(),
+            app.state.clone(),
+            app.upstream.clone(),
+        )),
+        ProviderId::OpenAi => Box::new(OpenAiSignIn::new(
+            app.cfg.openai.clone(),
+            app.registry.clone(),
+            app.state.clone(),
+            app.upstream.clone(),
+        )),
+    };
     match flow.start(&id, hint.as_deref(), mode) {
         Ok(pending) => {
             let out = json!({

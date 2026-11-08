@@ -311,7 +311,19 @@ pub struct OpenAiCfg {
     pub api_base: String,
     pub usage_url: String,
     pub token_url: String,
+    /// Browser sign-in (Codex CLI `build_authorize_url`).
+    pub authorize_url: String,
     pub client_id: String,
+    /// Scope of the JSON refresh grant (INV §4).
+    pub scope: String,
+    /// Scope requested at sign-in (Codex CLI, incl. the connector scopes).
+    pub login_scope: String,
+    /// `originator` sent on the authorize URL (and later on Codex requests).
+    pub originator: String,
+    /// Localhost ports tried in order for the sign-in redirect listener. The redirect URI
+    /// `http://localhost:<port>/auth/callback` is registered for the Codex client id on these
+    /// ports only, so change them only for tests (`0` = any free port).
+    pub callback_ports: Vec<u16>,
     pub user_agent: String,
 }
 
@@ -321,7 +333,14 @@ impl Default for OpenAiCfg {
             api_base: "https://chatgpt.com/backend-api/codex".into(),
             usage_url: "https://chatgpt.com/backend-api/wham/usage".into(),
             token_url: "https://auth.openai.com/oauth/token".into(),
+            authorize_url: "https://auth.openai.com/oauth/authorize".into(),
             client_id: "app_EMoamEEZ73f0CkXaXp7hrann".into(),
+            scope: "openid profile email".into(),
+            login_scope: "openid profile email offline_access api.connectors.read \
+                          api.connectors.invoke"
+                .into(),
+            originator: "codex_cli_rs".into(),
+            callback_ports: vec![1455, 1457],
             user_agent: "codex-cli".into(),
         }
     }

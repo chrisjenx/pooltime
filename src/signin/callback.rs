@@ -1,4 +1,6 @@
-//! The localhost OAuth redirect listener: `127.0.0.1:<ephemeral>`, path `/callback` only.
+//! The localhost OAuth redirect listener: `127.0.0.1:<ephemeral>`, path `/callback` only (Claude);
+//! or, via [`bind_first`], the first free port of a fixed list with a provider path (Codex:
+//! `/auth/callback`).
 //!
 //! The `state` parameter is validated in constant time before anything else; a request with a
 //! wrong or missing state is answered 400 and does NOT consume the listener (a stray request must
@@ -53,16 +55,35 @@ pub type Handler =
 pub struct BoundCallback {
     listener: TcpListener,
     port: u16,
+    path: &'static str,
 }
 
-/// Bind `127.0.0.1:0`. Must be called inside a tokio runtime.
+/// Bind `127.0.0.1:0`, serving `/callback`. Must be called inside a tokio runtime.
 pub fn bind() -> io::Result<BoundCallback> {
-    let std = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    bind_port(0, "/callback")
+}
+
+/// Bind the first of `ports` that is free (`0` = any free port), serving `path`. Errors with the
+/// last bind error when none is. Must be called inside a tokio runtime.
+pub fn bind_first(ports: &[u16], path: &'static str) -> io::Result<BoundCallback> {
+    let mut last = io::Error::new(io::ErrorKind::InvalidInput, "no callback port configured");
+    for &port in ports {
+        match bind_port(port, path) {
+            Ok(b) => return Ok(b),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+fn bind_port(port: u16, path: &'static str) -> io::Result<BoundCallback> {
+    let std = std::net::TcpListener::bind(("127.0.0.1", port))?;
     std.set_nonblocking(true)?;
     let port = std.local_addr()?.port();
     Ok(BoundCallback {
         listener: TcpListener::from_std(std)?,
         port,
+        path,
     })
 }
 
@@ -90,7 +111,7 @@ impl BoundCallback {
             handler,
         });
         let app = Router::new()
-            .route("/callback", get(callback))
+            .route(self.path, get(callback))
             .with_state(shared);
         tokio::spawn(async move {
             let _ = axum::serve(self.listener, app)

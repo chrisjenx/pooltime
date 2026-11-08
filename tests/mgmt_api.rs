@@ -1815,20 +1815,6 @@ mod mgmt {
         let r = call(
             &srv,
             "POST",
-            "/api/v1/accounts/oa/login",
-            Some(json!({"mode": "paste", "provider": "openai"})),
-        )
-        .await;
-        assert_eq!(r.status, 400);
-        assert!(message(&r).contains("not yet supported"), "{}", message(&r));
-        assert!(
-            pool.reg.get(&id("oa")).is_none(),
-            "an unsupported login must not create the account"
-        );
-
-        let r = call(
-            &srv,
-            "POST",
             "/api/v1/accounts/work/login",
             Some(json!({"mode": "telepathy"})),
         )
@@ -1863,18 +1849,6 @@ mod mgmt {
         .await;
         assert_eq!(r.status, 400);
 
-        // An existing OpenAI account cannot sign in yet either.
-        pool.add_account("codex1", ProviderId::OpenAi, 100, "x");
-        let r = call(
-            &srv,
-            "POST",
-            "/api/v1/accounts/codex1/login",
-            Some(json!({"mode": "paste"})),
-        )
-        .await;
-        assert_eq!(r.status, 400);
-        assert!(message(&r).contains("not yet supported"), "{}", message(&r));
-
         // `mode` defaults to the callback listener: the URL carries a localhost redirect.
         let r = call(&srv, "POST", "/api/v1/accounts/work/login", Some(json!({}))).await;
         assert_eq!(r.status, 200, "{}", r.text());
@@ -1884,6 +1858,48 @@ mod mgmt {
                 .unwrap()
                 .starts_with("http://localhost:"),
             "{url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_login_routes_to_the_chatgpt_flow() {
+        let pool = Pool::new();
+        // Never bind the real Codex ports (1455/1457) in tests.
+        let srv = pool
+            .boot(Boot {
+                configure: Some(Box::new(|cfg: &mut Config| {
+                    cfg.openai.callback_ports = vec![0];
+                })),
+                ..Boot::default()
+            })
+            .await;
+
+        // A new account created by its first login, and an existing one.
+        pool.add_account("codex1", ProviderId::OpenAi, 100, "x");
+        for (path, body) in [
+            (
+                "/api/v1/accounts/oa/login",
+                json!({"mode": "callback", "provider": "openai"}),
+            ),
+            ("/api/v1/accounts/codex1/login", json!({"mode": "paste"})),
+        ] {
+            let r = call(&srv, "POST", path, Some(body)).await;
+            assert_eq!(r.status, 200, "{path}: {}", r.text());
+            let v = r.json();
+            let url = v["authorize_url"].as_str().unwrap();
+            assert!(url.starts_with(&srv.app.cfg.openai.authorize_url), "{path}");
+            assert_eq!(
+                param(url, "client_id").as_deref(),
+                Some("app_EMoamEEZ73f0CkXaXp7hrann")
+            );
+            let redirect = reqwest::Url::parse(&param(url, "redirect_uri").unwrap()).unwrap();
+            assert_eq!(redirect.host_str(), Some("localhost"));
+            assert_eq!(redirect.path(), "/auth/callback");
+            assert!(v["signin_id"].as_str().is_some());
+        }
+        assert_eq!(
+            pool.reg.get(&id("oa")).unwrap().provider,
+            ProviderId::OpenAi
         );
     }
 
