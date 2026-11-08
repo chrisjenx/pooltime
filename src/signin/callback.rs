@@ -165,8 +165,19 @@ async fn callback(
             "This sign-in link was already used. Start the sign-in again if needed.",
         );
     }
-    let (status, body) = (s.handler)(event).await;
-    (status, Html(body))
+    // Hyper drops this future when the browser tab closes. The exchange and save must not go
+    // with it (a half-run flow stays `Exchanging` forever and keeps its port), so they run on
+    // their own task and the page only waits for them (spec §16).
+    match tokio::spawn((s.handler)(event)).await {
+        Ok((status, body)) => (status, Html(body)),
+        Err(e) => {
+            tracing::error!(panic = e.is_panic(), "sign-in callback handler failed");
+            page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Sign-in failed. Return to pooltime for details.",
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +247,42 @@ mod tests {
             *s.events.lock().unwrap(),
             vec![CallbackEvent::Code("c1".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn handler_survives_dropped_connection() {
+        use tokio::io::AsyncWriteExt;
+        let bound = bind().unwrap();
+        let port = bound.port();
+        let (started_tx, started) = oneshot::channel::<()>();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let (finished_tx, finished) = oneshot::channel::<()>();
+        let finished_tx = Arc::new(Mutex::new(Some(finished_tx)));
+        let handler: Handler = Arc::new(move |_| {
+            let (s, f) = (started_tx.clone(), finished_tx.clone());
+            Box::pin(async move {
+                let _ = s.lock().unwrap().take().unwrap().send(());
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = f.lock().unwrap().take().unwrap().send(());
+                (StatusCode::OK, "handled".to_string())
+            })
+        });
+        let (_stop, rx) = oneshot::channel::<()>();
+        bound.serve("st".into(), handler, async move {
+            let _ = rx.await;
+        });
+        let mut tab = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tab.write_all(b"GET /callback?code=c&state=st HTTP/1.1\r\nhost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        started.await.unwrap();
+        drop(tab);
+        tokio::time::timeout(Duration::from_secs(5), finished)
+            .await
+            .expect("handler cancelled with the connection")
+            .unwrap();
     }
 
     #[tokio::test]
