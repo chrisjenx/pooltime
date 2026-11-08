@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use pooltime::accounts::{AccountMeta, Registry};
 use pooltime::claude_code::{apply, is_connected, profile_of, EnvBlock, Pins};
 use pooltime::config::{Config, Paths, ProfileRef};
+use pooltime::providers::ProviderId;
 use serde_json::{json, Value};
 use support::{FakeAnthropic, Reply};
 use tempfile::TempDir;
@@ -54,9 +56,14 @@ struct Machine {
 
 impl Machine {
     fn new(upstream: &str) -> Machine {
+        Machine::with(free_port(), upstream, "")
+    }
+
+    /// The pool on `port`, Anthropic URLs at `upstream`, plus `extra` TOML appended.
+    fn with(port: u16, upstream: &str, extra: &str) -> Machine {
         let m = Machine {
             root: tempfile::tempdir().unwrap(),
-            port: free_port(),
+            port,
         };
         fs::create_dir_all(m.home()).unwrap();
         let paths = m.paths();
@@ -66,7 +73,7 @@ impl Machine {
             format!(
                 "port = {port}\n\n[anthropic]\napi_base = \"{upstream}\"\n\
                  token_url = \"{upstream}/v1/oauth/token\"\n\
-                 profile_url = \"{upstream}/api/oauth/profile\"\nusage_refresh = false\n",
+                 profile_url = \"{upstream}/api/oauth/profile\"\nusage_refresh = false\n{extra}",
                 port = m.port
             ),
         )
@@ -192,6 +199,27 @@ exit 0"#,
         )
         .unwrap();
         dir
+    }
+
+    /// As if `service install` had run: the definition exists and the shim reports it loaded.
+    fn mark_service_installed(&self) {
+        let def = self.definition();
+        fs::create_dir_all(def.parent().unwrap()).unwrap();
+        fs::write(&def, "x").unwrap();
+        fs::write(self.root.path().join("loaded"), "").unwrap();
+    }
+
+    /// An account on disk with credentials (the pool not running).
+    fn seed_account(&self, name: &str, provider: ProviderId, refresh_expires_in_days: Option<i64>) {
+        let paths = self.paths();
+        let reg = Registry::load(&paths).unwrap();
+        let meta = AccountMeta::new(name.parse().unwrap(), provider);
+        reg.upsert(meta.clone()).unwrap();
+        let mut c = support::creds("seed-access-SECRET", 3600);
+        c.provider = provider;
+        c.refresh_expires_at = refresh_expires_in_days
+            .map(|d| time::OffsetDateTime::now_utc() + time::Duration::days(d));
+        reg.write_creds(&meta.id, &c).unwrap();
     }
 
     fn definition(&self) -> PathBuf {
@@ -373,6 +401,7 @@ async fn setup_noninteractive_full_path() {
 
         // Idempotent: everything done, a re-run changes nothing.
         let settings_before = fs::read(chosen.join("settings.json")).unwrap();
+        let claude_json_before = fs::read(chosen.join(".claude.json")).ok();
         let config_before = fs::read(&paths.config).unwrap();
         let (ok, again) = m.run(&args);
         assert!(ok, "re-run failed:\n{again}");
@@ -389,7 +418,12 @@ async fn setup_noninteractive_full_path() {
             settings_before
         );
         assert_eq!(fs::read(&paths.config).unwrap(), config_before);
+        assert_eq!(
+            fs::read(chosen.join(".claude.json")).ok(),
+            claude_json_before
+        );
         assert_eq!(fs::read(other.join("settings.json")).unwrap(), other_before);
+        assert!(!again.contains("status line"), "{again}");
     });
 }
 
@@ -467,4 +501,80 @@ async fn doctor_flags_bad_permissions() {
     fs::set_permissions(&paths.config, fs::Permissions::from_mode(0o600)).unwrap();
     let (_, out) = tokio::task::block_in_place(|| m.run(&["doctor"]));
     assert!(line_with(&out, "permissions").starts_with('✓'), "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doctor_trusts_a_ready_account_past_its_recorded_expiry() {
+    let fake = fake_upstream().await;
+    let m = Machine::new(&fake.url());
+    m.seed_account("work", ProviderId::Anthropic, Some(-2));
+    m.mark_service_installed();
+
+    let (ok, out) = tokio::task::block_in_place(|| {
+        let _d = m.serve();
+        m.run(&["doctor"])
+    });
+    let l = line_with(&out, "account work:");
+    assert!(l.starts_with('!'), "{out}");
+    assert!(l.contains("still works"), "{out}");
+    assert!(!out.lines().any(|l| l.starts_with('✗')), "{out}");
+    assert!(ok, "only warnings, so exit 0:\n{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doctor_fails_when_the_pool_status_is_unreadable() {
+    // A "pool" that passes the health identity check but cannot produce its status.
+    let fake = FakeAnthropic::start().await;
+    fake.script(
+        "/health",
+        vec![Reply::json(
+            200,
+            &json!({"service": "pooltime", "status": "ok"}),
+        )],
+    );
+    fake.script(
+        "/api/v1/status",
+        vec![Reply::error(500, "api_error", "boom")],
+    );
+    let port: u16 = fake.url().rsplit(':').next().unwrap().parse().unwrap();
+    let m = Machine::with(port, &fake.url(), "");
+    m.seed_account("work", ProviderId::Anthropic, None);
+
+    let (ok, out) = tokio::task::block_in_place(|| m.run(&["doctor"]));
+    assert!(!ok, "{out}");
+    assert!(line_with(&out, "health:").starts_with('✓'), "{out}");
+    let l = line_with(&out, "accounts:");
+    assert!(l.starts_with('✗'), "{out}");
+    assert!(l.contains("could not read pool status"), "{out}");
+    // No silent fallback to the files.
+    assert!(!out.contains("account work:"), "{out}");
+    assert!(!out.contains("pool not running"), "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doctor_probes_codex_hosts_only_with_an_openai_account() {
+    let fake = fake_upstream().await;
+    let codex = FakeAnthropic::start().await;
+    let closed = "http://127.0.0.1:9";
+    let m = Machine::with(
+        free_port(),
+        &fake.url(),
+        &format!(
+            "\n[openai]\napi_base = \"{}/backend-api/codex\"\ntoken_url = \"{closed}/oauth/token\"\n",
+            codex.url()
+        ),
+    );
+    m.seed_account("work", ProviderId::Anthropic, None);
+
+    let (_, out) = tokio::task::block_in_place(|| m.run(&["doctor"]));
+    assert!(!out.contains(&codex.url()), "{out}");
+    assert!(!out.contains(closed), "{out}");
+
+    m.seed_account("codex1", ProviderId::OpenAi, None);
+    let (ok, out) = tokio::task::block_in_place(|| m.run(&["doctor"]));
+    assert!(!ok, "{out}");
+    let l = line_with(&out, &format!("upstream {}:", codex.url()));
+    assert!(l.starts_with('✓'), "{out}");
+    let l = line_with(&out, &format!("upstream {closed}:"));
+    assert!(l.starts_with('✗'), "{out}");
 }
