@@ -21,7 +21,9 @@ use http::{HeaderMap, HeaderValue};
 use http_body::Frame;
 use serde_json::Value;
 
+use super::inference::{self, RequestId, REQUEST_ID_HEADER};
 use super::{auth, health, AppState, PendingGuard};
+use crate::logging::new_request_id;
 use crate::providers::anthropic::anthropic_error;
 
 /// Largest accepted request body (Claude Code sends whole conversations).
@@ -36,7 +38,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 pub fn routes(state: Arc<AppState>) -> Router {
     // Auth is a route layer on the handler only, so a wrong method answers 405 before any
     // credential check (bro parity) and the key is never consulted for health.
-    let messages = post(messages)
+    let messages = post(inference::messages)
         .route_layer(from_fn_with_state(state.clone(), auth::require_proxy_key))
         .fallback(|| async { method_not_allowed("POST") });
     Router::new()
@@ -54,10 +56,23 @@ pub fn routes(state: Arc<AppState>) -> Router {
 }
 
 /// Layers shared by every route (and the 404 fallback). Outermost first: pending-request
-/// accounting, then the Host/Origin guard.
+/// accounting, the request id, then the Host/Origin guard.
 pub fn finish(app: Router, state: Arc<AppState>) -> Router {
     app.layer(from_fn_with_state(state.clone(), auth::host_origin_guard))
+        .layer(axum::middleware::from_fn(assign_request_id))
         .layer(from_fn_with_state(state, track_pending))
+}
+
+/// Give every request an id (request extension [`RequestId`]) and return it as the
+/// `x-pooltime-request-id` header on every response, errors and 404s included.
+async fn assign_request_id(mut req: Request, next: Next) -> Response {
+    let id = new_request_id();
+    req.extensions_mut().insert(RequestId(id.clone()));
+    let mut resp = next.run(req).await;
+    if let Ok(v) = HeaderValue::from_str(&id) {
+        resp.headers_mut().insert(REQUEST_ID_HEADER, v);
+    }
+    resp
 }
 
 // ---- handlers ----
@@ -78,20 +93,6 @@ fn method_not_allowed(allow: &'static str) -> Response {
     r.headers_mut()
         .insert(ALLOW, HeaderValue::from_static(allow));
     r
-}
-
-/// `POST /v1/messages`. Task 22 replaces the body of this handler; the ingress contract it
-/// already honours is route -> proxy auth (layer) -> JSON parse (400) -> handler.
-async fn messages(State(_app): State<Arc<AppState>>, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    match read_json(&parts.headers, body).await {
-        Ok(_) => anthropic_error(
-            501,
-            "api_error",
-            "pooltime: /v1/messages is not implemented yet",
-        ),
-        Err(resp) => resp,
-    }
 }
 
 /// `GET /v1/models`. Task 23 replaces this.

@@ -137,6 +137,17 @@ impl Sessions {
         });
     }
 
+    /// Live (not idle-expired) pins on `account`, across providers (bro `activeCount`): the
+    /// load term of the weighted score.
+    pub fn active_count(&self, account: &AccountId, now: OffsetDateTime) -> u32 {
+        let n = self
+            .lock()
+            .values()
+            .filter(|e| &e.account == account && !self.expired(e, now))
+            .count();
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
     /// Drop every pin for `account` (memory and database).
     pub fn evict_account(&self, account: &AccountId) {
         self.lock().retain(|_, e| &e.account != account);
@@ -324,5 +335,19 @@ mod tests {
         s.set(ProviderId::Anthropic, "u", &acct("a1"), at(9));
         assert_eq!(s.last_provider("u"), Some(ProviderId::Anthropic));
         assert_eq!(s.last_provider("other"), None);
+    }
+
+    #[test]
+    fn active_count_counts_live_pins_across_providers() {
+        let (_d, store) = open();
+        let s = Sessions::load(store, IDLE);
+        s.set(ProviderId::Anthropic, "u1", &acct("a1"), at(0));
+        s.set(ProviderId::OpenAi, "u2", &acct("a1"), at(0));
+        s.set(ProviderId::Anthropic, "u3", &acct("a2"), at(0));
+        assert_eq!(s.active_count(&acct("a1"), at(1)), 2);
+        assert_eq!(s.active_count(&acct("a2"), at(1)), 1);
+        assert_eq!(s.active_count(&acct("zz"), at(1)), 0);
+        let later = at(IDLE.as_secs() as i64 + 1);
+        assert_eq!(s.active_count(&acct("a1"), later), 0);
     }
 }

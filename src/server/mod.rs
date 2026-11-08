@@ -5,7 +5,10 @@
 //! signal handling and the drain sequence.
 
 pub mod auth;
+pub mod classifier;
+pub mod fallback;
 pub mod health;
+pub mod inference;
 pub mod router;
 pub mod shutdown;
 
@@ -20,6 +23,7 @@ use crate::providers::{Provider, ProviderId};
 use crate::routing::reserve::Reservations;
 use crate::routing::sessions::Sessions;
 use crate::store::Store;
+use crate::upstream::Upstream;
 
 pub use router::router;
 pub use shutdown::{serve, serve_listener, serve_until_signal, Outcome, ServeOpts};
@@ -38,6 +42,12 @@ pub struct AppState {
     /// Secret for dashboard/management mutations (never the proxy key).
     pub mgmt_key: String,
     pub runtime: Runtime,
+    /// Shared upstream HTTP client handed to every attempt.
+    pub upstream: Arc<Upstream>,
+    /// Classifier marker-drift warning throttle.
+    pub drift: classifier::DriftWarner,
+    /// Round-robin cursor for exact score ties (shared by every pick, like bro's).
+    pub cursor: AtomicUsize,
 }
 
 impl AppState {
@@ -66,7 +76,16 @@ impl AppState {
             store,
             mgmt_key,
             runtime: Runtime::default(),
+            upstream: Arc::new(Upstream::new()),
+            drift: classifier::DriftWarner::default(),
+            cursor: AtomicUsize::new(0),
         }
+    }
+
+    /// Use this upstream client (the daemon shares one with the providers).
+    pub fn with_upstream(mut self, upstream: Arc<Upstream>) -> AppState {
+        self.upstream = upstream;
+        self
     }
 }
 

@@ -572,3 +572,185 @@ fn min_headroom_gate_follows_tuning() {
     let strict = Tuning::new(1.0, 0.7, 0.2).unwrap();
     assert_eq!(name(choose(&c, &strict, &cursor, NOW, None)), "fresh");
 }
+
+// ---- Task 22: sticky pins and provider choice ----
+
+use pooltime::server::fallback::{pick_provider, ProviderPool};
+use pooltime::server::inference::pick_account;
+
+fn pick_pinned<'a>(cands: &[Candidate<'a>], pin: &str) -> Option<&'a AccountId> {
+    let pin: AccountId = pin.parse().unwrap();
+    pick_account(
+        cands,
+        Some(&pin),
+        &Tuning::default(),
+        &AtomicUsize::new(0),
+        NOW,
+        None,
+    )
+}
+
+#[test]
+fn sticky_pin_kept_only_if_usable_and_active_tier() {
+    let a = meta("a");
+    let b = meta("b");
+    let mut low = meta("low");
+    low.priority = 200;
+    // b would win on score (sooner weekly reset); low has the best data but a lower tier.
+    let (sa, sb, sl) = (
+        snap_7d(0.2, Duration::days(6)),
+        snap_7d(0.2, Duration::days(1)),
+        snap_7d(0.0, Duration::hours(2)),
+    );
+    let all = [
+        cand(&a, Some(&sa), 0),
+        cand(&b, Some(&sb), 0),
+        cand(&low, Some(&sl), 0),
+    ];
+    assert_eq!(name(pick(&all)), "b");
+    // Usable pin in the active tier is kept even though it scores lower.
+    assert_eq!(name(pick_pinned(&all, "a")), "a");
+    // Pin to a lower-tier account is not honored while the top tier has room.
+    assert_eq!(name(pick_pinned(&all, "low")), "b");
+
+    // Unusable pin (rate limited -> filtered by `usable`) falls back to `choose`.
+    let limited = AccountStatus::RateLimited {
+        until: NOW + Duration::hours(1),
+        window: None,
+    };
+    let none = HashSet::new();
+    let usable_now: Vec<Candidate<'_>> = all
+        .iter()
+        .filter(|c| {
+            let st = if c.meta.id.as_str() == "a" {
+                limited.clone()
+            } else {
+                AccountStatus::Ready
+            };
+            usable(c.meta, &st, ProviderId::Anthropic, None, &[], &none)
+        })
+        .copied()
+        .collect();
+    assert_eq!(name(pick_pinned(&usable_now, "a")), "b");
+    // A pin to an account that is gone entirely is ignored too.
+    assert_eq!(name(pick_pinned(&all, "deleted")), "b");
+
+    // Once the top tier is exhausted (tried), the lower tier is active and its pin holds.
+    let mut extra = meta("low2");
+    extra.priority = 200;
+    let rest = [cand(&low, Some(&sb), 0), cand(&extra, Some(&sl), 0)];
+    assert_eq!(name(pick(&rest)), "low2");
+    assert_eq!(name(pick_pinned(&rest, "low")), "low");
+}
+
+fn openai_meta(id: &str) -> AccountMeta {
+    AccountMeta::new(id.parse().unwrap(), ProviderId::OpenAi)
+}
+
+fn pools<'a>(anth: Vec<Candidate<'a>>, open: Vec<Candidate<'a>>) -> Vec<ProviderPool<'a>> {
+    vec![
+        ProviderPool {
+            provider: ProviderId::Anthropic,
+            family: Some("sonnet"),
+            cands: anth,
+        },
+        ProviderPool {
+            provider: ProviderId::OpenAi,
+            family: None,
+            cands: open,
+        },
+    ]
+}
+
+fn choose_provider(
+    p: &[ProviderPool<'_>],
+    pins: &[(ProviderId, &str)],
+    recent: Option<ProviderId>,
+) -> Option<ProviderId> {
+    let pins: Vec<(ProviderId, AccountId)> =
+        pins.iter().map(|(p, a)| (*p, a.parse().unwrap())).collect();
+    pick_provider(
+        p,
+        &pins,
+        recent,
+        &Tuning::default(),
+        &AtomicUsize::new(0),
+        NOW,
+    )
+}
+
+#[test]
+fn pick_provider_compares_on_one_expiry_scale() {
+    let a = meta("a");
+    let o = openai_meta("o");
+    let (sa, so) = (
+        snap_7d(0.2, Duration::days(6)),
+        snap_7d(0.2, Duration::days(1)),
+    );
+    // Provider-local ranks would both be 5 (tie -> Anthropic); one global scale ranks the
+    // sooner-expiring Codex weekly first.
+    let p = pools(vec![cand(&a, Some(&sa), 0)], vec![cand(&o, Some(&so), 0)]);
+    assert_eq!(choose_provider(&p, &[], None), Some(ProviderId::OpenAi));
+    // Reversed data: Anthropic wins.
+    let p = pools(vec![cand(&a, Some(&so), 0)], vec![cand(&o, Some(&sa), 0)]);
+    assert_eq!(choose_provider(&p, &[], None), Some(ProviderId::Anthropic));
+    // Exact tie keeps Anthropic first.
+    let p = pools(vec![cand(&a, None, 0)], vec![cand(&o, None, 0)]);
+    assert_eq!(choose_provider(&p, &[], None), Some(ProviderId::Anthropic));
+    // A provider is compared on its active tier only: Codex's better-placed backup tier
+    // does not count.
+    let mut backup = openai_meta("o-backup");
+    backup.priority = 200;
+    let p = pools(
+        vec![cand(&a, Some(&sa), 0)],
+        vec![cand(&o, Some(&sa), 3), cand(&backup, Some(&so), 0)],
+    );
+    assert_eq!(choose_provider(&p, &[], None), Some(ProviderId::Anthropic));
+    // Pools with no usable account drop out.
+    let p = pools(vec![], vec![cand(&o, None, 0)]);
+    assert_eq!(choose_provider(&p, &[], None), Some(ProviderId::OpenAi));
+    let p = pools(vec![], vec![]);
+    assert_eq!(choose_provider(&p, &[], None), None);
+}
+
+#[test]
+fn pick_provider_sticks_to_pinned_provider() {
+    let a = meta("a");
+    let o = openai_meta("o");
+    let mut o_low = openai_meta("o-low");
+    o_low.priority = 200;
+    let (sa, so) = (
+        snap_7d(0.2, Duration::days(1)),
+        snap_7d(0.2, Duration::days(6)),
+    );
+    // Anthropic would win on score...
+    let p = pools(
+        vec![cand(&a, Some(&sa), 0)],
+        vec![cand(&o, Some(&so), 0), cand(&o_low, Some(&so), 0)],
+    );
+    assert_eq!(choose_provider(&p, &[], None), Some(ProviderId::Anthropic));
+    // ...but a live pin to an active-tier Codex account keeps the session there.
+    assert_eq!(
+        choose_provider(&p, &[(ProviderId::OpenAi, "o")], None),
+        Some(ProviderId::OpenAi)
+    );
+    // A pin to a non-active-tier account does not count.
+    assert_eq!(
+        choose_provider(&p, &[(ProviderId::OpenAi, "o-low")], None),
+        Some(ProviderId::Anthropic)
+    );
+    // Both pinned: the most recently served provider wins; unknown -> list order.
+    let both = [(ProviderId::Anthropic, "a"), (ProviderId::OpenAi, "o")];
+    assert_eq!(
+        choose_provider(&p, &both, Some(ProviderId::OpenAi)),
+        Some(ProviderId::OpenAi)
+    );
+    assert_eq!(
+        choose_provider(&p, &both, Some(ProviderId::Anthropic)),
+        Some(ProviderId::Anthropic)
+    );
+    assert_eq!(
+        choose_provider(&p, &both, None),
+        Some(ProviderId::Anthropic)
+    );
+}

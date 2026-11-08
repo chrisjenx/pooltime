@@ -1636,3 +1636,481 @@ async fn client_disconnect_mid_stream_releases_and_records_nothing() {
     assert!(released(&rs, &pool).await);
     assert_eq!(state(&pool).lifetime.successes, 1);
 }
+
+// ---- Task 22: inference handler (failover loop, exhaustion, classifier, cross-provider) ----
+
+mod inference {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use pooltime::models::ModelTable;
+    use pooltime::providers::ProviderId;
+    use pooltime::server::classifier::MARKER;
+    use pooltime::server::inference::{ALL_UNAVAILABLE_MESSAGE, REQUEST_ID_HEADER};
+    use support::fake_provider::{done, quota_retry_watched, FakeProvider};
+    use support::sockets::{http_get, http_req, HttpResp};
+
+    async fn post(addr: std::net::SocketAddr, body: &serde_json::Value) -> HttpResp {
+        post_with(addr, body, &[]).await
+    }
+
+    async fn post_with(
+        addr: std::net::SocketAddr,
+        body: &serde_json::Value,
+        extra: &[(&str, &str)],
+    ) -> HttpResp {
+        let mut h = vec![("content-type", "application/json")];
+        h.extend_from_slice(extra);
+        http_req(
+            addr,
+            "POST",
+            "/v1/messages",
+            &h,
+            &serde_json::to_vec(body).unwrap(),
+        )
+        .await
+    }
+
+    fn body_with_user(user: &str) -> serde_json::Value {
+        let mut b = simple_body();
+        b["metadata"] = json!({ "user_id": user });
+        b
+    }
+
+    fn classifier_body(user: &str) -> serde_json::Value {
+        json!({
+            "model": "claude-sonnet-5",
+            "max_tokens": 64,
+            "system": [{"type": "text", "text": format!("{MARKER}. Judge the action.")}],
+            "messages": [{"role": "user", "content": "tool call"}],
+            "metadata": {"user_id": user}
+        })
+    }
+
+    fn mapped_models() -> ModelTable {
+        let mut t = ModelTable::defaults();
+        t.apply_mappings(Some(true), None).unwrap();
+        assert!(t.mapped_route("claude-sonnet-5").is_some());
+        t
+    }
+
+    fn quota_429() -> Reply {
+        Reply::error(429, "rate_limit_error", "Rate limited").header("retry-after", "120")
+    }
+
+    /// Log lines (JSON) that mention `request_id`.
+    fn lines_for(request_id: &str) -> Vec<String> {
+        captured_logs()
+            .lines()
+            .filter(|l| l.contains(request_id))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn anthropic(pool: &Pool, fake: &FakeAnthropic) -> Arc<dyn Provider> {
+        let (policy, _) = fast_policy();
+        Arc::new(pool.provider(fake, policy))
+    }
+
+    fn limited(pool: &Pool, id: &str) {
+        let now = OffsetDateTime::now_utc();
+        pool.state.mark_rate_limited(
+            &id.parse().unwrap(),
+            now + time::Duration::hours(1),
+            None,
+            now,
+        );
+    }
+
+    #[tokio::test]
+    async fn fails_over_on_quota_and_logs_each_attempt_reason() {
+        let fake = FakeAnthropic::start().await;
+        let pool = Pool::new().without_default_account();
+        let a1 = pool.add_account("a1", ProviderId::Anthropic, 1, "tok-a1");
+        pool.add_account("a2", ProviderId::Anthropic, 2, "tok-a2");
+        fake.route(MESSAGES, |r, _| match r.header("authorization") {
+            Some("Bearer tok-a1") => quota_429(),
+            _ => Reply::json(200, &ok_message(3, 4)),
+        });
+        let booted = pool
+            .boot(Boot::default().provider(anthropic(&pool, &fake)))
+            .await;
+        // Two sessions are pinned to a1; the quota bench must evict every pin of a1.
+        for s in ["sess-q", "sess-other"] {
+            booted
+                .app
+                .sessions
+                .set(ProviderId::Anthropic, s, &a1.id, OffsetDateTime::now_utc());
+        }
+
+        let resp = post(booted.addr, &body_with_user("sess-q")).await;
+        assert_eq!(resp.status, 200, "{}", resp.text());
+        assert_eq!(resp.header("x-pool-account"), Some("a2"));
+        assert_eq!(fake.requests_to(MESSAGES).len(), 2);
+        let now = OffsetDateTime::now_utc();
+        assert!(matches!(
+            pool.state.status(&a1.id, true, now),
+            AccountStatus::RateLimited { .. }
+        ));
+        // Old pin evicted, success re-pinned to the serving account.
+        assert_eq!(
+            booted
+                .app
+                .sessions
+                .pinned(ProviderId::Anthropic, "sess-q", now)
+                .map(|a| a.to_string()),
+            Some("a2".to_string())
+        );
+        assert_eq!(
+            booted
+                .app
+                .sessions
+                .pinned(ProviderId::Anthropic, "sess-other", now),
+            None
+        );
+
+        let rid = resp
+            .header(REQUEST_ID_HEADER)
+            .expect("request id")
+            .to_string();
+        let lines = lines_for(&rid);
+        assert!(
+            lines.iter().any(|l| l.contains(r#""account":"a1""#)
+                && l.contains(r#""reason":"quota""#)
+                && l.contains(r#""provider":"anthropic""#)),
+            "no quota attempt line for a1: {lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(r#""account":"a2""#) && l.contains(r#""outcome":"done""#)),
+            "no success attempt line for a2: {lines:#?}"
+        );
+        // Never the body or the upstream message.
+        assert!(!lines.iter().any(|l| l.contains("Rate limited")));
+        assert!(!lines.iter().any(|l| l.contains("\"hi\"")));
+    }
+
+    #[tokio::test]
+    async fn exhaustion_messages_match_bro() {
+        // 1. No account at all.
+        let fake = FakeAnthropic::start().await;
+        let pool = Pool::new().without_default_account();
+        let booted = pool
+            .boot(Boot::default().provider(anthropic(&pool, &fake)))
+            .await;
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 503);
+        let j = resp.json();
+        assert_eq!(j["type"], "error");
+        assert_eq!(j["error"]["type"], "overloaded_error");
+        let msg = j["error"]["message"].as_str().unwrap();
+        assert!(
+            msg.starts_with("No Claude accounts configured. Add one with: "),
+            "{msg}"
+        );
+
+        // 2. Accounts exist, none usable.
+        let fake = FakeAnthropic::start().await;
+        let pool = Pool::new();
+        limited(&pool, "work");
+        let booted = pool
+            .boot(Boot::default().provider(anthropic(&pool, &fake)))
+            .await;
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 503);
+        let j = resp.json();
+        assert_eq!(j["error"]["type"], "overloaded_error");
+        assert_eq!(j["error"]["message"], ALL_UNAVAILABLE_MESSAGE);
+        assert_eq!(
+            ALL_UNAVAILABLE_MESSAGE,
+            "All Claude accounts are currently unavailable (logged out or rate limited). Check the dashboard."
+        );
+        assert!(fake.requests_to(MESSAGES).is_empty());
+        assert!(resp.header("x-pool-retryable-transport").is_none());
+
+        // 3. Every account retried: the last retry's status/type/message.
+        let fake = FakeAnthropic::start().await;
+        fake.script(MESSAGES, vec![quota_429()]);
+        let pool = Pool::new();
+        let booted = pool
+            .boot(Boot::default().provider(anthropic(&pool, &fake)))
+            .await;
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 429);
+        let j = resp.json();
+        assert_eq!(j["error"]["type"], "rate_limit_error");
+        assert_eq!(j["error"]["message"], "Rate limited");
+        assert!(resp.header("x-pool-retryable-transport").is_none());
+    }
+
+    #[tokio::test]
+    async fn transport_exhaustion_sets_retryable_header() {
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let fake = FakeAnthropic::start().await;
+        let pool = Pool::new();
+        pool.add_account("second", ProviderId::Anthropic, 100, "tok-second");
+        let (policy, _) = fast_policy();
+        let cfg = pooltime::config::AnthropicCfg {
+            api_base: format!("http://{closed}"),
+            token_url: format!("{}{}", fake.url(), TOKEN),
+            ..Default::default()
+        };
+        let p = AnthropicProvider::new(cfg, pool.reg.clone(), pool.state.clone(), pool.up.clone())
+            .with_overload_policy(policy);
+        let booted = pool.boot(Boot::default().provider(Arc::new(p))).await;
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 502, "{}", resp.text());
+        assert_eq!(resp.json()["error"]["type"], "api_error");
+        assert_eq!(resp.header("x-pool-retryable-transport"), Some("1"));
+        // Both accounts were tried before giving up.
+        let rid = resp.header(REQUEST_ID_HEADER).unwrap().to_string();
+        let retries = lines_for(&rid)
+            .into_iter()
+            .filter(|l| l.contains(r#""reason":"transport:connect""#))
+            .count();
+        assert_eq!(retries, 2);
+    }
+
+    #[tokio::test]
+    async fn classifier_starts_on_anthropic_no_affinity() {
+        let fake = FakeAnthropic::start().await;
+        fake.script(MESSAGES, vec![Reply::json(200, &ok_message(1, 1))]);
+        let pool = Pool::new();
+        pool.add_account("codex1", ProviderId::OpenAi, 100, "tok-codex");
+        let codex = FakeProvider::new(ProviderId::OpenAi, |_, _| done(json!({"from": "codex"})));
+        let booted = pool
+            .boot(Boot {
+                models: Some(mapped_models()),
+                ..Boot::default()
+                    .provider(anthropic(&pool, &fake))
+                    .provider(codex.clone())
+            })
+            .await;
+        // A pin to the codex account must not attract the classifier (it never reads affinity).
+        let codex_id: pooltime::accounts::AccountId = "codex1".parse().unwrap();
+        booted.app.sessions.set(
+            ProviderId::OpenAi,
+            "sess-c",
+            &codex_id,
+            OffsetDateTime::now_utc(),
+        );
+
+        let resp = post(booted.addr, &classifier_body("sess-c")).await;
+        assert_eq!(resp.status, 200, "{}", resp.text());
+        assert_eq!(resp.header("x-pool-route"), Some("classifier"));
+        assert_eq!(resp.header("x-pool-account"), Some("work"));
+        assert!(codex.calls().is_empty());
+        // ... and never writes it.
+        assert_eq!(
+            booted
+                .app
+                .sessions
+                .pinned(ProviderId::Anthropic, "sess-c", OffsetDateTime::now_utc()),
+            None
+        );
+
+        // Anthropic exhausted: the mapped fallback still carries it.
+        limited(&pool, "work");
+        let resp = post(booted.addr, &classifier_body("sess-c")).await;
+        assert_eq!(resp.status, 200, "{}", resp.text());
+        assert_eq!(resp.json()["from"], "codex");
+        assert_eq!(resp.header("x-pool-route"), Some("classifier"));
+        assert_eq!(resp.header("x-pool-account"), Some("codex1"));
+        assert_eq!(codex.calls().len(), 1);
+
+        // classifier_route = "default": ordinary mapped routing, no classifier header.
+        let fake2 = FakeAnthropic::start().await;
+        let pool2 = Pool::new();
+        pool2.add_account("codex1", ProviderId::OpenAi, 100, "tok-codex");
+        let codex2 = FakeProvider::new(ProviderId::OpenAi, |_, _| done(json!({"from": "codex"})));
+        limited(&pool2, "work");
+        let booted2 = pool2
+            .boot(Boot {
+                models: Some(mapped_models()),
+                configure: Some(Box::new(|c| {
+                    c.routing.classifier_route = pooltime::config::ClassifierRoute::Default
+                })),
+                ..Boot::default()
+                    .provider(anthropic(&pool2, &fake2))
+                    .provider(codex2.clone())
+            })
+            .await;
+        let resp = post(booted2.addr, &classifier_body("sess-d")).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.header("x-pool-route"), None);
+        // Ordinary routing does pin the session.
+        assert!(booted2
+            .app
+            .sessions
+            .pinned(ProviderId::OpenAi, "sess-d", OffsetDateTime::now_utc())
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn cross_provider_one_hop_then_returns_first() {
+        // Anthropic overloaded past its backoff (529, cross-provider retryable).
+        let fake = FakeAnthropic::start().await;
+        fake.script(
+            MESSAGES,
+            vec![Reply::error(529, "overloaded_error", "Overloaded")],
+        );
+        let pool = Pool::new();
+        pool.add_account("codex1", ProviderId::OpenAi, 100, "tok-codex");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let d = dropped.clone();
+        let codex = FakeProvider::new(ProviderId::OpenAi, move |_, _| {
+            quota_retry_watched(d.clone())
+        });
+        let booted = pool
+            .boot(Boot {
+                models: Some(mapped_models()),
+                ..Boot::default()
+                    .provider(anthropic(&pool, &fake))
+                    .provider(codex.clone())
+            })
+            .await;
+        let resp = post(booted.addr, &simple_body()).await;
+        // Both failed: the FIRST provider's response is returned.
+        assert_eq!(resp.status, 529, "{}", resp.text());
+        assert_eq!(resp.json()["error"]["type"], "overloaded_error");
+        assert_eq!(resp.header("x-pool-account"), Some("work"));
+        // Exactly one hop: one serve per provider (1 + 4 backoff retries upstream on Anthropic).
+        assert_eq!(codex.calls().len(), 1);
+        assert_eq!(fake.requests_to(MESSAGES).len(), 5);
+        // The discarded response body was dropped (cancelled) before returning.
+        assert!(dropped.load(Ordering::SeqCst));
+        let rid = resp.header(REQUEST_ID_HEADER).unwrap().to_string();
+        let lines = lines_for(&rid);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains(r#""first_reason":"overloaded""#)
+                    && l.contains(r#""second_reason":"quota""#)),
+            "both reasons not logged: {lines:#?}"
+        );
+
+        // Recovered fallback: the alternate's success is returned.
+        let fake = FakeAnthropic::start().await;
+        fake.script(MESSAGES, vec![quota_429()]);
+        let pool = Pool::new();
+        pool.add_account("codex1", ProviderId::OpenAi, 100, "tok-codex");
+        let codex = FakeProvider::new(ProviderId::OpenAi, |_, _| done(json!({"from": "codex"})));
+        let booted = pool
+            .boot(Boot {
+                models: Some(mapped_models()),
+                ..Boot::default()
+                    .provider(anthropic(&pool, &fake))
+                    .provider(codex.clone())
+            })
+            .await;
+        let resp = post(booted.addr, &body_with_user("sess-x")).await;
+        assert_eq!(resp.status, 200, "{}", resp.text());
+        assert_eq!(resp.json()["from"], "codex");
+        assert_eq!(resp.header("x-pool-account"), Some("codex1"));
+        assert_eq!(codex.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn upstream_rejected_never_hops_provider() {
+        let fake = FakeAnthropic::start().await;
+        let upstream_body =
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}"#;
+        fake.script(
+            MESSAGES,
+            vec![Reply::bytes(429, upstream_body).header("content-type", "application/json")],
+        );
+        let pool = Pool::new();
+        pool.add_account("second", ProviderId::Anthropic, 100, "tok-second");
+        pool.add_account("codex1", ProviderId::OpenAi, 100, "tok-codex");
+        let codex = FakeProvider::new(ProviderId::OpenAi, |_, _| done(json!({"from": "codex"})));
+        let booted = pool
+            .boot(Boot {
+                models: Some(mapped_models()),
+                ..Boot::default()
+                    .provider(anthropic(&pool, &fake))
+                    .provider(codex.clone())
+            })
+            .await;
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 429);
+        assert_eq!(resp.header("x-pool-upstream-rejected"), Some("1"));
+        assert_eq!(resp.text(), upstream_body);
+        // No failover, no hop, no bench.
+        assert_eq!(fake.requests_to(MESSAGES).len(), 1);
+        assert!(codex.calls().is_empty());
+        let now = OffsetDateTime::now_utc();
+        for id in ["work", "second"] {
+            assert_eq!(
+                pool.state.status(&id.parse().unwrap(), true, now),
+                AccountStatus::Ready
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_id_header_on_every_response() {
+        let fake = FakeAnthropic::start().await;
+        fake.script(MESSAGES, vec![Reply::json(200, &ok_message(1, 1))]);
+        let pool = Pool::new();
+        let booted = pool
+            .boot(Boot {
+                proxy_key: Some("k".into()),
+                ..Boot::default().provider(anthropic(&pool, &fake))
+            })
+            .await;
+        let auth = [("x-api-key", "k")];
+        let mut ids = Vec::new();
+        let mut check = |what: &str, r: &HttpResp, status: u16| {
+            assert_eq!(r.status, status, "{what}: {}", r.text());
+            let id = r
+                .header(REQUEST_ID_HEADER)
+                .unwrap_or_else(|| panic!("{what}: no request id header"));
+            assert!(id.starts_with("req_"), "{what}: {id}");
+            ids.push(id.to_string());
+        };
+        check(
+            "success",
+            &post_with(booted.addr, &simple_body(), &auth).await,
+            200,
+        );
+        check(
+            "unauthorized",
+            &post(booted.addr, &simple_body()).await,
+            401,
+        );
+        let bad = http_req(
+            booted.addr,
+            "POST",
+            "/v1/messages",
+            &[("x-api-key", "k")],
+            b"{nope",
+        )
+        .await;
+        check("bad json", &bad, 400);
+        check(
+            "unknown path",
+            &http_get(booted.addr, "/v1/nope", &[]).await,
+            404,
+        );
+        check(
+            "wrong method",
+            &http_get(booted.addr, "/v1/messages", &[]).await,
+            405,
+        );
+        check("health", &http_get(booted.addr, "/health", &[]).await, 200);
+        // Exhaustion from the handler itself.
+        limited(&pool, "work");
+        check(
+            "exhausted",
+            &post_with(booted.addr, &simple_body(), &auth).await,
+            503,
+        );
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "ids not unique: {ids:?}");
+    }
+}

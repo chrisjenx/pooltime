@@ -197,6 +197,19 @@ pub struct RoutingCfg {
     /// 0 = unlimited.
     pub anthropic_max_inflight: u32,
     pub codex_max_inflight: u32,
+    /// Where Claude Code's auto-mode safety classifier is served (bro `CLASSIFIER_ROUTE`):
+    /// `anthropic` (default) starts it on Claude accounts even when its family is mapped;
+    /// `default` routes it like any other request.
+    pub classifier_route: ClassifierRoute,
+}
+
+/// See [`RoutingCfg::classifier_route`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClassifierRoute {
+    #[default]
+    Anthropic,
+    Default,
 }
 
 impl Default for RoutingCfg {
@@ -207,6 +220,7 @@ impl Default for RoutingCfg {
             headroom_taper_start: 0.20,
             anthropic_max_inflight: 0,
             codex_max_inflight: 4,
+            classifier_route: ClassifierRoute::Anthropic,
         }
     }
 }

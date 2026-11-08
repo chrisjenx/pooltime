@@ -3,8 +3,10 @@
 #![allow(dead_code)]
 
 pub mod fake_anthropic;
+pub mod fake_provider;
 pub mod sockets;
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -15,7 +17,7 @@ use pooltime::accounts::{AccountMeta, Credentials, Registry, StateBook};
 use pooltime::config::{AnthropicCfg, Paths};
 use pooltime::models::{Route, RouteDef};
 use pooltime::providers::anthropic::{AnthropicProvider, OverloadPolicy, Sleeper};
-use pooltime::providers::{InboundRequest, ProviderId};
+use pooltime::providers::{InboundRequest, Provider, ProviderId};
 use pooltime::store::Store;
 use pooltime::upstream::{Limits, Upstream};
 use time::OffsetDateTime;
@@ -74,32 +76,62 @@ impl Pool {
         self.reg.read_creds(&self.meta.id).unwrap().unwrap()
     }
 
-    /// Start the real HTTP server on 127.0.0.1:0 over this pool (no providers registered).
+    /// Add (or replace) an account `name` of `provider` with the given priority and access token.
+    pub fn add_account(
+        &self,
+        name: &str,
+        provider: ProviderId,
+        priority: u32,
+        access: &str,
+    ) -> AccountMeta {
+        let mut meta = AccountMeta::new(name.parse().unwrap(), provider);
+        meta.priority = priority;
+        self.reg.upsert(meta.clone()).unwrap();
+        let mut c = creds(access, 3600);
+        c.provider = provider;
+        self.reg.write_creds(&meta.id, &c).unwrap();
+        meta
+    }
+
+    /// Remove the default `work` account.
+    pub fn without_default_account(self) -> Pool {
+        self.reg.remove(&self.meta.id).unwrap();
+        self
+    }
+
+    /// Start the real HTTP server on 127.0.0.1:0 over this pool (providers from `opts`).
     pub async fn boot(&self, opts: Boot) -> Booted {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let cfg = pooltime::config::Config {
+        let mut cfg = pooltime::config::Config {
             port: addr.port(),
             proxy_key: opts.proxy_key,
             ..pooltime::config::Config::default()
         };
+        if let Some(edit) = opts.configure {
+            edit(&mut cfg);
+        }
         let paths = Paths::under(self.dir.path());
         let sessions = Arc::new(pooltime::routing::sessions::Sessions::load(
             self.store.clone(),
             Duration::from_secs(1800),
         ));
-        let app = Arc::new(pooltime::server::AppState::new(
-            cfg,
-            paths,
-            self.reg.clone(),
-            self.state.clone(),
-            sessions,
-            pooltime::routing::reserve::Reservations::new(Default::default()),
-            pooltime::models::ModelTable::defaults(),
-            Default::default(),
-            self.store.clone(),
-            "mgmt-test-key".into(),
-        ));
+        let app = Arc::new(
+            pooltime::server::AppState::new(
+                cfg,
+                paths,
+                self.reg.clone(),
+                self.state.clone(),
+                sessions,
+                pooltime::routing::reserve::Reservations::new(Default::default()),
+                opts.models
+                    .unwrap_or_else(pooltime::models::ModelTable::defaults),
+                opts.providers,
+                self.store.clone(),
+                "mgmt-test-key".into(),
+            )
+            .with_upstream(self.up.clone()),
+        );
         let mut router = pooltime::server::router::routes(app.clone());
         if let Some(extra) = opts.extra {
             router = extra(router);
@@ -131,12 +163,21 @@ impl Pool {
     }
 }
 
+/// A config edit applied by [`Pool::boot`].
+pub type ConfigEdit = Box<dyn FnOnce(&mut pooltime::config::Config) + Send>;
+
 /// Knobs for [`Pool::boot`].
 pub struct Boot {
     pub proxy_key: Option<String>,
     pub drain_timeout: Duration,
     /// Adds test-only routes before the standard layers are applied.
     pub extra: Option<Box<dyn FnOnce(axum::Router) -> axum::Router + Send>>,
+    /// Providers the inference handler may use (none by default).
+    pub providers: HashMap<ProviderId, Arc<dyn Provider>>,
+    /// Model table (bundled defaults when `None`).
+    pub models: Option<pooltime::models::ModelTable>,
+    /// Edits the daemon config after the port/proxy key are set.
+    pub configure: Option<ConfigEdit>,
 }
 
 impl Default for Boot {
@@ -145,7 +186,18 @@ impl Default for Boot {
             proxy_key: None,
             drain_timeout: Duration::from_secs(30),
             extra: None,
+            providers: HashMap::new(),
+            models: None,
+            configure: None,
         }
+    }
+}
+
+impl Boot {
+    /// Register `p` under its own id.
+    pub fn provider(mut self, p: Arc<dyn Provider>) -> Boot {
+        self.providers.insert(p.id(), p);
+        self
     }
 }
 
