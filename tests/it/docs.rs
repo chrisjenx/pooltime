@@ -4,14 +4,16 @@
 
 use std::process::Command;
 
+use crate::support::procs;
+
 #[test]
 fn docs_commands_run_and_name_real_subcommands() {
     let root = env!("CARGO_MANIFEST_DIR");
-    let out = Command::new("sh")
-        .arg(format!("{root}/scripts/check-docs.sh"))
-        .env("POOLTIME_BIN", env!("CARGO_BIN_EXE_pooltime"))
-        .output()
-        .expect("running scripts/check-docs.sh");
+    let out = procs::output(
+        Command::new("sh")
+            .arg(format!("{root}/scripts/check-docs.sh"))
+            .env("POOLTIME_BIN", env!("CARGO_BIN_EXE_pooltime")),
+    );
     assert!(
         out.status.success(),
         "check-docs failed\nstdout:\n{}\nstderr:\n{}",

@@ -1,7 +1,7 @@
 //! Task 21: the HTTP server's identity, auth, routing fallbacks, Host/Origin guard, drain and
 //! startup preflight, over real sockets.
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
@@ -470,9 +470,7 @@ async fn second_instance_refuses_to_start() {
     assert!(err.to_string().contains("already running"), "{err}");
 
     // A free port passes.
-    let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let free_port = free.local_addr().unwrap().port();
-    drop(free);
+    let free_port = support::procs::free_port();
     let cfg = pooltime::config::Config {
         port: free_port,
         ..pooltime::config::Config::default()
@@ -530,9 +528,7 @@ async fn bro_answering_blocks_imported_accounts_unless_flag() {
     check_bro_shadow(&pool.reg, bro.port(), true).await.unwrap();
 
     // Nothing answering on bro's port: fine.
-    let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let free_port = free.local_addr().unwrap().port();
-    drop(free);
+    let free_port = support::procs::free_port();
     check_bro_shadow(&pool.reg, free_port, false).await.unwrap();
 
     // A listener that is not a bro pool (a dev server answering 200 to everything) does not block.
@@ -566,9 +562,7 @@ async fn slow_bro_counts_as_running() {
     );
 
     // Nothing listening is Free, not Unresponsive.
-    let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let free_addr = free.local_addr().unwrap();
-    drop(free);
+    let free_addr = support::procs::free_addr();
     assert_eq!(
         probe_within(free_addr, Duration::from_millis(300)).await,
         Probe::Free
@@ -2400,8 +2394,8 @@ mod mgmt {
 
     // ---- dashboard ----
 
-    const APP_JS: &str = include_str!("../web/app.js");
-    const STYLE_CSS: &str = include_str!("../web/style.css");
+    const APP_JS: &str = include_str!("../../web/app.js");
+    const STYLE_CSS: &str = include_str!("../../web/style.css");
 
     /// Every dashboard response carries the CSP and the referrer/sniffing guards.
     fn assert_dashboard_headers(r: &HttpResp) {

@@ -2,7 +2,7 @@
 //! `POOLTIME_HOME` / `XDG_CONFIG_HOME`, with `launchctl` / `systemctl` replaced by PATH shims and
 //! every upstream URL pointed at a fake on 127.0.0.1 (never the network, never the real profiles).
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
