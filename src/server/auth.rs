@@ -63,7 +63,7 @@ pub(crate) fn keys_match(presented: &str, expected: &str) -> bool {
         == 0
 }
 
-/// Paths the Host/Origin guard covers: the dashboard (`/`, `/assets/*`), the management API
+/// Paths the Host/Origin guard covers: the dashboard (`/`, `/assets/*`, the favicon), the management API
 /// (`/api/*`) and the MCP endpoint (`/mcp`: the DNS-rebinding protection MCP's HTTP transport
 /// asks for).
 fn is_guarded(path: &str) -> bool {
@@ -71,6 +71,8 @@ fn is_guarded(path: &str) -> bool {
         || path == "/api"
         || path.starts_with("/api/")
         || path.starts_with("/assets/")
+        || path == "/favicon.svg"
+        || path == "/favicon.ico"
         || path == "/mcp"
 }
 
@@ -106,7 +108,7 @@ fn loopback_host(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Reject requests to `/`, `/assets/*` and `/api/*` whose `Host` is not `127.0.0.1:<port>` / `localhost:<port>`
+/// Reject requests to the dashboard paths (see [`is_guarded`]) whose `Host` is not `127.0.0.1:<port>` / `localhost:<port>`
 /// or whose `Origin` (when sent) is not the matching `http://` origin. There is deliberately no
 /// CORS support: browsers never get a grant, so only same-origin pages can read responses.
 pub async fn host_origin_guard(
@@ -188,6 +190,7 @@ mod tests {
         assert!(is_guarded("/api/status"));
         assert!(!is_guarded("/apiary"));
         assert!(is_guarded("/assets/app.js"));
+        assert!(is_guarded("/favicon.svg") && is_guarded("/favicon.ico"));
         assert!(!is_guarded("/health"));
         assert!(!is_guarded("/v1/messages"));
         assert!(is_guarded("/mcp"));
