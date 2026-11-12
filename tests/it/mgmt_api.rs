@@ -2396,6 +2396,7 @@ mod mgmt {
 
     const APP_JS: &str = include_str!("../../web/app.js");
     const STYLE_CSS: &str = include_str!("../../web/style.css");
+    const FAVICON_SVG: &str = include_str!("../../web/favicon.svg");
 
     /// Every dashboard response carries the CSP and the referrer/sniffing guards.
     fn assert_dashboard_headers(r: &HttpResp) {
@@ -2421,6 +2422,10 @@ mod mgmt {
         let html = r.text();
         assert!(html.contains(r#"<script src="/assets/app.js"#), "{html}");
         assert!(html.contains(r#"href="/assets/style.css"#), "{html}");
+        assert!(
+            html.contains(r#"<link rel="icon" href="/favicon.svg" type="image/svg+xml">"#),
+            "{html}"
+        );
         // Nothing inline: no script bodies, no style attributes or blocks, no remote URLs.
         assert!(!html.contains("<script>"), "{html}");
         assert!(!html.contains("<style"), "{html}");
@@ -2477,6 +2482,37 @@ mod mgmt {
         assert_eq!(r.status, 404);
         let r = http_get(srv.addr, "/assets/app.js", &[("host", "evil.example:80")]).await;
         assert_eq!(r.status, 403);
+    }
+
+    #[tokio::test]
+    async fn favicon_served_without_credentials() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+        // Browsers fetch it with no cookie and no key; the management key is set on this server.
+        let r = http_get(srv.addr, "/favicon.svg", &[]).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert_eq!(r.header("content-type"), Some("image/svg+xml"));
+        assert_eq!(r.text(), FAVICON_SVG, "the embedded file");
+        assert!(r.text().starts_with("<svg"), "{}", r.text());
+        assert!(FAVICON_SVG.len() < 2048);
+        assert_dashboard_headers(&r);
+        let cache = r.header("cache-control").expect("cache-control");
+        assert!(cache.contains("max-age"), "{cache}");
+        let etag = r.header("etag").expect("etag").to_string();
+        let r = http_get(srv.addr, "/favicon.svg", &[("if-none-match", &etag)]).await;
+        assert_eq!(r.status, 304);
+        assert!(r.body.is_empty());
+        // The default `/favicon.ico` probe lands on the same icon.
+        let r = http_get(srv.addr, "/favicon.ico", &[]).await;
+        assert_eq!(r.status, 302, "{}", r.text());
+        assert_eq!(r.header("location"), Some("/favicon.svg"));
+        // Read-only like the rest: no writes, and a foreign Host (DNS rebinding) is refused.
+        for path in ["/favicon.svg", "/favicon.ico"] {
+            let r = http_req(srv.addr, "POST", path, &[], b"").await;
+            assert_eq!(r.status, 405, "{path}");
+            let r = http_get(srv.addr, path, &[("host", "evil.example:80")]).await;
+            assert_eq!(r.status, 403, "{path}");
+        }
     }
 
     #[tokio::test]

@@ -655,7 +655,7 @@ async fn lookup_flushes_a_still_queued_row_and_favicon_is_not_an_error() {
 
     // Browsers' favicon probe: answered, never journaled as an unknown path.
     let fav = http_req(addr, "GET", "/favicon.ico", &[], b"").await;
-    assert_eq!(fav.status, 204);
+    assert_eq!(fav.status, 302);
 
     // Keep the store writer busy so the next row waits in its queue.
     booted

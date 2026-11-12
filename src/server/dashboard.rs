@@ -1,6 +1,7 @@
 //! The embedded web dashboard: `GET /` (the page) and `GET /assets/{name}` (its script and
 //! stylesheet). Plain HTML + vanilla JS from `web/`, compiled into the binary with
-//! `include_str!`; no build step, nothing fetched from anywhere but this server.
+//! `include_str!`; no build step, nothing fetched from anywhere but this server. The tab icon is
+//! `GET /favicon.svg`; `GET /favicon.ico` (what browsers ask for by default) redirects to it.
 //!
 //! # Session
 //! `pooltime open` prints `http://127.0.0.1:<port>/?k=<management key>`. A valid `k` is traded for
@@ -17,7 +18,10 @@
 //! the cookie). Assets are served with a strong `ETag` (SHA-256 of the embedded bytes) and
 //! `Cache-Control: no-cache`: the browser revalidates on every load and gets a `304` while the
 //! binary is unchanged, and an upgraded binary's assets are picked up immediately, without
-//! hashed file names or a build step.
+//! hashed file names or a build step. The favicon is the same, except it may be cached for a day
+//! (`max-age=86400`) so tab reloads do not revalidate it. Like the page's assets it needs no
+//! credentials (browsers fetch it with none), serves only embedded bytes, is `GET`-only and
+//! passes the same Host/Origin guard.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -64,6 +68,9 @@ impl Asset {
     }
 }
 
+static FAVICON: LazyLock<Asset> =
+    LazyLock::new(|| Asset::new(include_str!("../../web/favicon.svg"), "image/svg+xml"));
+
 static ASSETS: LazyLock<HashMap<&'static str, Asset>> = LazyLock::new(|| {
     HashMap::from([
         (
@@ -83,15 +90,18 @@ static ASSETS: LazyLock<HashMap<&'static str, Asset>> = LazyLock::new(|| {
     ])
 });
 
-/// `/`, `/assets/{name}` and `/favicon.ico`.
+/// `/`, `/assets/{name}`, `/favicon.svg` and `/favicon.ico`.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        // Browsers ask for it on every dashboard load; an empty 204 keeps those probes out of the
-        // request journal's unknown-path errors.
+        // Browsers ask for it on every dashboard load; answering (rather than 404) keeps those
+        // probes out of the request journal's unknown-path errors.
         .route(
             "/favicon.ico",
-            get(|| async { http::StatusCode::NO_CONTENT })
-                .fallback(|| async { method_not_allowed("GET") }),
+            get(favicon_ico).fallback(|| async { method_not_allowed("GET") }),
+        )
+        .route(
+            "/favicon.svg",
+            get(favicon_svg).fallback(|| async { method_not_allowed("GET") }),
         )
         .route(
             "/",
@@ -150,6 +160,27 @@ async fn asset(Path(name): Path<String>, headers: HeaderMap) -> Response {
     let Some(a) = ASSETS.get(name.as_str()) else {
         return anthropic_error(404, "not_found_error", "pooltime: unknown dashboard asset");
     };
+    serve(a, &headers, "no-cache")
+}
+
+async fn favicon_svg(headers: HeaderMap) -> Response {
+    serve(&FAVICON, &headers, "public, max-age=86400")
+}
+
+async fn favicon_ico() -> Response {
+    let mut r = StatusCode::FOUND.into_response();
+    let h = r.headers_mut();
+    h.insert(LOCATION, HeaderValue::from_static("/favicon.svg"));
+    h.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    harden(&mut r);
+    r
+}
+
+/// An embedded file with its `ETag`, honouring `If-None-Match`.
+fn serve(a: &Asset, headers: &HeaderMap, cache_control: &'static str) -> Response {
     let fresh = headers
         .get(IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -163,7 +194,7 @@ async fn asset(Path(name): Path<String>, headers: HeaderMap) -> Response {
     if let Ok(v) = HeaderValue::from_str(&a.etag) {
         h.insert(ETAG, v);
     }
-    h.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    h.insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
     harden(&mut r);
     r
 }
@@ -176,6 +207,7 @@ mod tests {
     fn page_has_mode_slot_and_assets_exist() {
         assert_eq!(INDEX_HTML.matches(MODE_SLOT).count(), 1);
         assert!(ASSETS.contains_key("app.js") && ASSETS.contains_key("style.css"));
+        assert!(FAVICON.body.starts_with("<svg") && FAVICON.body.len() < 2048);
         assert!(CSP.starts_with("default-src 'self'"));
     }
 }
