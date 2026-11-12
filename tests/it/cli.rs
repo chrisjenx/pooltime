@@ -124,7 +124,7 @@ fn second_serve_on_same_port_says_already_running() {
 
 // ---- Task 30: thin-client commands ------------------------------------------------------------
 
-mod support;
+use crate::support;
 
 use support::procs::{self, free_port};
 

@@ -1,6 +1,6 @@
 //! Task F4: the request journal, its management API, debug mode and journal retention.
 
-mod support;
+use crate::support;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

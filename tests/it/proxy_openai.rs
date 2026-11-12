@@ -6,7 +6,7 @@
 //! Timing: the keep-alive test scales bro's "upstream silent 5 s at a 1 s keep-alive -> at
 //! least 4 pings" down by 4 (250 ms keep-alive, 1.25 s silence -> at least 4 pings).
 
-mod support;
+use crate::support;
 
 use std::collections::HashMap;
 use std::time::Duration;

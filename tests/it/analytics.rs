@@ -1,6 +1,6 @@
 //! Task F5: `GET /api/v1/analytics/burn` (weekly subscription burn) over the real server.
 
-mod support;
+use crate::support;
 
 use pooltime::store::usage_history::{insert_sample, Point, WINDOW_7D};
 use serde_json::Value;

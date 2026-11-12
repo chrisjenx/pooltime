@@ -2,7 +2,7 @@
 //! copied into a temp dir. A fake [`Keychain`] stands in for macOS's; nothing here touches the real
 //! `$HOME`, bro's real files or the Keychain.
 
-mod support;
+use crate::support;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;

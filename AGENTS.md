@@ -11,6 +11,8 @@ one local Anthropic-compatible endpoint for Claude Code. It replaces the pool in
 ```sh
 cargo build                                   # debug binary at target/debug/pooltime
 cargo test                                    # unit + integration tests (also the harness crate's unit tests)
+cargo test --test it proxy_anthropic::        # one integration-test module (tests/it/proxy_anthropic.rs)
+cargo build --profile debugging               # full debug info for a debugger (dev builds keep line tables only)
 cargo run -q -p pooltime --bin pooltime -- --help
 ```
 
@@ -51,8 +53,9 @@ See [docs/architecture.md](docs/architecture.md) for the module map and request 
 - `src/store/`: SQLite journal, timeline, usage history, retention.
 - `src/mcp/`, `src/service/`, `src/import/`, `src/analytics/`.
 - `src/config.rs`, `src/fsutil.rs`, `src/upstream.rs`, `src/sse.rs`, `src/logging.rs`, `src/errors.rs`.
-- `web/` dashboard (vanilla JS, embedded); `tests/` integration tests with fake upstreams in
-  `tests/support/`; `harness/` differential harness.
+- `web/` dashboard (vanilla JS, embedded); `tests/it/` integration tests, one module per file,
+  linked into a single test binary (`tests/it/main.rs`), with fake upstreams in `tests/support/`;
+  `harness/` differential harness.
 
 Design docs: `docs/specs/2026-11-07-pooltime-design.md` (§16 overrides earlier sections) and
 `docs/specs/2026-11-07-pooltime-parity-inventory.md`; parity map in `docs/parity.md`.
@@ -107,6 +110,9 @@ Design docs: `docs/specs/2026-11-07-pooltime-design.md` (§16 overrides earlier 
 - Import is read-only on bro's files and Keychain items.
 - Tests: `cargo test`; **no network** (fake upstreams on `127.0.0.1:0`, wiremock); tempdirs only,
   never the real `$HOME`, `~/.claude*`, `~/.bro` or `~/.claude-max-pool`.
+- Integration tests share one process: add a file as a `mod` in `tests/it/main.rs`; never mutate
+  the process environment (`std::env::set_var`), pass env to child `Command`s instead; spawn
+  children and pick free ports only through `tests/support/procs.rs`.
 - Never modify the developer's real Claude Code profiles (`~/.claude`, `~/.claude.json`,
   `~/.claude-*`) or bro's state while developing or testing; set `HOME`/`POOLTIME_HOME` to a temp
   dir for any manual run of `connect`, `setup` or `import`.
