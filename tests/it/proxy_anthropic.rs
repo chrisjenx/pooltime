@@ -1,6 +1,6 @@
 //! Anthropic `/v1/messages` attempt: request shaping and the INV §1 response classification.
 
-mod support;
+use crate::support;
 
 use std::time::Duration;
 
@@ -644,10 +644,7 @@ async fn rate_limit_wording_on_non_429_is_quota() {
 #[tokio::test]
 async fn transport_error_is_retry_with_flag() {
     // Nothing listening: connect failure.
-    let closed = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap()
-    };
+    let closed = support::procs::free_addr();
     let fake = FakeAnthropic::start().await;
     let pool = Pool::new();
     let (policy, _) = fast_policy();
@@ -1854,10 +1851,7 @@ mod inference {
 
     #[tokio::test]
     async fn transport_exhaustion_sets_retryable_header() {
-        let closed = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap()
-        };
+        let closed = support::procs::free_addr();
         let fake = FakeAnthropic::start().await;
         let pool = Pool::new();
         pool.add_account("second", ProviderId::Anthropic, 100, "tok-second");

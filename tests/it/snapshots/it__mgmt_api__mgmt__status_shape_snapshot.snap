@@ -1,5 +1,5 @@
 ---
-source: tests/mgmt_api.rs
+source: tests/it/mgmt_api.rs
 expression: "serde_json::to_string_pretty(&v).unwrap()"
 ---
 {

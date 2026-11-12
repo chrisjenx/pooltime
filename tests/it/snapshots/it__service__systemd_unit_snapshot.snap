@@ -1,5 +1,5 @@
 ---
-source: tests/service.rs
+source: tests/it/service.rs
 expression: "render_systemd_unit(Path::new(\"/usr/local/bin/pooltime\"), &fake_paths())"
 ---
 [Unit]

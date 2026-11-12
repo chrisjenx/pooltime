@@ -595,10 +595,7 @@ fn connected_profile(home: &Path, paths: &Paths, name: &str) -> (Profile, Value)
 }
 
 fn service(root: &Path, shims: &Path, verb: &str) -> std::process::Output {
-    pooltime(root, shims)
-        .args(["service", verb])
-        .output()
-        .unwrap()
+    crate::support::procs::output(pooltime(root, shims).args(["service", verb]))
 }
 
 #[test]

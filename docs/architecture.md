@@ -41,8 +41,8 @@ runs).
 | `errors.rs` | classified failure kinds (never upstream text) |
 
 Outside `src/`: `web/` (dashboard), `harness/` (differential harness against bro; see
-[harness report](harness-report.md)), `tests/` (integration tests with in-process fake upstreams),
-`packaging/homebrew/`, `install.sh`.
+[harness report](harness-report.md)), `tests/it/` (integration tests in one binary, in-process
+fake upstreams in `tests/support/`), `packaging/homebrew/`, `install.sh`.
 
 ## Request flow (`POST /v1/messages`)
 

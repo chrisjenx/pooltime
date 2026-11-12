@@ -1,4 +1,5 @@
-//! Free ports and child processes for tests that do both in one test binary.
+//! Free ports and child processes. All integration tests share one binary (`tests/it`), so some
+//! test is always spawning children while another wants a free port.
 //!
 //! Finding a free port means binding a listener on `127.0.0.1:0` and closing it. A child spawned
 //! by another test thread meanwhile gets a copy of that listening socket (its fds are only closed
@@ -7,10 +8,10 @@
 //! makes the two exclusive: [`free_port`] waits until no spawn is in progress, and every spawn
 //! goes through [`spawn`] (which returns only after the child has exec'd).
 //!
-//! In a test binary that spawns children, use these instead of `Command::spawn`/`output`/
-//! `status`, `assert_cmd`'s `assert()`, or a bare `TcpListener::bind("127.0.0.1:0")` that is closed.
+//! Use these instead of `Command::spawn`/`output`/`status`, `assert_cmd`'s `assert()`, or a bare
+//! `TcpListener::bind("127.0.0.1:0")` that is closed.
 
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::RwLock;
 
@@ -21,6 +22,11 @@ pub fn free_port() -> u16 {
     let _g = SPAWN_GATE.write().unwrap_or_else(|e| e.into_inner());
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().port()
+}
+
+/// [`free_port`] as a loopback address (a connect to it is refused).
+pub fn free_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], free_port()))
 }
 
 /// `c.spawn()`, never concurrently with [`free_port`].

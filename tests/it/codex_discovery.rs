@@ -2,7 +2,7 @@
 //! strict catalog validation, additive merge into the model table, hot reload into `/v1/models`
 //! and routing without a restart, and the usage poll's last-check-only gate.
 
-mod support;
+use crate::support;
 
 use std::sync::Arc;
 use std::time::Duration;

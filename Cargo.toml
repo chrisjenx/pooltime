@@ -57,3 +57,15 @@ http-body-util = "0.1.5"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Dev/test builds: line tables only for workspace crates (panics and backtraces keep file:line),
+# no debug info for dependencies. Full debug info for a debugger: `cargo build --profile debugging`.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.debugging]
+inherits = "dev"
+debug = true

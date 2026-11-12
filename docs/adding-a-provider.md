@@ -48,7 +48,7 @@ verify the signed-in identity against the account's baseline before saving.
 | `src/routing/sessions.rs` | add it to `PROVIDERS` (sticky sessions are per provider) |
 | `src/models/` | default routes and any mapping rules |
 | `src/server/fallback.rs` | cross-provider fallback is written for exactly two providers today (`other()`); generalise it |
-| `tests/support/fake_<name>.rs`, `tests/proxy_<name>.rs` | an in-process fake upstream and integration tests |
+| `tests/support/fake_<name>.rs`, `tests/it/proxy_<name>.rs` (+ `mod` in `tests/it/main.rs`) | an in-process fake upstream and integration tests |
 
 The compiler finds the rest: every `match` on `ProviderId` is exhaustive.
 

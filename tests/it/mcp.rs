@@ -1,7 +1,7 @@
 //! Task F6: the MCP server at `/mcp` (JSON-RPC over HTTP POST), its token, its tools, and the
 //! `.claude.json` registration written by `connect --mcp`.
 
-mod support;
+use crate::support;
 
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;

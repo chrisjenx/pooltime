@@ -1,7 +1,7 @@
 //! Task 28: connect / disconnect / profile sync over a booted pool and a fake Anthropic catalog.
 //! Everything runs under tempdirs; the "user home" is a tempdir, never the real one.
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -351,11 +351,7 @@ async fn tuning_save_during_connect_keeps_the_proxy_key() {
 #[tokio::test]
 async fn connect_refuses_when_pool_unhealthy() {
     // Nothing listens on the configured port.
-    let free = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let free = support::procs::free_port();
     let fx = Fix::with(|b| Boot {
         configure: Some(Box::new(move |c| c.port = free)),
         ..b

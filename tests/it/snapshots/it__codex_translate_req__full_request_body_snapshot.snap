@@ -1,5 +1,5 @@
 ---
-source: tests/codex_translate_req.rs
+source: tests/it/codex_translate_req.rs
 expression: "serde_json::to_string_pretty(&out).unwrap()"
 ---
 {

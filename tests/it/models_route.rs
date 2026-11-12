@@ -12,7 +12,7 @@
 //! `falls_through_to_next_account_when_one_is_rejected`, `cache_serves_within_ttl`.
 //! (`buildModelListing` unit cases live in `src/server/models_route.rs`.)
 
-mod support;
+use crate::support;
 
 use std::sync::Arc;
 use std::time::Duration;

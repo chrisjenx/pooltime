@@ -1,5 +1,5 @@
 ---
-source: tests/service.rs
+source: tests/it/service.rs
 expression: "render_launchd_plist(Path::new(\"/usr/local/bin/pooltime\"), &fake_paths())"
 ---
 <?xml version="1.0" encoding="UTF-8"?>
