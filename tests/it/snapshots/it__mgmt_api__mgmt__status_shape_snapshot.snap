@@ -25,19 +25,22 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
           "key": "5h",
           "model": null,
           "utilization": 0.25,
-          "reset": "2026-11-07T15:00:00Z"
+          "reset": "2026-11-07T15:00:00Z",
+          "reset_estimated": false
         },
         {
           "key": "7d",
           "model": null,
           "utilization": 0.37,
-          "reset": "2026-11-12T09:00:00Z"
+          "reset": "2026-11-12T09:00:00Z",
+          "reset_estimated": false
         },
         {
           "key": "7d-fable",
           "model": "fable",
           "utilization": 0.9,
-          "reset": "2026-11-12T09:00:00Z"
+          "reset": "2026-11-12T09:00:00Z",
+          "reset_estimated": false
         }
       ],
       "seven_day_left": 0.63,
@@ -46,8 +49,39 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
       "identity": {
         "email": "alpha@example.com"
       },
+      "plan": "max",
+      "tier": "default_claude_max_20x",
       "in_flight": 2,
       "sessions": 3,
+      "last_used_at": "2026-11-07T11:59:00Z",
+      "usage_updated_at": "2026-11-07T12:00:00Z",
+      "unified_status": "allowed",
+      "usage_check": {
+        "at": "2026-11-07T11:55:00Z",
+        "ok": true,
+        "error": null
+      },
+      "counters": {
+        "window_started_at": "2026-11-07T09:00:00Z",
+        "window": {
+          "requests": 12,
+          "successes": 11,
+          "errors": 1,
+          "input_tokens": 3400,
+          "output_tokens": 900,
+          "cache_read": 120000,
+          "cache_write": 8000
+        },
+        "lifetime": {
+          "requests": 1500,
+          "successes": 1480,
+          "errors": 20,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cache_read": 0,
+          "cache_write": 0
+        }
+      },
       "last_error": null
     },
     {
@@ -68,13 +102,15 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
           "key": "5h",
           "model": null,
           "utilization": 1.0,
-          "reset": "2026-11-07T15:00:00Z"
+          "reset": "2026-11-07T15:00:00Z",
+          "reset_estimated": false
         },
         {
           "key": "7d",
           "model": null,
           "utilization": 0.9,
-          "reset": "2026-11-12T09:00:00Z"
+          "reset": "2026-11-12T09:00:00Z",
+          "reset_estimated": false
         }
       ],
       "seven_day_left": 0.1,
@@ -83,8 +119,35 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
       "identity": {
         "email": null
       },
+      "plan": null,
+      "tier": null,
       "in_flight": 0,
       "sessions": 0,
+      "last_used_at": null,
+      "usage_updated_at": "2026-11-07T12:00:00Z",
+      "unified_status": "allowed",
+      "usage_check": null,
+      "counters": {
+        "window_started_at": null,
+        "window": {
+          "requests": 0,
+          "successes": 0,
+          "errors": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cache_read": 0,
+          "cache_write": 0
+        },
+        "lifetime": {
+          "requests": 0,
+          "successes": 0,
+          "errors": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cache_read": 0,
+          "cache_write": 0
+        }
+      },
       "last_error": {
         "at": "2026-11-07T11:58:00Z",
         "reason": "quota"
@@ -110,8 +173,39 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
       "identity": {
         "email": null
       },
+      "plan": null,
+      "tier": null,
       "in_flight": 0,
       "sessions": 0,
+      "last_used_at": null,
+      "usage_updated_at": null,
+      "unified_status": null,
+      "usage_check": {
+        "at": "2026-11-06T00:00:00Z",
+        "ok": false,
+        "error": "http_401"
+      },
+      "counters": {
+        "window_started_at": null,
+        "window": {
+          "requests": 0,
+          "successes": 0,
+          "errors": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cache_read": 0,
+          "cache_write": 0
+        },
+        "lifetime": {
+          "requests": 0,
+          "successes": 0,
+          "errors": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cache_read": 0,
+          "cache_write": 0
+        }
+      },
       "last_error": null
     },
     {
@@ -134,8 +228,35 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
       "identity": {
         "email": null
       },
+      "plan": null,
+      "tier": null,
       "in_flight": 0,
       "sessions": 0,
+      "last_used_at": null,
+      "usage_updated_at": null,
+      "unified_status": null,
+      "usage_check": null,
+      "counters": {
+        "window_started_at": null,
+        "window": {
+          "requests": 0,
+          "successes": 0,
+          "errors": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cache_read": 0,
+          "cache_write": 0
+        },
+        "lifetime": {
+          "requests": 0,
+          "successes": 0,
+          "errors": 0,
+          "input_tokens": 0,
+          "output_tokens": 0,
+          "cache_read": 0,
+          "cache_write": 0
+        }
+      },
       "last_error": null
     }
   ],

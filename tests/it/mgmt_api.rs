@@ -614,8 +614,8 @@ mod mgmt {
 
     use async_trait::async_trait;
     use pooltime::accounts::{
-        AccountId, AccountMeta, AccountState, AccountStatus, ErrorRecord, Identity,
-        RateLimitSnapshot, StateBook, TimedOverride, Window, WindowStatus,
+        AccountId, AccountMeta, AccountState, AccountStatus, Counters, ErrorRecord, Identity,
+        RateLimitSnapshot, StateBook, TimedOverride, UsageCheck, Window, WindowStatus,
     };
     use pooltime::config::{Config, Paths};
     use pooltime::errors::{FailReason, RefreshErrorKind};
@@ -712,6 +712,8 @@ mod mgmt {
             creds: CredsInfo::Present {
                 expires_at: Some(datetime!(2026-11-07 18:00 UTC)),
                 refresh_expires_at: Some(datetime!(2026-12-01 00:00 UTC)),
+                plan: None,
+                tier: None,
             },
             in_flight: 0,
             sessions: 0,
@@ -753,6 +755,34 @@ mod mgmt {
         ready.in_flight = 2;
         ready.sessions = 3;
         ready.status_since = Some(datetime!(2026-11-05 08:30 UTC));
+        ready.creds = CredsInfo::Present {
+            expires_at: Some(datetime!(2026-11-07 18:00 UTC)),
+            refresh_expires_at: Some(datetime!(2026-12-01 00:00 UTC)),
+            plan: Some("max".into()),
+            tier: Some("default_claude_max_20x".into()),
+        };
+        ready.state.last_used_at = Some(datetime!(2026-11-07 11:59 UTC));
+        ready.state.usage_check = Some(UsageCheck {
+            at: datetime!(2026-11-07 11:55 UTC),
+            ok: true,
+            error: None,
+        });
+        ready.state.window_started_at = Some(datetime!(2026-11-07 09:00 UTC));
+        ready.state.window_counters = Counters {
+            requests: 12,
+            successes: 11,
+            errors: 1,
+            input_tokens: 3400,
+            output_tokens: 900,
+            cache_read: 120_000,
+            cache_write: 8000,
+        };
+        ready.state.lifetime = Counters {
+            requests: 1500,
+            successes: 1480,
+            errors: 20,
+            ..Counters::default()
+        };
 
         // rate limited by the 5h window; last error recorded.
         let mut limited = view(
@@ -792,11 +822,18 @@ mod mgmt {
             },
         );
         dead.status_since = Some(datetime!(2026-11-06 00:00 UTC));
+        dead.state.usage_check = Some(UsageCheck {
+            at: datetime!(2026-11-06 00:00 UTC),
+            ok: false,
+            error: Some("http_401".into()),
+        });
 
         let mut billing = view("delta", AccountStatus::Billing, AccountState::default());
         billing.creds = CredsInfo::Present {
             expires_at: None,
             refresh_expires_at: None,
+            plan: None,
+            tier: None,
         };
 
         let table = ModelTable::defaults();
@@ -817,6 +854,26 @@ mod mgmt {
         assert_eq!(v["pool"]["seven_day_left_total"].as_f64(), Some(0.73));
         assert_eq!(v["accounts"][2]["seven_day_left"], Value::Null);
         assert_eq!(v["accounts"][2]["windows"], json!([]));
+
+        // Plan, tier, last used, usage freshness and counters (bro's account drawer).
+        let a = &v["accounts"][0];
+        assert_eq!(a["plan"], "max");
+        assert_eq!(a["tier"], "default_claude_max_20x");
+        assert_eq!(a["last_used_at"], "2026-11-07T11:59:00Z");
+        assert_eq!(a["usage_updated_at"], "2026-11-07T12:00:00Z");
+        assert_eq!(a["unified_status"], "allowed");
+        assert_eq!(a["usage_check"]["ok"], true);
+        assert_eq!(a["counters"]["window_started_at"], "2026-11-07T09:00:00Z");
+        assert_eq!(a["counters"]["window"]["requests"], 12);
+        assert_eq!(a["counters"]["window"]["input_tokens"], 3400);
+        assert_eq!(a["counters"]["lifetime"]["requests"], 1500);
+        assert_eq!(a["windows"][0]["reset_estimated"], false);
+        // A dead account keeps its failed usage check (why it is dead) but no usage freshness.
+        let d = &v["accounts"][2];
+        assert_eq!(d["usage_check"]["error"], "http_401");
+        assert_eq!(d["usage_updated_at"], Value::Null);
+        assert_eq!(d["unified_status"], Value::Null);
+        assert_eq!(v["accounts"][3]["plan"], Value::Null);
     }
 
     #[test]
@@ -2649,6 +2706,42 @@ mod mgmt {
         assert!(v["profiles"].is_null(), "{v}");
         assert!(v.get("profiles").is_some(), "{v}");
         assert!(v["storage"].is_object(), "{v}");
+    }
+
+    /// The dashboard fixture stays in step with the real status document: every account field
+    /// `build_status` emits is in every fixture account (screenshots then show every field).
+    #[test]
+    fn fixture_accounts_carry_every_status_field() {
+        let raw_fixture = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/fixtures/dashboard.json"
+        ))
+        .unwrap();
+        let fixture: Value = serde_json::from_str(&raw_fixture).unwrap();
+        let inputs = StatusInputs {
+            accounts: vec![view("alpha", AccountStatus::Ready, AccountState::default())],
+            tuning: Tuning::default(),
+            mapping_enabled: false,
+            mappings: vec![],
+            inert_mappings: vec![],
+            expiry_warn: time::Duration::days(3),
+        };
+        let live = build_status(&inputs, datetime!(2026-11-07 12:00 UTC));
+        let keys = |v: &Value| -> Vec<String> {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let want = keys(&live["accounts"][0]);
+        for a in fixture["accounts"].as_array().unwrap() {
+            assert_eq!(keys(a), want, "fixture account {}", a["id"]);
+            assert_eq!(
+                keys(&a["counters"]),
+                keys(&live["accounts"][0]["counters"]),
+                "{}",
+                a["id"]
+            );
+        }
     }
 
     #[tokio::test]
