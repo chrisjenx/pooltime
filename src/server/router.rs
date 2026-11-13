@@ -52,6 +52,12 @@ pub fn routes(state: Arc<AppState>) -> Router {
             "/health",
             get(health::health).fallback(|| async { method_not_allowed("GET") }),
         )
+        // Claude Code's connectivity probe (`HEAD /api/hello`): answer it without the
+        // unknown-endpoint log line and journal row. `get` also serves HEAD.
+        .route(
+            "/api/hello",
+            get(|| async {}).fallback(|| async { method_not_allowed("GET") }),
+        )
         .route("/v1/messages", messages)
         .route("/v1/messages/count_tokens", count_tokens)
         .route(

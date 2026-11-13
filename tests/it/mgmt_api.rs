@@ -261,6 +261,27 @@ async fn unknown_path_anthropic_404_logged() {
     assert_eq!(r.header("allow"), Some("GET"));
 }
 
+/// Claude Code probes `HEAD /api/hello` to check that its base URL is reachable: answer 200,
+/// without the unknown-endpoint log line or journal row.
+#[tokio::test]
+async fn api_hello_connectivity_probe_is_answered_quietly() {
+    let pool = Pool::new();
+    let srv = pool.boot(Boot::default()).await;
+
+    let r = http_req(srv.addr, "HEAD", "/api/hello", &[], b"").await;
+    assert_eq!(r.status, 200);
+    let r = http_get(srv.addr, "/api/hello", &[]).await;
+    assert_eq!(r.status, 200);
+
+    let logs = captured_logs();
+    assert!(
+        !logs
+            .lines()
+            .any(|l| l.contains("unknown endpoint") && l.contains("/api/hello")),
+        "connectivity probe logged as an unknown endpoint"
+    );
+}
+
 #[tokio::test]
 async fn foreign_origin_rejected_on_api() {
     let pool = Pool::new();
