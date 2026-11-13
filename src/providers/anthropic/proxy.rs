@@ -60,6 +60,7 @@ pub const RETRYABLE_TRANSPORT_HEADER: &str = "x-pool-retryable-transport";
 pub const POOL_ACCOUNT_HEADER: &str = "x-pool-account";
 
 const MESSAGES_PATH: &str = "/v1/messages";
+const COUNT_TOKENS_PATH: &str = "/v1/messages/count_tokens";
 
 /// Never forwarded upstream (besides `x-api-key`, which is the pool's own credential).
 const HOP_BY_HOP_REQUEST: &[&str] = &[
@@ -115,6 +116,9 @@ struct Call<'a> {
     acct: &'a AccountId,
     state: &'a StateBook,
     req: &'a InboundRequest,
+    /// A `count_tokens` call: an upstream refusal of the request itself (a plain 4xx) says
+    /// nothing about the account, so it is replayed without being recorded as an account error.
+    quiet: bool,
 }
 
 impl AnthropicProvider {
@@ -143,6 +147,7 @@ impl AnthropicProvider {
             acct: &ctx.account.id,
             state,
             req,
+            quiet: false,
         };
         let body = prepare_body(&req.raw_body, &req.json);
         let mut token = ctx.token.clone();
@@ -190,6 +195,86 @@ impl AnthropicProvider {
         }
     }
 
+    /// One `count_tokens` call: the messages attempt without its inference side effects. Same
+    /// request shaping ([`upstream_headers`], Codex-thinking strip), one post-401 refresh and
+    /// resend, and the same classification of a refusal (quota benches and fails over, 403
+    /// entitlement/denial, transport failure fails over); but no success, usage or request is
+    /// recorded on the account, a plain 4xx is replayed without blaming the account, and an
+    /// overload is replayed at once instead of backing off (the caller can simply ask again).
+    async fn attempt_count_tokens(
+        &self,
+        mut ctx: AttemptCtx<'_>,
+        req: &InboundRequest,
+        state: &StateBook,
+    ) -> AttemptOutcome {
+        // Held for the call, released when it returns (never moved into a stream).
+        let _slot = ctx.reservation.take();
+        let call = Call {
+            acct: &ctx.account.id,
+            state,
+            req,
+            quiet: true,
+        };
+        let body = prepare_body(&req.raw_body, &req.json);
+        let mut token = ctx.token.clone();
+        let mut resp = match self.send(&ctx, req, &body, &token, COUNT_TOKENS_PATH).await {
+            Ok(r) => r,
+            Err(k) => return transport_outcome(&call, k, None),
+        };
+        if resp.status == StatusCode::UNAUTHORIZED {
+            drop(resp);
+            match self.token_after_reject(ctx.account, &token).await {
+                Ok(t) => token = t,
+                Err(k) => return refresh_failure_outcome(k),
+            }
+            resp = match self.send(&ctx, req, &body, &token, COUNT_TOKENS_PATH).await {
+                Ok(r) => r,
+                Err(k) => return transport_outcome(&call, k, None),
+            };
+        }
+        if let Some(snap) = parse_unified_headers(&resp.headers, OffsetDateTime::now_utc()) {
+            state.merge_header_snapshot(call.acct, snap);
+        }
+        let (status, headers) = (resp.status, resp.headers);
+        if status.is_success() {
+            return match resp.body.read_all().await {
+                Ok(bytes) => {
+                    tracing::info!(
+                        account = %call.acct,
+                        request_id = %req.request_id,
+                        status = status.as_u16(),
+                        upstream_request_id = request_id(&headers).as_deref().unwrap_or("-"),
+                        "anthropic count_tokens served"
+                    );
+                    let b = Buffered {
+                        status,
+                        headers,
+                        body: bytes,
+                    };
+                    AttemptOutcome::Done(replay(&b, call.acct), None)
+                }
+                Err(k) => transport_outcome(&call, k, request_id(&headers)),
+            };
+        }
+        let bytes = resp.body.read_all().await.unwrap_or_default();
+        let b = Buffered {
+            status,
+            headers,
+            body: bytes,
+        };
+        match self.classify_error(&call, b) {
+            Step::Outcome(o) => o,
+            Step::Overloaded(b) => {
+                AttemptOutcome::Terminal(replay(&b, call.acct), FailReason::Overloaded)
+            }
+            // `classify_error` never commits a stream.
+            Step::Stream(_) => AttemptOutcome::Terminal(
+                anthropic_error(502, "api_error", "Unexpected upstream response"),
+                FailReason::Status(502),
+            ),
+        }
+    }
+
     /// Send once (plus the one post-401 resend) and classify the response.
     async fn exchange(
         &self,
@@ -199,7 +284,7 @@ impl AnthropicProvider {
         token: &mut String,
         refreshed: &mut bool,
     ) -> Step {
-        let mut resp = match self.send(ctx, call.req, body, token).await {
+        let mut resp = match self.send(ctx, call.req, body, token, MESSAGES_PATH).await {
             Ok(r) => r,
             Err(k) => return Step::Outcome(transport_outcome(call, k, None)),
         };
@@ -210,7 +295,7 @@ impl AnthropicProvider {
                 Ok(t) => *token = t,
                 Err(k) => return Step::Outcome(refresh_failure_outcome(k)),
             }
-            resp = match self.send(ctx, call.req, body, token).await {
+            resp = match self.send(ctx, call.req, body, token, MESSAGES_PATH).await {
                 Ok(r) => r,
                 Err(k) => return Step::Outcome(transport_outcome(call, k, None)),
             };
@@ -260,8 +345,9 @@ impl AnthropicProvider {
         req: &InboundRequest,
         body: &Bytes,
         token: &str,
+        path: &str,
     ) -> Result<crate::upstream::UpstreamResponse, TransportKind> {
-        let request = self.build_request(req, body, token)?;
+        let request = self.build_request(req, body, token, path)?;
         ctx.upstream.send(request, &ctx.limits).await
     }
 
@@ -270,13 +356,12 @@ impl AnthropicProvider {
         req: &InboundRequest,
         body: &Bytes,
         token: &str,
+        path: &str,
     ) -> Result<reqwest::Request, TransportKind> {
-        let url: reqwest::Url = join_url(&self.cfg.api_base, MESSAGES_PATH)
-            .parse()
-            .map_err(|_| {
-                tracing::error!("anthropic api_base is not a valid URL");
-                TransportKind::Other
-            })?;
+        let url: reqwest::Url = join_url(&self.cfg.api_base, path).parse().map_err(|_| {
+            tracing::error!("anthropic api_base is not a valid URL");
+            TransportKind::Other
+        })?;
         let mut auth = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
             tracing::error!("stored access token is not a valid header value");
             TransportKind::Other
@@ -362,7 +447,9 @@ impl AnthropicProvider {
             _ => {
                 log("terminal");
                 let reason = FailReason::Status(code);
-                record(call, reason, upstream_request_id.clone(), now);
+                if !call.quiet {
+                    record(call, reason, upstream_request_id.clone(), now);
+                }
                 Step::Outcome(AttemptOutcome::Terminal(replay(&b, call.acct), reason))
             }
         }
@@ -464,6 +551,15 @@ impl Provider for AnthropicProvider {
         state: &StateBook,
     ) -> AttemptOutcome {
         self.attempt_messages(ctx, req, state).await
+    }
+
+    async fn count_tokens(
+        &self,
+        ctx: AttemptCtx<'_>,
+        req: &InboundRequest,
+        state: &StateBook,
+    ) -> AttemptOutcome {
+        self.attempt_count_tokens(ctx, req, state).await
     }
 
     async fn poll_usage(&self, acct: &AccountMeta) -> Result<RateLimitSnapshot, UsageError> {

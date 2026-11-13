@@ -154,7 +154,7 @@ async fn route_and_serve(app: &Arc<AppState>, mut req: InboundRequest) -> Served
     req.journal.set_provider(route.def.provider.as_str());
 
     if route.def.provider == ProviderId::OpenAi {
-        return serve_provider(app, ProviderId::OpenAi, &route, &req, &budget).await;
+        return serve_provider(app, ProviderId::OpenAi, &route, &req, &budget, Op::Messages).await;
     }
 
     let cr = app.cfg.routing.classifier_route;
@@ -182,14 +182,26 @@ async fn route_and_serve(app: &Arc<AppState>, mut req: InboundRequest) -> Served
     };
     let mut served = match first {
         // Neither provider has a usable account: let the Anthropic path produce its 503.
-        None => serve_provider(app, ProviderId::Anthropic, &route, req, &budget).await,
+        None => {
+            serve_provider(
+                app,
+                ProviderId::Anthropic,
+                &route,
+                req,
+                &budget,
+                Op::Messages,
+            )
+            .await
+        }
         Some(first) if use_fallback => {
             fallback::serve_with_cross_provider_fallback(first, &req.request_id, |svc| {
-                serve_provider(app, svc, route_for(svc), req, &budget)
+                serve_provider(app, svc, route_for(svc), req, &budget, Op::Messages)
             })
             .await
         }
-        Some(first) => serve_provider(app, first, route_for(first), req, &budget).await,
+        Some(first) => {
+            serve_provider(app, first, route_for(first), req, &budget, Op::Messages).await
+        }
     };
     if is_classifier {
         served
@@ -368,13 +380,23 @@ fn set_account_header(resp: &mut Response, acct: &AccountId) {
     }
 }
 
+/// What [`serve_provider`] asks of the chosen account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Op {
+    /// `POST /v1/messages`.
+    Messages,
+    /// `POST /v1/messages/count_tokens`: same account choice and failover, not an inference.
+    CountTokens,
+}
+
 /// Serve `req` on one provider, failing over across its accounts.
-async fn serve_provider(
+pub(super) async fn serve_provider(
     app: &Arc<AppState>,
     pid: ProviderId,
     route: &Route,
     req: &InboundRequest,
     budget: &WaitBudget,
+    op: Op,
 ) -> Served {
     let rid = req.request_id.as_str();
     let Some(provider) = app.providers.get(&pid) else {
@@ -454,7 +476,10 @@ async fn serve_provider(
                     upstream: &app.upstream,
                     reservation: Some(reservation),
                 };
-                provider.attempt(ctx, req, &app.state).await
+                match op {
+                    Op::Messages => provider.attempt(ctx, req, &app.state).await,
+                    Op::CountTokens => provider.count_tokens(ctx, req, &app.state).await,
+                }
             }
             Err(kind) => {
                 drop(reservation);

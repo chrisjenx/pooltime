@@ -196,7 +196,7 @@ async fn journal_row_per_request_with_attempt_chain() {
     let r = http_req(
         booted.addr,
         "POST",
-        "/v1/messages/count_tokens?code=SECRETCODE&beta=true",
+        "/v1/messages/unknown_thing?code=SECRETCODE&beta=true",
         &[("content-type", "application/json")],
         b"{}",
     )
@@ -206,7 +206,7 @@ async fn journal_row_per_request_with_attempt_chain() {
     let j = journaled(booted.addr, &nid).await;
     assert_eq!(j["request"]["outcome"], "error");
     assert_eq!(j["request"]["reason"], "unknown_path");
-    assert_eq!(j["request"]["path"], "/v1/messages/count_tokens");
+    assert_eq!(j["request"]["path"], "/v1/messages/unknown_thing");
     assert_eq!(j["request"]["status"], 404);
     assert!(j["attempts"].as_array().unwrap().is_empty());
 

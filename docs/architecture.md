@@ -5,6 +5,7 @@ One Rust binary. `pooltime serve` is a tokio/axum daemon on `127.0.0.1:3460` tha
 | Path | What |
 |---|---|
 | `POST /v1/messages` | Anthropic Messages API (what Claude Code calls); the proxy key is optional in config, but `connect` generates one and the running daemon enforces it at once |
+| `POST /v1/messages/count_tokens` | token counting: forwarded to Anthropic with a pooled account for Claude models, a local estimate for Codex-served models (see below); same Host/Origin guard and proxy key as `/v1/messages` |
 | `GET /v1/models` | the model list Claude Code sees |
 | `GET /health` | identity check (so nobody trusts or kills a foreign listener) |
 | `/api/v1/*` | management API: the one layer the dashboard, CLI and MCP all call |
@@ -21,7 +22,7 @@ runs).
 |---|---|
 | `main.rs`, `cli/` | clap entry point; one file per command (`setup`, `doctor`, `accounts`, ...); `cli/client.rs` finds the daemon and talks to it |
 | `config.rs` | `config.toml`, `POOLTIME_*` overlay, defaults, data-dir `Paths` |
-| `server/` | `daemon` (boot), `router` (routes + middleware), `auth`, `inference` (`/v1/messages` and the failover loop), `fallback` (cross-provider), `classifier`, `models_route`, `health`, `shutdown` (drain), `mgmt` (management API), `journal_api`, `analytics_api`, `dashboard` |
+| `server/` | `daemon` (boot), `router` (routes + middleware), `auth`, `inference` (`/v1/messages` and the failover loop), `count_tokens`, `fallback` (cross-provider), `classifier`, `models_route`, `health`, `shutdown` (drain), `mgmt` (management API), `journal_api`, `analytics_api`, `dashboard` |
 | `providers/` | the `Provider` trait; `anthropic/` (passthrough proxy, OAuth refresh, rate-limit headers, usage poll, catalog) and `openai/` (Codex: request/stream translation, OAuth, usage, catalog); `stream_guard` (shared stream pump) |
 | `signin/` | OAuth PKCE sign-in flows (`claude`, `openai`), the localhost `callback` listener, paste-code mode |
 | `accounts/` | account ids, `account.toml` registry, credentials (0600), identity verification, the runtime `StateBook` (availability per account) |
@@ -82,3 +83,24 @@ status-line cache, usage sampler, session pruning (every minute), retention (hou
 
 Related: [Adding a provider](adding-a-provider.md), [`AGENTS.md`](../AGENTS.md), [parity](parity.md),
 [performance](perf.md).
+
+## `POST /v1/messages/count_tokens`
+
+Claude Code asks this for context accounting. It reuses the `/v1/messages` plumbing but is not an
+inference:
+
+- **Claude models** are forwarded to Anthropic's `/v1/messages/count_tokens` through the same
+  account loop (`server/inference.rs` `serve_provider`, `Op::CountTokens`) and the same upstream
+  request shaping (client `authorization`/`x-api-key` stripped, the account's bearer set,
+  `anthropic-version`/`anthropic-beta` passed through as sent). A 401 refreshes and retries once;
+  a quota 429 benches the account and fails over; other refusals are replayed.
+- **Codex-served models** (an OpenAI model id, or a Claude id mapped to Codex when no Claude
+  account can answer) get a local estimate, `{"input_tokens": ceil(request bytes / 4)}` with
+  `x-pool-estimate: 1`. OpenAI has no counting endpoint and another tokenizer would not match the
+  Claude count anyway; a clean 200 keeps Claude Code from logging a failure every turn.
+- **No inference side effects**: no sticky session is read or written, the account records no
+  success, token usage or request (so `last used`, counters and the utilization-based burn
+  analytics are unaffected), and a plain upstream 4xx is not held against the account.
+- **Journal**: the request gets a row (`path`, model, status, outcome, `provider`) so failures are
+  visible, but no attempt rows, so per-account attempt counts and error rates stay about real
+  inference.

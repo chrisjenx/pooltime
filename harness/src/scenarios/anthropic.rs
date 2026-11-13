@@ -190,12 +190,12 @@ pub fn scenarios() -> Vec<Scenario> {
         .steps(vec![stream()]),
         Scenario::new(
             "unknown_path",
-            "an endpoint neither proxy implements (count_tokens) gets a 404",
+            "an endpoint neither proxy implements (the legacy /v1/complete) gets a 404",
             |_| {},
         )
         .accounts(one())
         .steps(vec![Step::post(
-            "/v1/messages/count_tokens",
+            "/v1/complete",
             claude_body(SONNET, false, None),
         )]),
         Scenario::new(

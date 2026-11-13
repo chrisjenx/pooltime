@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `POST /v1/messages/count_tokens` (Claude Code's token counting) no longer fails with
+  "unknown endpoint". Claude models are counted by Anthropic through a pooled account, with the
+  same credential handling and proxy-key enforcement as `/v1/messages`; it never pins a session,
+  counts as a served request or touches usage and burn analytics. Models Codex serves get a local
+  estimate (request bytes / 4, flagged `x-pool-estimate: 1`) because OpenAI has no such endpoint.
+  The request shows in the journal without attempts.
+
 ## 1.0.1 - 2026-11-12
 
 ### Dashboard

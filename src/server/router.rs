@@ -22,7 +22,7 @@ use http_body::Frame;
 use serde_json::Value;
 
 use super::inference::{self, RequestId, REQUEST_ID_HEADER};
-use super::{auth, dashboard, health, mgmt, models_route, AppState, PendingGuard};
+use super::{auth, count_tokens, dashboard, health, mgmt, models_route, AppState, PendingGuard};
 use crate::logging::{debug_headers, new_request_id, redact_uri};
 use crate::providers::anthropic::anthropic_error;
 use crate::store::journal::Journal;
@@ -44,12 +44,16 @@ pub fn routes(state: Arc<AppState>) -> Router {
     let messages = post(inference::messages)
         .route_layer(from_fn_with_state(state.clone(), auth::require_proxy_key))
         .fallback(|| async { method_not_allowed("POST") });
+    let count_tokens = post(count_tokens::count_tokens)
+        .route_layer(from_fn_with_state(state.clone(), auth::require_proxy_key))
+        .fallback(|| async { method_not_allowed("POST") });
     Router::new()
         .route(
             "/health",
             get(health::health).fallback(|| async { method_not_allowed("GET") }),
         )
         .route("/v1/messages", messages)
+        .route("/v1/messages/count_tokens", count_tokens)
         .route(
             "/v1/models",
             get(models_route::models).fallback(|| async { method_not_allowed("GET") }),
@@ -118,7 +122,7 @@ async fn assign_request_id(
 /// Unknown endpoint: Anthropic-shaped 404. Logs method and path only, never the query string
 /// (it can carry `code=`/`state=`/keys).
 /// Journaled as an `error` with reason `unknown_path` and the path (so new Claude Code endpoints
-/// such as `count_tokens` are visible).
+/// show up).
 async fn not_found(
     State(app): State<Arc<AppState>>,
     method: Method,
