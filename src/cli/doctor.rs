@@ -4,7 +4,8 @@
 //!
 //! Checks, in order:
 //! - **service**: launchd/systemd definition installed and running (`!` when not installed: the
-//!   pool then runs only while `pooltime serve` does; `✗` when installed but not running).
+//!   pool then runs only while `pooltime serve` does; `✗` when installed but not running; `!`
+//!   when the definition predates seamless restarts and needs one `pooltime service install`).
 //! - **health**: what answers `/health` on the configured address (pooltime `✓`; bro, another
 //!   server, a hung listener or nothing `✗`).
 //! - **profile <id>**, per profile recorded in `config.toml`: still connected (a profile
@@ -299,25 +300,46 @@ fn home_default() -> Option<PathBuf> {
 }
 
 fn service_check(paths: &Paths) -> Check {
-    let label = "service";
     let st = Backend::native()
         .and_then(|b| Ok((b, Env::from_process(paths)?)))
-        .and_then(|(b, env)| b.status(&env, &SystemRunner));
+        .and_then(|(b, env)| Ok((b.status(&env, &SystemRunner)?, b.supervised(&env))));
     match st {
-        Ok(s) if s.running => Check::new(Level::Ok, label, "installed and running"),
-        Ok(s) if s.installed => Check::new(Level::Fail, label, "installed but not running")
+        Ok((s, supervised)) => service_verdict(&s, supervised),
+        Err(e) => Check::new(
+            Level::Warn,
+            "service",
+            format!("could not ask the service manager: {e:#}"),
+        ),
+    }
+}
+
+/// `supervised`: whether the installed definition runs the supervisor (`None`: none installed).
+fn service_verdict(s: &crate::service::Status, supervised: Option<bool>) -> Check {
+    let label = "service";
+    match (s.installed, s.running, supervised) {
+        (true, running, Some(false)) => Check::new(
+            Level::Warn,
+            label,
+            format!(
+                "installed{}, but from before seamless restarts (a restart makes new requests \
+                 wait for the in-flight ones)",
+                if running {
+                    " and running"
+                } else {
+                    ", not running"
+                }
+            ),
+        )
+        .hint("`pooltime service install` once (`pooltime service restart` also does it)"),
+        (_, true, _) => Check::new(Level::Ok, label, "installed and running"),
+        (true, false, _) => Check::new(Level::Fail, label, "installed but not running")
             .hint("`pooltime service restart`, then `pooltime logs` if it stops again"),
-        Ok(_) => Check::new(
+        (false, false, _) => Check::new(
             Level::Warn,
             label,
             "not installed (the pool runs only while `pooltime serve` does)",
         )
         .hint("`pooltime service install`"),
-        Err(e) => Check::new(
-            Level::Warn,
-            label,
-            format!("could not ask the service manager: {e:#}"),
-        ),
     }
 }
 
@@ -1766,6 +1788,30 @@ mod tests {
         );
         let c = storage_check(&paths, &ret(2), Some(7));
         assert!(c.detail.contains("journal 7 of 100000 requests"), "{c}");
+    }
+
+    #[test]
+    fn service_from_before_seamless_restarts_is_a_warning() {
+        let st = |installed, running| crate::service::Status {
+            installed,
+            running,
+            detail: String::new(),
+        };
+        let old = service_verdict(&st(true, true), Some(false));
+        assert_eq!(old.level, Level::Warn);
+        assert!(
+            old.to_string().contains("pooltime service install"),
+            "{old}"
+        );
+        assert_eq!(
+            service_verdict(&st(true, true), Some(true)).level,
+            Level::Ok
+        );
+        assert_eq!(
+            service_verdict(&st(true, false), Some(true)).level,
+            Level::Fail
+        );
+        assert_eq!(service_verdict(&st(false, false), None).level, Level::Warn);
     }
 
     #[test]

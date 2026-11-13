@@ -12,6 +12,7 @@ expression: "render_launchd_plist(Path::new(\"/usr/local/bin/pooltime\"), &fake_
   <array>
     <string>/usr/local/bin/pooltime</string>
     <string>serve</string>
+    <string>--supervise</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

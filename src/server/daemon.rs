@@ -4,9 +4,15 @@
 //! and shadow-run guards -> store, registry, state, sessions, providers -> background tasks ->
 //! serve until SIGTERM/SIGINT. The background tasks stop with the server and never take the
 //! daemon down: they log failures (no tokens, no bodies) and carry on.
+//!
+//! Run by the supervisor (`--listen-fd`/`--control-fd`, see [`crate::supervisor`]) the daemon
+//! is one worker generation: it serves the inherited socket, skips the "already running"
+//! preflight (the previous generation still answers there), starts its background tasks only
+//! when made active, and hands them back on `handoff` before draining.
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,8 +20,13 @@ use anyhow::Context;
 use time::OffsetDateTime;
 use tokio::task::JoinHandle;
 
-use super::{health, mgmt, serve_until_signal, AppState, Outcome};
+use super::handoff::{until, Control, Inherited};
+use super::shutdown::install_signals_supervised;
+use super::{
+    health, mgmt, serve_until, serve_until_signal, AppState, Outcome, ServeOpts, StopKind,
+};
 use crate::accounts::{Registry, StateBook};
+use crate::claude_code::statusline::StatusCache;
 use crate::cli::ServeFlags;
 use crate::config::{Config, Paths};
 use crate::models::ModelTable;
@@ -27,6 +38,7 @@ use crate::providers::{Provider, ProviderId};
 use crate::routing::reserve::Reservations;
 use crate::routing::sessions::Sessions;
 use crate::store::{prune, Store};
+use crate::supervisor::proto::FromWorker;
 use crate::upstream::Upstream;
 
 /// How often idle sticky-session pins are dropped.
@@ -46,6 +58,12 @@ const RETENTION_EVERY: Duration = Duration::from_secs(60 * 60);
 /// bro pool would share imported accounts (unless `flags.i_stopped_bro`), or when the port
 /// cannot be bound.
 pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
+    // A supervised worker: own the inherited sockets before anything else opens a file.
+    let inherited = match (flags.listen_fd, flags.control_fd) {
+        (Some(l), Some(c)) => Some(Inherited::take(l, c)?),
+        (None, None) => None,
+        _ => anyhow::bail!("--listen-fd and --control-fd go together"),
+    };
     paths
         .ensure()
         .context("creating the pooltime data directory")?;
@@ -56,11 +74,29 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
     if let Some(host) = flags.host {
         cfg.host = host;
     }
+    // A worker serves the supervisor's socket: its address is the one in effect.
+    let configured = SocketAddr::new(cfg.host, cfg.port);
+    let bound = match &inherited {
+        Some(i) => Some(i.listener.local_addr()?),
+        None => None,
+    };
+    if let Some(a) = bound {
+        (cfg.host, cfg.port) = (a.ip(), a.port());
+    }
     cfg.validate()?;
     let _log = crate::logging::init(&paths, &cfg.retention, std::io::stderr().is_terminal())?;
     crate::logging::install_panic_hook();
+    if bound.is_some_and(|a| a != configured) {
+        tracing::warn!(
+            %configured, serving = %SocketAddr::new(cfg.host, cfg.port),
+            "the configured address changed: `pooltime service install` moves the service to it"
+        );
+    }
 
-    health::preflight(&cfg).await?;
+    // Another generation answering on the inherited socket is expected, not a conflict.
+    if inherited.is_none() {
+        health::preflight(&cfg).await?;
+    }
     let registry = Arc::new(Registry::load(&paths)?);
     health::check_bro_shadow(&registry, health::BRO_PORT, flags.i_stopped_bro).await?;
 
@@ -123,7 +159,6 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
         (ProviderId::OpenAi, openai.clone() as Arc<dyn Provider>),
     ]);
 
-    let retention_cfg = cfg.retention.clone();
     let (host, port) = (cfg.host, cfg.port);
     let app = Arc::new(
         AppState::new(
@@ -147,8 +182,72 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
         %host, port,
         version = env!("CARGO_PKG_VERSION"),
         accounts = app.registry.list().len(),
+        supervised = inherited.is_some(),
         "pooltime starting"
     );
+    let spawn = {
+        let app = app.clone();
+        move || spawn_background(app, anthropic, openai, sessions)
+    };
+    let outcome = match inherited {
+        None => {
+            let bg = spawn();
+            let outcome = serve_until_signal(app.clone()).await;
+            // Status lines say `pool down` right away instead of once the cache goes stale.
+            bg.stop().await;
+            outcome
+        }
+        Some(inherited) => serve_supervised(app.clone(), inherited, spawn).await,
+    };
+    // A refresh that already spent a rotating refresh token must get the new one to disk.
+    let refreshes = app.providers.values().map(|p| {
+        let p = p.clone();
+        Box::pin(async move { p.drain_refreshes().await }) as _
+    });
+    let (refresh_bound, flush_bound) = shutdown_bounds(outcome.as_ref().ok());
+    if !drain_within(refreshes.collect(), refresh_bound).await {
+        tracing::warn!("token refreshes still running at exit");
+    }
+    // Journal, state and session writes queued so far.
+    if !flush_store(&app.store, flush_bound).await {
+        tracing::warn!("database writes still queued at exit");
+    }
+    match outcome? {
+        Outcome::Drained => tracing::info!("pooltime stopped"),
+        Outcome::TimedOut | Outcome::Forced => {
+            tracing::warn!("pooltime stopped with requests in flight")
+        }
+    }
+    Ok(())
+}
+
+/// The daemon's background work: pollers, profile sync, health and alerts, sampler, pruning and
+/// the status-line cache. Exactly one process runs it (the single writer of those files and
+/// rows): a supervised worker only once the supervisor makes it the active generation.
+struct Background {
+    tasks: Tasks,
+    cache: StatusCache,
+}
+
+/// How long a handing-off worker waits for its background work to stop.
+const RELEASE_BOUND: Duration = Duration::from_secs(5);
+
+impl Background {
+    /// Shutting down: stop, and delete the status cache so status lines say `pool down` at once.
+    async fn stop(self) {
+        drop(self.tasks);
+        self.cache.shutdown().await;
+    }
+}
+
+fn spawn_background(
+    app: Arc<AppState>,
+    anthropic: Arc<AnthropicProvider>,
+    openai: Arc<OpenAiProvider>,
+    sessions: Arc<Sessions>,
+) -> Background {
+    let store = app.store.clone();
+    let retention_cfg = app.cfg.retention.clone();
     let tasks = Tasks(vec![
         spawn_usage_sweeper(anthropic, SWEEP_INTERVAL),
         openai::spawn_usage_sweeper(openai, SWEEP_INTERVAL),
@@ -201,33 +300,121 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
             }
         }),
     ]);
-
     // run/status-cache.json for `pooltime statusline` (spec §16).
-    let cache = crate::claude_code::statusline::spawn_status_cache(app.clone());
-    let outcome = serve_until_signal(app.clone()).await;
-    drop(tasks);
-    // Status lines say `pool down` right away instead of once the cache goes stale.
-    cache.shutdown().await;
-    // A refresh that already spent a rotating refresh token must get the new one to disk.
-    let refreshes = app.providers.values().map(|p| {
-        let p = p.clone();
-        Box::pin(async move { p.drain_refreshes().await }) as _
+    let cache = crate::claude_code::statusline::spawn_status_cache(app);
+    Background { tasks, cache }
+}
+
+/// Handing off to a newer generation: stop the background tasks and wait for the blocking work
+/// they started, stop persisting account state, and get every queued write to disk, so that
+/// after `released` the next generation is the only writer (it reloads account state then).
+/// The status cache is left for it to update. Bounded by [`RELEASE_BOUND`].
+async fn release(app: &AppState, bg: Option<Background>) {
+    let work = async {
+        if let Some(bg) = bg {
+            bg.tasks.stop().await;
+            bg.cache.release().await;
+        }
+        crate::background::idle().await;
+        app.state.stop_persisting();
+        let _ = app.store.exec(|_| Ok(())).await;
+    };
+    if tokio::time::timeout(RELEASE_BOUND, work).await.is_err() {
+        tracing::warn!("background work still stopping at handoff");
+    }
+    app.state.stop_persisting();
+}
+
+/// A worker run by the supervisor: serve the inherited socket at once and follow the
+/// supervisor's orders over the control socket. `active`: reload account state from the
+/// database and start the background tasks. `handoff`: [`release`] them, answer `released`,
+/// stop accepting and drain. `stop`: drain as an unsupervised daemon does; `force`: stop now.
+///
+/// OS signals are ignored while the supervisor is there (it receives the service manager's
+/// signals and passes them on as orders), so a `SIGTERM` sent to the whole process group is
+/// never counted twice. If the control socket closes (the supervisor died), the worker hands
+/// off on its own, and from then on its second `SIGTERM` forces exit.
+async fn serve_supervised(
+    app: Arc<AppState>,
+    inherited: Inherited,
+    spawn: impl FnOnce() -> Background + Send + 'static,
+) -> anyhow::Result<Outcome> {
+    let signals = install_signals_supervised().context("installing signal handlers")?;
+    let ctl = Arc::new(Control::start(inherited.control)?);
+    let listener = tokio::net::TcpListener::from_std(inherited.listener)?;
+    let slot: Arc<std::sync::Mutex<Option<Background>>> = Arc::default();
+    let life = tokio::spawn({
+        let (ctl, slot, app) = (ctl.clone(), slot.clone(), app.clone());
+        async move {
+            let mut rx = ctl.orders();
+            let o = until(&mut rx, |o| o.active || o.ending().is_some()).await;
+            if o.ending().is_none() {
+                // What the previous generation learned before it released.
+                let book = app.state.clone();
+                let now = OffsetDateTime::now_utc();
+                match tokio::task::spawn_blocking(move || book.reload(now)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %format!("{e:#}"), "could not reload account state")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "account state reload failed"),
+                }
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(spawn());
+                tracing::info!("active generation: background tasks started");
+            }
+            let o = until(&mut rx, |o| o.ending().is_some()).await;
+            if o.ending() == Some(StopKind::Handoff) {
+                let bg = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+                release(&app, bg).await;
+                tracing::info!("background work released for the handoff");
+                ctl.send(&FromWorker::Released);
+            }
+        }
     });
-    let (refresh_bound, flush_bound) = shutdown_bounds(outcome.as_ref().ok());
-    if !drain_within(refreshes.collect(), refresh_bound).await {
-        tracing::warn!("token refreshes still running at exit");
-    }
-    // Journal, state and session writes queued so far.
-    if !flush_store(&app.store, flush_bound).await {
-        tracing::warn!("database writes still queued at exit");
-    }
-    match outcome? {
-        Outcome::Drained => tracing::info!("pooltime stopped"),
-        Outcome::TimedOut | Outcome::Forced => {
-            tracing::warn!("pooltime stopped with requests in flight")
+
+    let mut rx = ctl.orders();
+    let shutdown = async move {
+        until(&mut rx, |o| o.ending().is_some())
+            .await
+            .ending()
+            .unwrap_or(StopKind::Stop)
+    };
+    // Spawned now, not when the drain first polls it (after the handoff grace): SIGTERMs are
+    // counted from the moment the supervisor is found gone.
+    let mut rx = ctl.orders();
+    let mut sigs = signals.counter();
+    let (forced_tx, mut forced) = tokio::sync::watch::channel(false);
+    let watch_force = tokio::spawn(async move {
+        let o = until(&mut rx, |o| o.force || o.orphaned).await;
+        if !o.force {
+            // Orphaned and draining on its own: the second SIGTERM from here on forces exit.
+            let from = *sigs.borrow_and_update();
+            let _ = sigs.wait_for(|n| *n >= from + 2).await;
+        }
+        let _ = forced_tx.send(true);
+    });
+    let force = async move {
+        let _ = forced.wait_for(|f| *f).await;
+    };
+    let opts = ServeOpts::default().with_force(force);
+    let router = super::router(app.clone());
+    let serving = serve_until(listener, app.clone(), router, shutdown, opts);
+    ctl.send(&FromWorker::Ready {
+        version: env!("CARGO_PKG_VERSION").into(),
+    });
+    let served = serving.await;
+    watch_force.abort();
+    if matches!(served, Ok((_, StopKind::Handoff))) {
+        // Released long ago (it races only the grace period); let it finish its message.
+        let _ = tokio::time::timeout(RELEASE_BOUND, life).await;
+    } else {
+        life.abort();
+        let bg = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(bg) = bg {
+            bg.stop().await;
         }
     }
-    Ok(())
+    served.map(|(outcome, _)| outcome)
 }
 
 /// The account state book, with the configured counter window and access-denied cooldown.
@@ -271,6 +458,17 @@ async fn flush_store(store: &Store, within: Duration) -> bool {
 
 /// Aborts the background tasks when dropped (on shutdown or a failed bind).
 struct Tasks(Vec<JoinHandle<()>>);
+
+impl Tasks {
+    /// Abort every task and wait until each has stopped at its next await point.
+    async fn stop(mut self) {
+        let handles = std::mem::take(&mut self.0);
+        for h in &handles {
+            h.abort();
+        }
+        futures_util::future::join_all(handles).await;
+    }
+}
 
 impl Drop for Tasks {
     fn drop(&mut self) {

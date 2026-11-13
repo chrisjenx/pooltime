@@ -77,21 +77,38 @@ status line and MCP server are added with `pooltime connect --statusline --mcp` 
 ```sh
 pooltime service install     # install and start (re-running replaces and reloads it)
 pooltime service status      # installed? running?
-pooltime service restart
+pooltime service restart     # new worker takes new requests; the old one finishes its streams
 pooltime service uninstall   # disconnects every Claude Code profile first, then removes it
 ```
+
+The service runs `pooltime serve --supervise`: a small supervisor that owns the port and runs
+the daemon as a worker process. `pooltime service restart` starts a new worker from the installed
+binary, which takes new connections within about a second, while the old worker finishes its
+in-flight requests (streams included) and exits; the port never closes, so nothing is refused or
+answered with 503. A worker that crashes is replaced at once (clients wait on the open port
+meanwhile). `pooltime service status` shows the supervisor and the worker generations.
+
+- **Upgrading from 1.0.x:** the service definition changed. Run `pooltime service install` once
+  (or `pooltime service restart`, which notices the old definition and reinstalls it). That
+  restart still waits for in-flight requests like before; `pooltime doctor` warns until it is
+  done.
+- The supervisor itself is only replaced by `pooltime service install` (a full restart that
+  drains first). It rarely changes; `service restart` says when it is older than the worker.
+- A changed `port` or `host` needs `pooltime service install`: the supervisor keeps the socket it
+  bound.
 
 - **macOS**: a LaunchAgent at `~/Library/LaunchAgents/dev.pooltime.daemon.plist` (label
   `dev.pooltime.daemon`), loaded into your GUI session. It restarts the daemon if it exits.
 - **Linux**: a systemd user unit at `~/.config/systemd/user/pooltime.service` (honours
-  `XDG_CONFIG_HOME`), `Restart=on-failure`, `TimeoutStopSec=600`. A user unit stops when you log
+  `XDG_CONFIG_HOME`), `Restart=on-failure`, `TimeoutStopSec=600`, `KillMode=mixed` (a stop
+  reaches the supervisor, which stops its workers), `ExecReload` = the restart signal. A user unit stops when you log
   out; to keep it running (servers, SSH-only machines):
 
   ```sh
   loginctl enable-linger "$USER"
   ```
 
-Both run `pooltime serve` with `POOLTIME_HOME` set; when installed by Homebrew they point at the
+Both run `pooltime serve --supervise` with `POOLTIME_HOME` set; when installed by Homebrew they point at the
 stable `<prefix>/bin/pooltime` symlink, so `brew upgrade` needs only `pooltime service restart`.
 The service does not see your shell's `POOLTIME_PORT`/`POOLTIME_HOST`: put a non-default port in
 `config.toml` instead (see [Configuration](configuration.md)).

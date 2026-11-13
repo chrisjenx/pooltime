@@ -52,6 +52,8 @@ See [docs/architecture.md](docs/architecture.md) for the module map and request 
   alerts, account choice, model table.
 - `src/claude_code/`: Claude Code profile connect/disconnect, pins, status line, MCP registration.
 - `src/store/`: SQLite journal, timeline, usage history, retention.
+- `src/supervisor/`: `serve --supervise`, worker generations and seamless restarts (the
+  service's main process); `src/server/handoff.rs` is a worker's side.
 - `src/mcp/`, `src/service/`, `src/import/`, `src/analytics/`.
 - `src/config.rs`, `src/fsutil.rs`, `src/upstream.rs`, `src/sse.rs`, `src/logging.rs`, `src/errors.rs`.
 - `web/` dashboard (vanilla JS, embedded); `tests/it/` integration tests, one module per file,

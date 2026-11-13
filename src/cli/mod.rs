@@ -106,6 +106,22 @@ pub struct ServeFlags {
     /// Confirm the bro pool is stopped, so imported accounts may be served.
     #[arg(long)]
     pub i_stopped_bro: bool,
+    /// Run as a supervisor that owns the port and runs the daemon as worker processes, so
+    /// `pooltime service restart` hands over to a new worker without closing the port (what the
+    /// background service runs).
+    #[arg(long)]
+    pub supervise: bool,
+    /// Worker mode (set by the supervisor): serve on this inherited listening socket.
+    #[arg(
+        long,
+        hide = true,
+        requires = "control_fd",
+        conflicts_with = "supervise"
+    )]
+    pub listen_fd: Option<i32>,
+    /// Worker mode (set by the supervisor): the inherited control socket.
+    #[arg(long, hide = true, requires = "listen_fd")]
+    pub control_fd: Option<i32>,
 }
 
 /// Parse `args` (including argv[0]) and run; returns the process exit code.
@@ -130,6 +146,7 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
         .build()?;
     rt.block_on(async move {
         match command {
+            Command::Serve(flags) if flags.supervise => crate::supervisor::run(paths, flags).await,
             Command::Serve(flags) => {
                 crate::server::daemon::run_daemon(paths, flags).await?;
                 Ok(0)

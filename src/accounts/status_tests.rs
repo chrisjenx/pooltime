@@ -1074,3 +1074,36 @@ fn erroring_threshold_and_clear() {
     b.mark_verified(&q, t(18 * 60));
     assert_eq!(b.erroring(&q, t(18 * 60 + 1)), None);
 }
+
+#[tokio::test]
+async fn a_handed_off_book_stops_persisting_and_the_next_one_reloads() {
+    let f = fixture();
+    let a = id("a");
+    // The new generation booted while the old one still served.
+    let new = StateBook::load_at(f.store.clone(), t(0)).unwrap();
+    // The old generation learns a rate limit before it hands off.
+    f.book
+        .mark_rate_limited(&a, t(3600), Some("5h".into()), t(1));
+    f.book.flush().await.unwrap();
+    assert_eq!(
+        new.status(&a, true, t(2)),
+        AccountStatus::Ready,
+        "not seen yet"
+    );
+
+    // Handoff: the old book stops writing, the new one reloads and sees the limit.
+    f.book.stop_persisting();
+    new.reload(t(2)).unwrap();
+    assert!(matches!(
+        new.status(&a, true, t(2)),
+        AccountStatus::RateLimited { .. }
+    ));
+
+    // What the old book learns afterwards stays in its memory, never in the database.
+    let b = id("b");
+    f.book.mark_billing(&b, t(3));
+    f.book.flush().await.unwrap();
+    let fresh = StateBook::load_at(f.store.clone(), t(4)).unwrap();
+    assert_eq!(fresh.status(&b, true, t(4)), AccountStatus::Ready);
+    assert_eq!(f.book.status(&b, true, t(4)), AccountStatus::Billing);
+}

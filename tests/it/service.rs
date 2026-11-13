@@ -14,9 +14,10 @@ use pooltime::claude_code::{apply, is_connected, profile_of, EnvBlock, Pins, Pro
 use pooltime::cli::service::{run_with, ServiceCmd};
 use pooltime::config::{Config, Paths, ProfileRef};
 use pooltime::service::{
-    launchd, render_launchd_plist, render_systemd_unit, stable_bin, systemd, Backend, CmdOutput,
-    Env, Runner, Timing,
+    launchd, render_launchd_plist, render_systemd_unit, restart, stable_bin, systemd, Backend,
+    CmdOutput, Env, Restarted, Runner, Timing,
 };
+use pooltime::supervisor::proto::{RestartResult, SupervisorState};
 use serde_json::{json, Value};
 
 fn fake_paths() -> Paths {
@@ -65,7 +66,7 @@ fn cellar_path_maps_to_stable_symlink() {
     assert!(render_launchd_plist(cellar_bin, &fake_paths())
         .contains("<string>/opt/homebrew/bin/pooltime</string>"));
     assert!(render_systemd_unit(cellar_bin, &fake_paths())
-        .contains("ExecStart=/opt/homebrew/bin/pooltime serve\n"));
+        .contains("ExecStart=/opt/homebrew/bin/pooltime serve --supervise\n"));
 }
 
 #[test]
@@ -79,7 +80,7 @@ fn plist_escapes_xml_and_unit_quotes_spaces() {
     let paths = Paths::under(Path::new("/home/a b/.pool\"time%"));
     let unit = render_systemd_unit(Path::new("/opt/x y/pooltime"), &paths);
     assert!(
-        unit.contains("ExecStart=\"/opt/x y/pooltime\" serve\n"),
+        unit.contains("ExecStart=\"/opt/x y/pooltime\" serve --supervise\n"),
         "{unit}"
     );
     assert!(
@@ -107,6 +108,11 @@ struct Rec {
     bootstrap_failures: Mutex<u32>,
     /// systemctl disable reports the unit as unknown.
     missing_unit: bool,
+    /// Runs when the supervisor is signalled (`launchctl kill`, `systemctl reload`): stands in
+    /// for the supervisor recording its restart.
+    on_reload: Option<Box<dyn Fn() + Send + Sync>>,
+    /// The next N `launchctl print` calls die of a signal (a Ctrl-C reaching them).
+    print_signals: Mutex<u32>,
 }
 
 impl Rec {
@@ -147,9 +153,25 @@ impl Runner for Rec {
             return reply(1, "", "boom");
         }
         let verb = args.iter().find(|a| !a.starts_with("--")).unwrap_or(&"");
+        if (program, *verb) == ("launchctl", "print") {
+            let mut left = self.print_signals.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Ok(CmdOutput {
+                    success: false,
+                    code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+        }
         let mut loaded = self.loaded.lock().unwrap();
         let mut active = self.active.lock().unwrap();
         match (program, *verb) {
+            // launchd refuses a label it still has loaded.
+            ("launchctl", "bootstrap") if *loaded => {
+                reply(5, "", "Bootstrap failed: 5: Input/output error")
+            }
             ("launchctl", "bootstrap") => {
                 let mut left = self.bootstrap_failures.lock().unwrap();
                 if *left > 0 {
@@ -185,6 +207,12 @@ impl Runner for Rec {
             ("systemctl", "is-active") => reply(3, "inactive\n", ""),
             ("systemctl", "status") if *active => reply(0, "Active: active (running)\n", ""),
             ("systemctl", "status") => reply(3, "Active: inactive (dead)\n", ""),
+            ("launchctl", "kill") | ("systemctl", "reload") => {
+                if let Some(f) = &self.on_reload {
+                    f();
+                }
+                reply(0, "", "")
+            }
             _ => reply(0, "", ""),
         }
     }
@@ -258,14 +286,25 @@ fn launchd_install_waits_for_the_unload_and_retries_bootstrap() {
     assert!(format!("{err:#}").contains("boom"), "{err:#}");
     assert_eq!(boots(&rec), 3);
 
-    // A job that will not unload is an error, and nothing is bootstrapped over it.
+    // A job still draining when the wait ends (timeout, or Ctrl-C twice): loading the new
+    // definition is still tried, so the service is not left down; launchd refuses while the
+    // old job is there, and the error says what to do.
     let rec = Rec {
         stuck: true,
         ..Rec::launchd_loaded()
     };
-    let err = launchd::install(&env, &rec).unwrap_err();
-    assert!(format!("{err:#}").contains("still loaded"), "{err:#}");
-    assert_eq!(boots(&rec), 0);
+    let err = format!("{:#}", launchd::install(&env, &rec).unwrap_err());
+    assert!(err.contains("still loaded"), "{err}");
+    assert!(err.contains("pooltime service install` again"), "{err}");
+    assert_eq!(boots(&rec), 3);
+
+    // Once the old job is gone in time, the new definition loads.
+    let rec = Rec {
+        stuck: false,
+        ..Rec::launchd_loaded()
+    };
+    launchd::install(&env, &rec).unwrap();
+    assert_eq!(boots(&rec), 1);
 }
 
 #[test]
@@ -276,9 +315,61 @@ fn launchd_install_stops_on_a_real_bootout_failure() {
         fail: vec!["launchctl bootout"],
         ..Rec::launchd_loaded()
     };
-    let err = launchd::install(&env, &rec).unwrap_err();
-    assert!(format!("{err:#}").contains("boom"), "{err:#}");
-    assert!(!rec.calls().iter().any(|c| c.contains("bootstrap")));
+    // The old job is still loaded: loading the new definition is still tried (launchd refuses
+    // while the old one is there), and the error says what to do.
+    let err = format!("{:#}", launchd::install(&env, &rec).unwrap_err());
+    assert!(err.contains("boom"), "{err}");
+    assert!(err.contains("pooltime service install` again"), "{err}");
+    assert!(rec.calls().iter().any(|c| c.contains("bootstrap")));
+
+    // uninstall keeps reporting it as an error (and keeps the plist).
+    let rec = Rec {
+        fail: vec!["launchctl bootout"],
+        ..Rec::launchd_loaded()
+    };
+    assert!(launchd::uninstall(&env, &rec).is_err());
+    assert!(launchd::plist_path(&env).exists());
+}
+
+#[test]
+fn a_print_killed_by_a_signal_is_not_read_as_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut env = env_in(dir.path());
+    // The old job drains: still loaded after bootout. A `print` killed by Ctrl-C answers
+    // nothing, which must not end the wait as if the job were gone.
+    let rec = Rec {
+        stuck: true,
+        print_signals: Mutex::new(5),
+        ..Rec::launchd_loaded()
+    };
+    let err = format!("{:#}", launchd::install(&env, &rec).unwrap_err());
+    assert!(err.contains("still loaded"), "{err}");
+    assert!(err.contains("pooltime service install` again"), "{err}");
+
+    // With time to wait: an unanswered print keeps the wait going until a real answer.
+    env.timing.unload_timeout = std::time::Duration::from_secs(5);
+    let rec = Rec {
+        print_signals: Mutex::new(2),
+        ..Rec::launchd_loaded()
+    };
+    launchd::install(&env, &rec).unwrap();
+    let calls = rec.calls();
+    let after_bootout: Vec<_> = calls
+        .iter()
+        .skip_while(|c| !c.starts_with("launchctl bootout"))
+        .collect();
+    assert_eq!(
+        after_bootout
+            .iter()
+            .filter(|c| c.starts_with("launchctl print"))
+            .count(),
+        2,
+        "kept polling past the unanswered print: {calls:?}"
+    );
+    assert!(after_bootout
+        .last()
+        .unwrap()
+        .starts_with("launchctl bootstrap"));
 }
 
 #[test]
@@ -392,6 +483,7 @@ fn systemd_install_enables_and_reinstall_restarts() {
         [
             "systemctl --user daemon-reload",
             "systemctl --user enable --now pooltime.service",
+            "systemctl --user is-active pooltime.service",
             "systemctl --user restart pooltime.service"
         ],
         "a replaced unit is picked up by the running daemon"
@@ -697,4 +789,215 @@ fn uninstall_aborts_on_a_corrupt_config_without_touching_the_service() {
         calls_before,
         "no launchctl/systemctl calls after the abort"
     );
+}
+
+// ---- seamless restart -------------------------------------------------------------------------
+
+fn write_supervisor(paths: &Paths, st: &SupervisorState) {
+    fs::create_dir_all(&paths.run).unwrap();
+    fs::write(
+        paths.run.join("supervisor.json"),
+        serde_json::to_vec(st).unwrap(),
+    )
+    .unwrap();
+}
+
+fn live_supervisor(restarts: u64) -> SupervisorState {
+    SupervisorState {
+        // This test process: alive, so the file counts as a running supervisor.
+        pid: std::process::id(),
+        version: "1.0.0".into(),
+        generation: restarts + 1,
+        worker_pid: Some(4243),
+        worker_version: Some("1.1.0".into()),
+        draining: vec![],
+        restarts,
+        restarting: false,
+        last_restart: None,
+    }
+}
+
+/// A recorder whose "supervisor" answers a restart signal with `result`.
+fn rec_answering(paths: &Paths, result: RestartResult) -> Rec {
+    let paths = paths.clone();
+    Rec {
+        on_reload: Some(Box::new(move || {
+            let mut st = live_supervisor(1);
+            st.draining = vec![4242];
+            st.last_restart = Some(result.clone());
+            write_supervisor(&paths, &st);
+        })),
+        ..Rec::launchd_loaded()
+    }
+}
+
+#[test]
+fn restart_signals_the_supervisor_and_reports_the_handover() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    launchd::install(&env, &Rec::default()).unwrap();
+    write_supervisor(&env.paths, &live_supervisor(0));
+    let ok = RestartResult {
+        ok: true,
+        generation: 2,
+        error: None,
+    };
+    let rec = rec_answering(&env.paths, ok);
+    match restart(Backend::Launchd, &env, &rec).unwrap() {
+        Restarted::HandedOver { state: st, joined } => {
+            assert!(!joined);
+            assert_eq!(st.generation, 2);
+            assert_eq!(st.draining, [4242]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        rec.calls(),
+        ["launchctl kill SIGHUP gui/501/dev.pooltime.daemon"],
+        "no kickstart: the port never closes"
+    );
+
+    // systemd: the same through `systemctl reload` (ExecReload sends SIGHUP).
+    let sd = tempfile::tempdir().unwrap();
+    let env = env_in(sd.path());
+    systemd::install(&env, &Rec::default()).unwrap();
+    write_supervisor(&env.paths, &live_supervisor(0));
+    let rec = rec_answering(
+        &env.paths,
+        RestartResult {
+            ok: true,
+            generation: 2,
+            error: None,
+        },
+    );
+    assert!(matches!(
+        restart(Backend::Systemd, &env, &rec).unwrap(),
+        Restarted::HandedOver { joined: false, .. }
+    ));
+    assert_eq!(rec.calls(), ["systemctl --user reload pooltime.service"]);
+}
+
+#[test]
+fn a_restart_already_in_progress_is_reported_as_such() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    launchd::install(&env, &Rec::default()).unwrap();
+    let mut busy = live_supervisor(0);
+    busy.restarting = true;
+    write_supervisor(&env.paths, &busy);
+    let ok = RestartResult {
+        ok: true,
+        generation: 2,
+        error: None,
+    };
+    let rec = rec_answering(&env.paths, ok);
+    assert!(matches!(
+        restart(Backend::Launchd, &env, &rec).unwrap(),
+        Restarted::HandedOver { joined: true, .. }
+    ));
+
+    write_supervisor(&env.paths, &busy);
+    let failed = RestartResult {
+        ok: false,
+        generation: 1,
+        error: Some("boom".into()),
+    };
+    let rec = rec_answering(&env.paths, failed);
+    let err = format!("{:#}", restart(Backend::Launchd, &env, &rec).unwrap_err());
+    assert!(err.contains("already in progress"), "{err}");
+}
+
+#[test]
+fn a_failed_handover_is_an_error_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    launchd::install(&env, &Rec::default()).unwrap();
+    write_supervisor(&env.paths, &live_supervisor(0));
+    let rec = rec_answering(
+        &env.paths,
+        RestartResult {
+            ok: false,
+            generation: 1,
+            error: Some("the new worker exited before it was ready (exit status: 1)".into()),
+        },
+    );
+    let err = restart(Backend::Launchd, &env, &rec).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("exited before it was ready"), "{msg}");
+    assert!(msg.contains("keeps serving"), "{msg}");
+
+    // No verdict at all (Timing::instant gives it no time): an error, not a silent success.
+    write_supervisor(&env.paths, &live_supervisor(0));
+    let rec = Rec::launchd_loaded();
+    let err = restart(Backend::Launchd, &env, &rec).unwrap_err();
+    assert!(format!("{err:#}").contains("did not confirm"), "{err:#}");
+}
+
+#[test]
+fn restart_without_a_running_supervisor_restarts_the_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    launchd::install(&env, &Rec::default()).unwrap();
+    // A file left by a supervisor that was killed does not count.
+    let mut dead = live_supervisor(3);
+    dead.pid = i32::MAX as u32;
+    write_supervisor(&env.paths, &dead);
+    let rec = Rec::launchd_loaded();
+    assert_eq!(
+        restart(Backend::Launchd, &env, &rec).unwrap(),
+        Restarted::Started
+    );
+    assert_eq!(
+        rec.calls(),
+        ["launchctl kickstart -k gui/501/dev.pooltime.daemon"]
+    );
+}
+
+#[test]
+fn restart_reinstalls_a_definition_from_before_seamless_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    let plist = launchd::plist_path(&env);
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    let old = render_launchd_plist(&env.bin, &env.paths)
+        .replace("    <string>--supervise</string>\n", "");
+    fs::write(&plist, &old).unwrap();
+    assert_eq!(Backend::Launchd.supervised(&env), Some(false));
+
+    let rec = Rec::launchd_loaded();
+    assert_eq!(
+        restart(Backend::Launchd, &env, &rec).unwrap(),
+        Restarted::Reinstalled
+    );
+    assert_eq!(Backend::Launchd.supervised(&env), Some(true));
+    let calls = rec.calls();
+    assert!(
+        calls.iter().any(|c| c.starts_with("launchctl bootstrap")),
+        "{calls:?}"
+    );
+
+    // Nothing installed: says so.
+    let none = tempfile::tempdir().unwrap();
+    let err = restart(Backend::Launchd, &env_in(none.path()), &Rec::default()).unwrap_err();
+    assert!(format!("{err:#}").contains("service install"), "{err:#}");
+}
+
+#[test]
+fn status_shows_the_supervisor_and_an_outdated_definition() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    let plist = launchd::plist_path(&env);
+    launchd::install(&env, &Rec::default()).unwrap();
+    let mut st = live_supervisor(1);
+    st.draining = vec![4242];
+    let line = pooltime::cli::service::supervisor_line(&st);
+    assert!(line.contains("generation 2: pid 4243 (v1.1.0)"), "{line}");
+    assert!(line.contains("1 older generation(s) draining"), "{line}");
+
+    let old = fs::read_to_string(&plist)
+        .unwrap()
+        .replace("    <string>--supervise</string>\n", "");
+    fs::write(&plist, old).unwrap();
+    assert_eq!(Backend::Launchd.supervised(&env), Some(false));
+    assert!(pooltime::cli::service::OLD_DEFINITION.contains("pooltime service install"));
 }

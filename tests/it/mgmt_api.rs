@@ -38,6 +38,7 @@ async fn health_identity_shape() {
             "accounts",
             "available",
             "pending",
+            "pid",
             "service",
             "status",
             "version"

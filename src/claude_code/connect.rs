@@ -542,7 +542,7 @@ pub async fn sync_once(state: &AppState) -> anyhow::Result<Vec<(String, WriteOut
     let paths = state.paths.clone();
     // A registered profile's MCP entry follows a moved port too (never added here).
     let mcp = mcp_target(state);
-    tokio::task::spawn_blocking(move || {
+    crate::background::blocking(move || {
         let mut out = Vec::new();
         let mcp = mcp.as_ref().map(|(u, t)| (u.as_str(), t.as_str()));
         for p in connected {

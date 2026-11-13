@@ -136,16 +136,36 @@ pub fn read_segment(paths: &Paths) -> String {
 /// The running cache writer ([`spawn_status_cache`]). The writer itself deletes the cache when it
 /// stops, after any write in progress, so a late write never brings the file back.
 pub struct StatusCache {
-    stop: watch::Sender<bool>,
+    stop: watch::Sender<Stop>,
     task: JoinHandle<()>,
+}
+
+/// What the writer does when it stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    Running,
+    /// Delete the cache: the pool is going away.
+    Remove,
+    /// Leave the cache: a newer daemon generation takes it over.
+    Keep,
 }
 
 impl StatusCache {
     /// Stop the writer and wait until it has deleted the cache (status lines then say
     /// `pool down` at once). Dropping a `StatusCache` stops it too, without waiting.
     pub async fn shutdown(self) {
+        self.stop_with(Stop::Remove).await;
+    }
+
+    /// Stop the writer and wait for it, leaving the cache in place: a newer daemon generation
+    /// (a supervised restart) keeps it current from now on.
+    pub async fn release(self) {
+        self.stop_with(Stop::Keep).await;
+    }
+
+    async fn stop_with(self, how: Stop) {
         let StatusCache { stop, task } = self;
-        let _ = stop.send(true);
+        let _ = stop.send(how);
         let _ = task.await;
     }
 }
@@ -156,7 +176,7 @@ impl StatusCache {
 /// writes (it refreshes `written_at`). Nothing is read while nothing changes between heartbeats. A
 /// failed read is warned about once per failure streak (with its cause), the recovery logged.
 pub fn spawn_status_cache(app: Arc<AppState>) -> StatusCache {
-    let (stop, mut stopped) = watch::channel(false);
+    let (stop, mut stopped) = watch::channel(Stop::Running);
     let task = tokio::spawn(async move {
         let path = cache_path(&app.paths);
         let mut changes = Some(app.state.changes());
@@ -226,7 +246,7 @@ pub fn spawn_status_cache(app: Arc<AppState>) -> StatusCache {
             doc["written_at"] = json!(now.unix_timestamp());
             let bytes = serde_json::to_vec(&doc).expect("json value");
             let p = path.clone();
-            match tokio::task::spawn_blocking(move || atomic_write_relaxed(&p, &bytes, 0o600)).await
+            match crate::background::blocking(move || atomic_write_relaxed(&p, &bytes, 0o600)).await
             {
                 Ok(Ok(())) => last_body = Some(body),
                 Ok(Err(e)) => tracing::warn!(error = %e, "status cache write failed"),
@@ -234,6 +254,9 @@ pub fn spawn_status_cache(app: Arc<AppState>) -> StatusCache {
             }
         }
         // Stopped: nothing of ours is in flight any more.
+        if *stopped.borrow() == Stop::Keep {
+            return;
+        }
         if let Err(e) = std::fs::remove_file(&path) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(error = %e, "could not delete the status cache");

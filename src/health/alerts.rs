@@ -167,7 +167,7 @@ impl Alerts {
             );
             if self.notify {
                 let (notifier, note) = (self.notifier.clone(), n.clone());
-                match tokio::task::spawn_blocking(move || notifier.notify(&note)).await {
+                match crate::background::blocking(move || notifier.notify(&note)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         tracing::warn!(account = %ev.account, error = %format!("{e:#}"), "alert notification failed")
