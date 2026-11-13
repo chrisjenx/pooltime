@@ -1,7 +1,10 @@
 #!/bin/sh
-# Fill packaging/homebrew/pooltime.rb (or the formula given) with a release's URLs and sha256s.
+# Fill a formula with a release's URLs and sha256s. The release workflow runs it on the tap's
+# Formula/pooltime.rb after each release; by hand, give it a checkout of chrisjenx/homebrew-tap:
 #
 #   packaging/homebrew/update-formula.sh <version> [formula]
+#
+# (the default formula, packaging/homebrew/pooltime.rb, is only the template).
 #
 # The checksums come from the release's SHA256SUMS asset, fetched from
 # $POOLTIME_RELEASE_BASE/v<version>/SHA256SUMS (default base:
@@ -29,7 +32,8 @@ trap 'rm -rf "$tmp"' EXIT
 if [ -n "${POOLTIME_SHA256SUMS:-}" ]; then
     cp "$POOLTIME_SHA256SUMS" "$tmp/SHA256SUMS"
 else
-    curl -fsSL -o "$tmp/SHA256SUMS" "${base}/v${version}/SHA256SUMS" ||
+    # Retry briefly (a 404 included): right after a release is published the asset may not be visible yet.
+    curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors -o "$tmp/SHA256SUMS" "${base}/v${version}/SHA256SUMS" ||
         die "could not download ${base}/v${version}/SHA256SUMS"
 fi
 

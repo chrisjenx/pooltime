@@ -1,23 +1,117 @@
 name: Release
 
-# Push a tag `vX.Y.Z` whose version matches Cargo.toml to build the four release binaries and
-# publish them as a GitHub Release (tarballs, per-asset .sha256 and a combined SHA256SUMS).
-# install.sh and packaging/homebrew/update-formula.sh consume exactly these asset names.
-# A manual run (workflow_dispatch) builds and uploads the artifacts without publishing, to check
-# the four targets build before tagging.
+# Releasing is merging a PR that bumps `version` in Cargo.toml (plus its CHANGELOG entry).
+#
+# plan     reads the version from Cargo.toml and decides whether this run releases:
+#          - push to main: release when the tag v<version> does not exist yet, otherwise do nothing
+#            (ordinary pushes finish after this one cheap job);
+#          - push of a tag vX.Y.Z (manual release): the tag must match Cargo.toml;
+#          - manual run (workflow_dispatch): builds the four targets as a check; with `publish` it
+#            releases like a push to main (only from main, only if the tag is new).
+# build    the four release binaries (tarballs, per-asset .sha256).
+# release  combines SHA256SUMS and runs `gh release create v<version> --target <sha>`, which also
+#          creates the tag. A tag pushed with GITHUB_TOKEN would not start another workflow, so
+#          building and releasing happen in this one run.
+# tap      updates Formula/pooltime.rb in chrisjenx/homebrew-tap (the source of truth for the
+#          formula) with packaging/homebrew/update-formula.sh. Needs the HOMEBREW_TAP_DEPLOY_KEY
+#          secret; without it the job warns and skips.
+#
+# install.sh and packaging/homebrew/update-formula.sh consume exactly the asset names built here.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a release for the Cargo.toml version (main only; skipped if its tag exists)"
+        type: boolean
+        default: false
 
 permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
 
+# One release at a time; a queued run is never cancelled mid-publish.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      build: ${{ steps.plan.outputs.build }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Decide whether to release
+        id: plan
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          TAG: ${{ github.ref_name }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "pooltime") | .version')
+          [[ -n "$version" ]] || { echo "::error::no pooltime version in Cargo.toml"; exit 1; }
+
+          tag_exists() {
+            local out
+            if out=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${version}" 2>&1); then
+              return 0
+            elif [[ "$out" == *"Not Found"* || "$out" == *"404"* ]]; then
+              return 1
+            fi
+            echo "::error::could not check for tag v${version}: ${out}"
+            exit 1
+          }
+
+          build=false
+          publish=false
+          if [[ "$EVENT" == "workflow_dispatch" && "$PUBLISH_INPUT" != "true" ]]; then
+            build=true
+            echo "::notice::manual run without publish: building the four targets only"
+          elif [[ "$EVENT" == "push" && "$REF" == refs/tags/* ]]; then
+            # Manual tag: it must be the Cargo.toml version.
+            if [[ "v${version}" != "${TAG}" ]]; then
+              echo "::error::tag ${TAG} does not match Cargo.toml version ${version}"
+              exit 1
+            fi
+            build=true
+            publish=true
+          elif [[ "$REF" != "refs/heads/main" ]]; then
+            echo "::notice::not main: nothing to release from ${REF}"
+          elif tag_exists; then
+            echo "::notice::v${version} is already tagged: nothing to release"
+          else
+            echo "::notice::v${version} is not tagged yet: releasing ${GITHUB_SHA}"
+            build=true
+            publish=true
+          fi
+
+          {
+            echo "version=${version}"
+            echo "build=${build}"
+            echo "publish=${publish}"
+          } >> "$GITHUB_OUTPUT"
+
   build:
     name: build (${{ matrix.target }})
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -43,22 +137,6 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Check the tag matches Cargo.toml
-        id: version
-        shell: bash
-        env:
-          REF: ${{ github.ref }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          version=$(cargo metadata --no-deps --format-version 1 --locked \
-            | jq -r '.packages[] | select(.name == "pooltime") | .version')
-          if [[ "$REF" == refs/tags/* && "v${version}" != "${TAG}" ]]; then
-            echo "::error::tag ${TAG} does not match Cargo.toml version ${version}"
-            exit 1
-          fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: |
@@ -79,7 +157,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
           out=$("target/${TARGET}/release/pooltime" --version)
@@ -90,7 +168,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
           asset="pooltime-${VERSION}-${TARGET}.tar.gz"
@@ -115,8 +193,8 @@ jobs:
 
   release:
     name: publish release
-    needs: build
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -138,11 +216,84 @@ jobs:
       - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
-          gh release create "$TAG" dist/* \
+          tag="v${VERSION}"
+          # A pushed tag already exists (and must be the one built). On main, creating the release
+          # creates the tag at the commit that was built.
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            target=(--verify-tag)
+          else
+            target=(--target "$GITHUB_SHA")
+          fi
+          gh release create "$tag" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "pooltime ${TAG}" \
+            --title "pooltime ${tag}" \
             --generate-notes \
-            --verify-tag
+            "${target[@]}"
+
+  tap:
+    name: update Homebrew tap
+    needs: [plan, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check for the tap deploy key
+        id: key
+        shell: bash
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          if [[ -n "$DEPLOY_KEY" ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::HOMEBREW_TAP_DEPLOY_KEY is not set: skipping the Homebrew tap update. Run packaging/homebrew/update-formula.sh by hand in chrisjenx/homebrew-tap."
+          fi
+
+      # The deploy key (write access to the tap only) stays in this checkout's git config so the
+      # push below can use it.
+      - name: Check out the tap
+        if: steps.key.outputs.present == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: chrisjenx/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+
+      - name: Update the formula
+        if: steps.key.outputs.present == 'true'
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The script retries the SHA256SUMS download briefly in case the asset is not visible yet.
+          packaging/homebrew/update-formula.sh "$VERSION" tap/Formula/pooltime.rb
+
+      - name: Commit and push to the tap
+        if: steps.key.outputs.present == 'true'
+        working-directory: tap
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "tap already at pooltime ${VERSION}: nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "pooltime ${VERSION}"
+          for attempt in 1 2 3; do
+            git push origin HEAD && exit 0
+            echo "push failed (attempt ${attempt}); rebasing on the tap's latest and retrying"
+            git pull --rebase origin "$(git rev-parse --abbrev-ref HEAD)"
+          done
+          echo "::error::could not push to the tap"
+          exit 1

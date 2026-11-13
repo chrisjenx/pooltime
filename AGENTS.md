@@ -121,6 +121,21 @@ Design docs: `docs/specs/2026-11-07-pooltime-design.md` (§16 overrides earlier 
 - MIT license. Conventional commits (`feat(scope): ...`, `fix(...)`, `docs: ...`), one commit per
   change; never commit tokens, credentials or real account emails.
 
+## Releasing
+
+Merge a PR that bumps `version` in the root `Cargo.toml` (and `Cargo.lock`) and adds the
+`CHANGELOG.md` entry. Nothing else is manual: on the push to `main`, `.github/workflows/release.yml`
+sees a version whose `v<version>` tag does not exist, builds the four targets, creates the GitHub
+release (which creates the tag at that commit) and updates `Formula/pooltime.rb` in
+`chrisjenx/homebrew-tap`. Pushes to `main` that leave the version alone stop after a one-job check.
+
+- One-time setup: the repository secret `HOMEBREW_TAP_DEPLOY_KEY`, the private half of an SSH deploy
+  key with write access to `chrisjenx/homebrew-tap`. Without it the tap job warns and skips; update
+  the tap by hand with `packaging/homebrew/update-formula.sh <version> <tap checkout>/Formula/pooltime.rb`.
+- `packaging/homebrew/pooltime.rb` is only the template; the tap is the source of truth.
+- A hand-pushed `vX.Y.Z` tag still works (it must match `Cargo.toml`). The "Release" workflow can
+  also be run manually: without `publish` it only builds the four targets as a check.
+
 ## Docs
 
 User docs live in `README.md`, `llms.txt` and `docs/*.md`. They must describe what the code does:
