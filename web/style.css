@@ -199,6 +199,36 @@ td.barcell { width: 34%; }
 .dim { color: var(--muted); }
 .nowrap { white-space: nowrap; }
 
+/* ---- account list: toolbar, table cells, chips ---- */
+
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; }
+.toolbar-panel { padding: 10px 14px; }
+.toolbar-panel .toolbar { margin-bottom: 0; }
+.toolbar input[type="search"] { width: 200px; }
+.toolbar .grow-right { margin-left: auto; font-size: 12.5px; }
+.table-wrap { overflow-x: auto; }
+table.accounts td { vertical-align: top; }
+td.metercell { width: 22%; min-width: 150px; }
+.meter { display: flex; flex-direction: column; gap: 4px; padding-top: 6px; font-size: 12.5px; white-space: nowrap; }
+.meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; font-size: 12.5px; margin-top: 2px; }
+.small { font-size: 12.5px; }
+.chip {
+  display: inline-block;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--track);
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.chip.warn { background: var(--warn-bg); color: var(--warn); }
+table.accounts td:first-child, table.accounts th:first-child { padding-left: 10px; }
+table.accounts tr.sev-needs_login td:first-child, table.accounts tr.sev-billing td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
+.usage-title { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.usage-fresh { font-size: 12px; color: var(--muted); }
+.usage-fresh.warn-text { color: var(--warn); }
+
 /* ---- bars ---- */
 
 .bar {
