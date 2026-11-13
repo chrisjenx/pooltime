@@ -32,8 +32,8 @@ use tokio::time::Instant;
 use super::callback::{self, page_html, CallbackEvent, Handler};
 use super::pkce::{random_token, state_eq, Pkce};
 use super::{
-    parse_pasted, FlowControl, PendingSignIn, SignInFlow, SignInMode, SignInResult, SubmitError,
-    FLOW_TTL,
+    parse_submission, FlowControl, PendingSignIn, SignInFlow, SignInMode, SignInResult,
+    SubmitError, FLOW_TTL,
 };
 use crate::accounts::{AccountId, Credentials, Identity, Registry, StateBook, Verify};
 use crate::config::OpenAiCfg;
@@ -635,7 +635,7 @@ struct Ctl(Arc<Flow>);
 
 impl FlowControl for Ctl {
     fn submit_code(&self, pasted: &str) -> Result<(), SubmitError> {
-        let (code, state) = parse_pasted(pasted).ok_or(SubmitError::Malformed)?;
+        let (code, state) = parse_submission(pasted)?;
         if !state_eq(&state, &self.0.oauth_state) {
             return Err(SubmitError::StateMismatch);
         }
