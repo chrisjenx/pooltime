@@ -519,7 +519,7 @@
     "db_bytes": 18874368,
     "logs_bytes": 4194304
   },
-  "version": "1.0.0",
+  "version": "1.0.1",
   "now": "2026-11-07T12:00:00Z",
   "journal": {
     "requests": [
