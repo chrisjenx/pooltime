@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.0.1 - 2026-11-12
+
+### Dashboard
+
+- Accounts are listed soonest 7-day reset first by default, with a remembered sort menu
+  (7-day reset, 7-day left, 5-hour left, state, name, activity), search and state/provider
+  filters.
+- The account summary now shows everything bro's did: 5-hour and 7-day resets as columns
+  (passed resets rolled forward and marked estimated), plan and rate tier, last used, usage
+  freshness and errors, access-token expiry, request and token counts, and sessions in flight.
+  "Accounts by severity" became "Needs attention". See
+  [`docs/dashboard-parity.md`](docs/dashboard-parity.md).
+- A favicon.
+
+### Sign-in
+
+- Pasting Claude's 6-digit email verification code into pooltime now explains where it goes
+  (the Claude sign-in tab) instead of reporting a malformed code.
+
+### Build
+
+- Smaller, faster dev and test builds: trimmed debug info and a single integration-test binary.
+
 ## 1.0.0 - 2026-11-08
 
 First stable release. pooltime replaces the pool in bro-cli.
