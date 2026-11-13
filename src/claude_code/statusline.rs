@@ -246,7 +246,7 @@ pub fn spawn_status_cache(app: Arc<AppState>) -> StatusCache {
             doc["written_at"] = json!(now.unix_timestamp());
             let bytes = serde_json::to_vec(&doc).expect("json value");
             let p = path.clone();
-            match tokio::task::spawn_blocking(move || atomic_write_relaxed(&p, &bytes, 0o600)).await
+            match crate::background::blocking(move || atomic_write_relaxed(&p, &bytes, 0o600)).await
             {
                 Ok(Ok(())) => last_body = Some(body),
                 Ok(Err(e)) => tracing::warn!(error = %e, "status cache write failed"),

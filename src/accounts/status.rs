@@ -21,6 +21,7 @@
 //! (and implicitly at the start of the next mutation, reason `cooldown_expired`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
@@ -426,6 +427,47 @@ pub struct StateBook {
     changed: watch::Sender<u64>,
     access_denied_cooldown: Duration,
     usage_window: Duration,
+    /// Cleared by [`stop_persisting`](Self::stop_persisting) (a daemon generation that handed
+    /// off): memory still changes, `account_state` rows no longer do.
+    persisting: AtomicBool,
+}
+
+/// Persisted rows as states; unreadable ones fail closed (`unverified`) and are returned with
+/// their raw text for quarantine.
+#[allow(clippy::type_complexity)]
+fn read_rows(
+    store: &Store,
+) -> anyhow::Result<(
+    Vec<(AccountId, AccountState)>,
+    Vec<(AccountId, Option<String>)>,
+)> {
+    let rows: Vec<(String, Option<String>)> = store.read(|c| {
+        let mut st = c.prepare("SELECT account, json FROM account_state")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })?;
+    let mut states = Vec::new();
+    let mut quarantined = Vec::new();
+    for (account, json) in rows {
+        let Ok(id) = account.parse::<AccountId>() else {
+            tracing::error!(account = %account, "skipping persisted state for invalid account id");
+            continue;
+        };
+        let state = match json.as_deref().map(serde_json::from_str::<AccountState>) {
+            Some(Ok(s)) => s,
+            // Unparseable (or NULL): fail closed. Never log the error text or row content.
+            _ => {
+                tracing::warn!(account = %id, "unreadable persisted account state; quarantined, account needs a health re-check");
+                quarantined.push((id.clone(), json));
+                AccountState {
+                    unverified: true,
+                    ..AccountState::default()
+                }
+            }
+        };
+        states.push((id, state));
+    }
+    Ok((states, quarantined))
 }
 
 impl StateBook {
@@ -441,32 +483,11 @@ impl StateBook {
 
     /// [`load`](Self::load) with an explicit clock (loading never emits transitions).
     pub fn load_at(store: Arc<Store>, now: OffsetDateTime) -> anyhow::Result<StateBook> {
-        let rows: Vec<(String, Option<String>)> = store.read(|c| {
-            let mut st = c.prepare("SELECT account, json FROM account_state")?;
-            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })?;
-        let mut map = HashMap::new();
-        let mut quarantined = Vec::new();
-        for (account, json) in rows {
-            let Ok(id) = account.parse::<AccountId>() else {
-                tracing::error!(account = %account, "skipping persisted state for invalid account id");
-                continue;
-            };
-            let state = match json.as_deref().map(serde_json::from_str::<AccountState>) {
-                Some(Ok(s)) => s,
-                // Unparseable (or NULL): fail closed. Never log the error text or row content.
-                _ => {
-                    tracing::warn!(account = %id, "unreadable persisted account state; quarantined, account needs a health re-check");
-                    quarantined.push((id.clone(), json));
-                    AccountState {
-                        unverified: true,
-                        ..AccountState::default()
-                    }
-                }
-            };
-            map.insert(id, Entry::new(state, now));
-        }
+        let (states, quarantined) = read_rows(&store)?;
+        let map = states
+            .into_iter()
+            .map(|(id, state)| (id, Entry::new(state, now)))
+            .collect();
         let (tx, _) = broadcast::channel(TRANSITION_CHANNEL_CAPACITY);
         let book = StateBook {
             store,
@@ -475,6 +496,7 @@ impl StateBook {
             changed: watch::channel(0).0,
             access_denied_cooldown: DEFAULT_ACCESS_DENIED_COOLDOWN,
             usage_window: DEFAULT_USAGE_WINDOW,
+            persisting: AtomicBool::new(true),
         };
         for (id, raw) in quarantined {
             book.quarantine(&id, raw, now);
@@ -509,6 +531,34 @@ impl StateBook {
         if let Err(err) = queued {
             tracing::error!(account = %id, error = %err, "could not queue account state quarantine");
         }
+    }
+
+    /// Stop writing `account_state` rows (memory keeps changing). For a daemon generation that
+    /// handed off to a newer one: only the active generation persists account state.
+    pub fn stop_persisting(&self) {
+        self.persisting.store(false, Ordering::SeqCst);
+    }
+
+    /// Replace the persisted part of every account's state with what is in the database now
+    /// (what an older daemon generation learned before it handed off: rate limits, dead-token
+    /// markers, billing blocks, usage). Memory-only verdicts (error streaks) are kept. An
+    /// unreadable row fails closed (`unverified`), as at load. Emits no transitions; a changed
+    /// status shows on its next read.
+    pub fn reload(&self, now: OffsetDateTime) -> anyhow::Result<()> {
+        let (states, _) = read_rows(&self.store)?;
+        {
+            let mut map = self.lock();
+            for (id, state) in states {
+                match map.get_mut(&id) {
+                    Some(e) => e.state = state,
+                    None => {
+                        map.insert(id, Entry::new(state, now));
+                    }
+                }
+            }
+        }
+        self.notify_changed();
+        Ok(())
     }
 
     /// Cooldown applied by `mark_access_denied` / `mark_billing` (default 1 h).
@@ -634,6 +684,9 @@ impl StateBook {
     pub fn forget(&self, id: &AccountId) {
         self.lock().remove(id);
         self.notify_changed();
+        if !self.persisting.load(Ordering::SeqCst) {
+            return;
+        }
         let account = id.to_string();
         let queued = self.store.submit(move |c| {
             c.execute("DELETE FROM account_state WHERE account = ?1", [account])?;
@@ -954,6 +1007,9 @@ impl StateBook {
     }
 
     fn persist(&self, id: &AccountId, state: &AccountState) {
+        if !self.persisting.load(Ordering::SeqCst) {
+            return;
+        }
         let json = match serde_json::to_string(state) {
             Ok(j) => j,
             Err(e) => {

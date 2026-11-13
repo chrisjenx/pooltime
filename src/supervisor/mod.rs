@@ -10,8 +10,9 @@
 //!   backlog instead of being refused); repeated failures back off, and after [`MAX_FAILURES`]
 //!   in a row, or when the very first worker never gets ready, the supervisor exits non-zero and
 //!   the service manager's restart policy takes over.
-//! - `SIGTERM`/`SIGINT`: forwarded to every worker as `SIGTERM` (a second one forces them), then
-//!   exit once they are gone.
+//! - `SIGTERM`/`SIGINT`: every worker is told `stop` over its control socket (a second signal:
+//!   `force`), then the supervisor exits once they are gone. Workers ignore OS signals while
+//!   the supervisor is there, so a signal sent to the whole process group counts once.
 //!
 //! Deliberately small: no database, providers or HTTP. A running supervisor is not replaced by
 //! `service restart`, only by `service install` (a full restart), so its protocol with the
@@ -98,8 +99,14 @@ pub async fn run(paths: Paths, flags: ServeFlags) -> anyhow::Result<i32> {
         worker = %exe.display(),
         "pooltime supervisor starting"
     );
-    let mut sup = Supervisor::new(paths.clone(), exe, listener, flags.i_stopped_bro);
+    let launcher = ProcessLauncher {
+        exe,
+        listen_fd: listener.as_raw_fd(),
+        i_stopped_bro: flags.i_stopped_bro,
+    };
+    let mut sup = Supervisor::new(paths.clone(), launcher);
     let code = sup.run().await;
+    drop(listener);
     let _ = std::fs::remove_file(proto::state_path(&paths));
     let code = code?;
     tracing::info!(code, "pooltime supervisor stopped");
@@ -118,13 +125,38 @@ enum Phase {
     Draining,
 }
 
+/// The supervisor's end of one worker's control socket.
+trait Ctl: Send {
+    fn send(&self, msg: ToWorker) -> std::io::Result<()>;
+}
+
+impl Ctl for UnixStream {
+    fn send(&self, msg: ToWorker) -> std::io::Result<()> {
+        let mut s: &UnixStream = self;
+        s.write_all(msg.line().as_bytes())
+    }
+}
+
+/// Starts and kills workers (a fake in tests).
+trait Launcher {
+    /// Start generation `gen`; its messages and exit arrive on `events`.
+    fn spawn(
+        &mut self,
+        gen: u64,
+        events: mpsc::UnboundedSender<Event>,
+    ) -> std::io::Result<(u32, Box<dyn Ctl>)>;
+    fn kill(&mut self, pid: u32);
+}
+
 struct Worker {
     gen: u64,
     pid: u32,
-    ctl: UnixStream,
+    ctl: Box<dyn Ctl>,
     phase: Phase,
     version: Option<String>,
     since: Instant,
+    /// Sent `SIGKILL` by a backstop; just waiting for its exit now.
+    killed: bool,
 }
 
 enum Event {
@@ -149,18 +181,19 @@ struct Boot {
     timed_out: bool,
 }
 
+/// The old generation is stopping its background tasks; nobody may start them until it has
+/// (or its deadline passed). Kept even if the generation waiting to take over dies: the next
+/// one waits too.
 struct Release {
     old: u64,
-    new: u64,
-    why: Why,
+    /// The ready generation to activate afterwards (none while a replacement boots).
+    new: Option<(u64, Why)>,
     deadline: Instant,
 }
 
-struct Supervisor {
+struct Supervisor<L: Launcher> {
     paths: Paths,
-    exe: PathBuf,
-    listener: std::net::TcpListener,
-    i_stopped_bro: bool,
+    launcher: L,
     workers: Vec<Worker>,
     next_gen: u64,
     tx: mpsc::UnboundedSender<Event>,
@@ -175,28 +208,12 @@ struct Supervisor {
     published: Option<SupervisorState>,
 }
 
-fn send_signal(pid: u32, sig: libc::c_int) {
-    if let Ok(pid) = libc::pid_t::try_from(pid) {
-        // SAFETY: plain kill(2) on a child we have not reaped yet.
-        unsafe {
-            libc::kill(pid, sig);
-        }
-    }
-}
-
-impl Supervisor {
-    fn new(
-        paths: Paths,
-        exe: PathBuf,
-        listener: std::net::TcpListener,
-        i_stopped_bro: bool,
-    ) -> Supervisor {
+impl<L: Launcher> Supervisor<L> {
+    fn new(paths: Paths, launcher: L) -> Supervisor<L> {
         let (tx, rx) = mpsc::unbounded_channel();
         Supervisor {
             paths,
-            exe,
-            listener,
-            i_stopped_bro,
+            launcher,
             workers: Vec::new(),
             next_gen: 1,
             tx,
@@ -223,7 +240,7 @@ impl Supervisor {
         self.start(Why::Initial);
         loop {
             self.publish();
-            if self.stopping > 0 && self.workers.is_empty() {
+            if self.done() {
                 return Ok(self.exit_code);
             }
             let deadline = self.next_deadline();
@@ -231,10 +248,7 @@ impl Supervisor {
                 _ = hup.recv() => self.on_restart(),
                 _ = term.recv() => self.on_stop("SIGTERM"),
                 _ = int.recv() => self.on_stop("SIGINT"),
-                Some(ev) = self.rx.recv() => match ev {
-                    Event::Msg(gen, m) => self.on_message(gen, m),
-                    Event::Exited(gen, status) => self.on_exit(gen, &status),
-                },
+                Some(ev) = self.rx.recv() => self.on_event(ev),
                 _ = async {
                     match deadline {
                         Some(d) => tokio::time::sleep_until(d).await,
@@ -245,13 +259,24 @@ impl Supervisor {
         }
     }
 
+    fn done(&self) -> bool {
+        self.stopping > 0 && self.workers.is_empty()
+    }
+
+    fn on_event(&mut self, ev: Event) {
+        match ev {
+            Event::Msg(gen, m) => self.on_message(gen, m),
+            Event::Exited(gen, status) => self.on_exit(gen, &status),
+        }
+    }
+
     fn worker_mut(&mut self, gen: u64) -> Option<&mut Worker> {
         self.workers.iter_mut().find(|w| w.gen == gen)
     }
 
     fn tell(&mut self, gen: u64, msg: ToWorker) {
         if let Some(w) = self.worker_mut(gen) {
-            if let Err(e) = (&w.ctl).write_all(msg.line().as_bytes()) {
+            if let Err(e) = w.ctl.send(msg) {
                 tracing::warn!(generation = gen, error = %e, "could not reach a worker");
             }
         }
@@ -267,13 +292,7 @@ impl Supervisor {
     fn start(&mut self, why: Why) {
         let gen = self.next_gen;
         self.next_gen += 1;
-        match spawn_worker(
-            &self.exe,
-            gen,
-            self.listener.as_raw_fd(),
-            self.i_stopped_bro,
-            self.tx.clone(),
-        ) {
+        match self.launcher.spawn(gen, self.tx.clone()) {
             Ok((pid, ctl)) => {
                 tracing::info!(generation = gen, pid, reason = ?why, "worker started");
                 self.workers.push(Worker {
@@ -283,6 +302,7 @@ impl Supervisor {
                     phase: Phase::Booting,
                     version: None,
                     since: Instant::now(),
+                    killed: false,
                 });
                 self.boot = Some(Boot {
                     gen,
@@ -292,7 +312,7 @@ impl Supervisor {
                 });
             }
             Err(e) => {
-                let why_text = format!("could not start {}: {e}", self.exe.display());
+                let why_text = format!("could not start a worker: {e}");
                 tracing::error!(generation = gen, error = %why_text, "worker not started");
                 match why {
                     Why::Initial => self.fail(),
@@ -329,6 +349,13 @@ impl Supervisor {
                 if self.stopping > 0 {
                     return;
                 }
+                // An older generation is still releasing its background tasks: wait for it.
+                if let Some(r) = self.release.as_mut() {
+                    if r.new.is_none() {
+                        r.new = Some((gen, why));
+                        return;
+                    }
+                }
                 let old = self
                     .workers
                     .iter()
@@ -348,8 +375,7 @@ impl Supervisor {
                         }
                         self.release = Some(Release {
                             old,
-                            new: gen,
-                            why,
+                            new: Some((gen, why)),
                             deadline: Instant::now() + RELEASE_TIMEOUT,
                         });
                     }
@@ -358,10 +384,21 @@ impl Supervisor {
             }
             FromWorker::Released => {
                 if self.release.as_ref().is_some_and(|r| r.old == gen) {
-                    let r = self.release.take().expect("checked");
-                    self.activate(r.new, r.why);
+                    self.released();
                 }
             }
+        }
+    }
+
+    /// The old generation let go of the background tasks (or ran out of time): activate the
+    /// generation waiting for them, if any.
+    fn released(&mut self) {
+        if let Some(Release {
+            new: Some((gen, why)),
+            ..
+        }) = self.release.take()
+        {
+            self.activate(gen, why);
         }
     }
 
@@ -417,19 +454,21 @@ impl Supervisor {
             }
             return;
         }
-        if let Some(r) = self.release.take() {
-            if r.old == gen {
-                self.activate(r.new, r.why);
-            } else if r.new == gen {
-                tracing::error!(generation = gen, %status, "the new worker exited during the handoff");
-                if r.why == Why::Restart {
-                    self.finish_restart(false, Some(format!("the new worker exited ({status})")));
-                }
-                self.crashed();
-                return;
-            } else {
-                self.release = Some(r);
+        if self.release.as_ref().is_some_and(|r| r.old == gen) {
+            // Gone, so its background tasks are too.
+            self.released();
+        } else if let Some(r) = self
+            .release
+            .as_mut()
+            .filter(|r| r.new.is_some_and(|(n, _)| n == gen))
+        {
+            let (_, why) = r.new.take().expect("checked");
+            tracing::error!(generation = gen, %status, "the new worker exited during the handoff");
+            if why == Why::Restart {
+                self.finish_restart(false, Some(format!("the new worker exited ({status})")));
             }
+            self.crashed();
+            return;
         }
         match w.phase {
             Phase::Draining => tracing::info!(generation = gen, %status, "old generation drained"),
@@ -468,39 +507,41 @@ impl Supervisor {
 
     fn on_timer(&mut self) {
         let now = Instant::now();
-        let mut kill_boot = None;
+        let mut kill = Vec::new();
         if let Some(b) = self.boot.as_mut() {
             if !b.timed_out && now >= b.deadline {
                 b.timed_out = true;
-                kill_boot = Some(b.gen);
-            }
-        }
-        if let Some(gen) = kill_boot {
-            if let Some(w) = self.worker_mut(gen) {
-                tracing::error!(generation = gen, "worker not ready in time; killing it");
-                send_signal(w.pid, libc::SIGKILL);
+                tracing::error!(generation = b.gen, "worker not ready in time; killing it");
+                kill.push(b.gen);
             }
         }
         if self.release.as_ref().is_some_and(|r| now >= r.deadline) {
-            let r = self.release.take().expect("checked");
             tracing::warn!(
-                old = r.old,
-                new = r.new,
-                "the old generation did not release its background tasks in time; activating the new one anyway"
+                "the old generation did not release its background tasks in time; going on"
             );
-            self.activate(r.new, r.why);
+            self.released();
         }
         if self.respawn_at.is_some_and(|t| now >= t) {
             self.respawn_at = None;
             self.start(Why::Respawn);
         }
         for w in &self.workers {
-            if w.phase == Phase::Draining && now.duration_since(w.since) >= DRAIN_BACKSTOP {
+            if w.phase == Phase::Draining
+                && !w.killed
+                && now.duration_since(w.since) >= DRAIN_BACKSTOP
+            {
                 tracing::error!(
                     generation = w.gen,
                     "old generation still running; killing it"
                 );
-                send_signal(w.pid, libc::SIGKILL);
+                kill.push(w.gen);
+            }
+        }
+        for gen in kill {
+            if let Some(w) = self.worker_mut(gen) {
+                w.killed = true;
+                let pid = w.pid;
+                self.launcher.kill(pid);
             }
         }
     }
@@ -514,7 +555,7 @@ impl Supervisor {
         let draining = self
             .workers
             .iter()
-            .filter(|w| w.phase == Phase::Draining)
+            .filter(|w| w.phase == Phase::Draining && !w.killed)
             .map(|w| w.since + DRAIN_BACKSTOP);
         [
             boot,
@@ -527,11 +568,15 @@ impl Supervisor {
         .min()
     }
 
+    fn restarting(&self) -> bool {
+        self.boot.is_some() || self.release.is_some()
+    }
+
     fn on_restart(&mut self) {
         if self.stopping > 0 {
             return;
         }
-        if self.boot.is_some() || self.release.is_some() {
+        if self.restarting() {
             tracing::info!("SIGHUP: a restart is already in progress");
             return;
         }
@@ -540,23 +585,35 @@ impl Supervisor {
         self.start(Why::Restart);
     }
 
+    /// The first stop signal tells every worker to `stop` (drain), any further one to `force`.
+    /// Over the control socket, not as signals: a worker may get the same `SIGTERM` directly
+    /// (process-group signal, `pkill`), and must not count it twice.
     fn on_stop(&mut self, name: &str) {
         self.stopping += 1;
         self.respawn_at = None;
+        let msg = if self.stopping == 1 {
+            ToWorker::Stop
+        } else {
+            ToWorker::Force
+        };
         tracing::info!(
             signal = name,
             workers = self.workers.len(),
-            "stopping: forwarding SIGTERM to the workers"
+            order = ?msg,
+            "stopping the workers"
         );
-        for w in &self.workers {
-            send_signal(w.pid, libc::SIGTERM);
+        let gens: Vec<u64> = self.workers.iter().map(|w| w.gen).collect();
+        for gen in gens {
+            self.tell(gen, msg);
         }
     }
 
     /// Stop everything and exit 1 once the workers are gone.
     fn fail(&mut self) {
         self.exit_code = 1;
-        self.on_stop("fatal");
+        if self.stopping == 0 {
+            self.on_stop("fatal");
+        }
     }
 
     fn finish_restart(&mut self, ok: bool, error: Option<String>) {
@@ -567,8 +624,10 @@ impl Supervisor {
         let generation = self
             .workers
             .iter()
-            .find(|w| matches!(w.phase, Phase::Active | Phase::Serving))
-            .map_or(0, |w| w.gen);
+            .filter(|w| matches!(w.phase, Phase::Active | Phase::Serving))
+            .map(|w| w.gen)
+            .max()
+            .unwrap_or(0);
         self.state.last_restart = Some(RestartResult {
             ok,
             generation,
@@ -592,6 +651,7 @@ impl Supervisor {
             .filter(|w| w.phase == Phase::Draining)
             .map(|w| w.pid)
             .collect();
+        self.state.restarting = self.restarting();
         if self.published.as_ref() == Some(&self.state) {
             return;
         }
@@ -616,72 +676,88 @@ fn inherit(fd: RawFd) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Start `exe serve --listen-fd <listener> --control-fd <ours>` and watch it: control messages
-/// and its exit arrive on `events`. Returns its pid and our end of the control socket.
-fn spawn_worker(
-    exe: &std::path::Path,
-    gen: u64,
+/// Real workers: `exe serve --listen-fd <listener> --control-fd <theirs>`.
+struct ProcessLauncher {
+    exe: PathBuf,
     listen_fd: RawFd,
     i_stopped_bro: bool,
-    events: mpsc::UnboundedSender<Event>,
-) -> std::io::Result<(u32, UnixStream)> {
-    // Both ends are close-on-exec; only the child's copy of its end is made inheritable.
-    let (ours, theirs) = UnixStream::pair()?;
-    let control_fd = theirs.as_raw_fd();
-    let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("serve")
-        .arg("--listen-fd")
-        .arg(listen_fd.to_string())
-        .arg("--control-fd")
-        .arg(control_fd.to_string());
-    if i_stopped_bro {
-        cmd.arg("--i-stopped-bro");
-    }
-    cmd.stdin(Stdio::null()).kill_on_drop(false);
-    // SAFETY: the closure only calls fcntl, which is async-signal-safe.
-    unsafe {
-        cmd.pre_exec(move || {
-            inherit(listen_fd)?;
-            inherit(control_fd)
-        });
-    }
-    let mut child = cmd.spawn()?;
-    drop(theirs);
-    let pid = child.id().unwrap_or(0);
-    let reader = ours.try_clone()?;
-    reader.set_nonblocking(true)?;
-    let reader = tokio::net::UnixStream::from_std(reader)?;
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        let mut open = true;
-        loop {
-            tokio::select! {
-                biased;
-                l = lines.next_line(), if open => match l {
-                    Ok(Some(l)) => {
-                        if let Some(m) = FromWorker::parse(&l) {
-                            let _ = events.send(Event::Msg(gen, m));
+}
+
+impl Launcher for ProcessLauncher {
+    fn spawn(
+        &mut self,
+        gen: u64,
+        events: mpsc::UnboundedSender<Event>,
+    ) -> std::io::Result<(u32, Box<dyn Ctl>)> {
+        // Both ends are close-on-exec; only the child's copy of its end is made inheritable.
+        let (ours, theirs) = UnixStream::pair()?;
+        let control_fd = theirs.as_raw_fd();
+        let listen_fd = self.listen_fd;
+        let mut cmd = tokio::process::Command::new(&self.exe);
+        cmd.arg("serve")
+            .arg("--listen-fd")
+            .arg(listen_fd.to_string())
+            .arg("--control-fd")
+            .arg(control_fd.to_string());
+        if self.i_stopped_bro {
+            cmd.arg("--i-stopped-bro");
+        }
+        cmd.stdin(Stdio::null()).kill_on_drop(false);
+        // SAFETY: the closure only calls fcntl, which is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(move || {
+                inherit(listen_fd)?;
+                inherit(control_fd)
+            });
+        }
+        let mut child = cmd.spawn()?;
+        drop(theirs);
+        let pid = child.id().unwrap_or(0);
+        let reader = ours.try_clone()?;
+        reader.set_nonblocking(true)?;
+        let reader = tokio::net::UnixStream::from_std(reader)?;
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(reader).lines();
+            let mut open = true;
+            loop {
+                tokio::select! {
+                    biased;
+                    l = lines.next_line(), if open => match l {
+                        Ok(Some(l)) => {
+                            if let Some(m) = FromWorker::parse(&l) {
+                                let _ = events.send(Event::Msg(gen, m));
+                            }
                         }
+                        _ => open = false,
+                    },
+                    st = child.wait() => {
+                        let status = match st {
+                            Ok(s) => s.to_string(),
+                            Err(e) => format!("wait failed: {e}"),
+                        };
+                        let _ = events.send(Event::Exited(gen, status));
+                        return;
                     }
-                    _ => open = false,
-                },
-                st = child.wait() => {
-                    let status = match st {
-                        Ok(s) => s.to_string(),
-                        Err(e) => format!("wait failed: {e}"),
-                    };
-                    let _ = events.send(Event::Exited(gen, status));
-                    return;
                 }
             }
+        });
+        Ok((pid, Box::new(ours)))
+    }
+
+    fn kill(&mut self, pid: u32) {
+        if let Ok(pid) = libc::pid_t::try_from(pid) {
+            // SAFETY: plain kill(2) on a child we have not reaped yet.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
         }
-    });
-    Ok((pid, ours))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn backoff_starts_immediately_then_doubles_to_eight_seconds() {
@@ -701,5 +777,195 @@ mod tests {
         // SAFETY: as above.
         let after = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         assert_eq!(after & libc::FD_CLOEXEC, 0);
+    }
+
+    /// Everything the supervisor told or did to its workers, in order.
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    struct FakeCtl(u64, Log);
+
+    impl Ctl for FakeCtl {
+        fn send(&self, msg: ToWorker) -> std::io::Result<()> {
+            self.1
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", self.0, msg.line().trim()));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct Fake {
+        log: Log,
+    }
+
+    impl Launcher for Fake {
+        fn spawn(
+            &mut self,
+            gen: u64,
+            _: mpsc::UnboundedSender<Event>,
+        ) -> std::io::Result<(u32, Box<dyn Ctl>)> {
+            self.log.lock().unwrap().push(format!("{gen} spawn"));
+            Ok((1000 + gen as u32, Box::new(FakeCtl(gen, self.log.clone()))))
+        }
+
+        fn kill(&mut self, pid: u32) {
+            self.log.lock().unwrap().push(format!("kill {pid}"));
+        }
+    }
+
+    fn sup() -> (tempfile::TempDir, Supervisor<Fake>, Log) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        paths.ensure().unwrap();
+        let fake = Fake::default();
+        let log = fake.log.clone();
+        (dir, Supervisor::new(paths, fake), log)
+    }
+
+    fn ready(gen: u64) -> FromWorker {
+        FromWorker::Ready {
+            version: format!("v{gen}"),
+        }
+    }
+
+    fn take(log: &Log) -> Vec<String> {
+        std::mem::take(&mut *log.lock().unwrap())
+    }
+
+    #[tokio::test]
+    async fn restart_activates_the_new_generation_only_after_the_old_one_released() {
+        let (_d, mut s, log) = sup();
+        s.start(Why::Initial);
+        s.on_message(1, ready(1));
+        assert_eq!(take(&log), ["1 spawn", "1 active"]);
+
+        s.on_restart();
+        s.on_message(2, ready(2));
+        assert_eq!(
+            take(&log),
+            ["2 spawn", "1 handoff"],
+            "generation 2 serves, but its background tasks wait"
+        );
+        s.publish();
+        assert!(s.state.restarting);
+        // A second SIGHUP meanwhile starts nothing.
+        s.on_restart();
+        assert!(take(&log).is_empty());
+
+        s.on_message(1, FromWorker::Released);
+        assert_eq!(take(&log), ["2 active"]);
+        s.publish();
+        assert_eq!(s.state.restarts, 1);
+        assert_eq!(s.state.generation, 2);
+        assert_eq!(s.state.draining, [1001]);
+        assert!(!s.state.restarting);
+        assert!(s.state.last_restart.as_ref().unwrap().ok);
+        s.on_exit(1, "exit status: 0");
+        s.publish();
+        assert!(s.state.draining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_replacement_waits_for_the_release_of_the_generation_before_it() {
+        let (_d, mut s, log) = sup();
+        s.start(Why::Initial);
+        s.on_message(1, ready(1));
+        s.on_restart();
+        s.on_message(2, ready(2));
+        take(&log);
+
+        // Generation 2 dies after `ready`, before generation 1 has released.
+        s.on_exit(2, "signal: 9 (SIGKILL)");
+        assert!(!s.state.last_restart.as_ref().unwrap().ok);
+        assert!(s.respawn_at.is_some(), "nobody serves: respawn");
+        s.on_timer();
+        s.on_message(3, ready(3));
+        assert_eq!(
+            take(&log),
+            ["3 spawn"],
+            "generation 1 is still stopping its background tasks: 3 must wait"
+        );
+        s.on_message(1, FromWorker::Released);
+        assert_eq!(take(&log), ["3 active"]);
+    }
+
+    #[tokio::test]
+    async fn the_release_deadline_and_the_old_generations_exit_also_unblock() {
+        let (_d, mut s, log) = sup();
+        s.start(Why::Initial);
+        s.on_message(1, ready(1));
+        s.on_restart();
+        s.on_message(2, ready(2));
+        take(&log);
+        s.on_exit(1, "exit status: 0");
+        assert_eq!(take(&log), ["2 active"]);
+
+        s.on_restart();
+        s.on_message(3, ready(3));
+        take(&log);
+        s.release.as_mut().unwrap().deadline = Instant::now();
+        s.on_timer();
+        assert_eq!(take(&log), ["3 active"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_restart_keeps_the_old_generation_active() {
+        let (_d, mut s, log) = sup();
+        s.start(Why::Initial);
+        s.on_message(1, ready(1));
+        s.on_restart();
+        s.on_exit(2, "exit status: 1");
+        assert_eq!(take(&log), ["1 spawn", "1 active", "2 spawn"]);
+        let r = s.state.last_restart.clone().unwrap();
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("exited before it was ready"));
+        assert!(s.respawn_at.is_none(), "generation 1 still serves");
+        s.publish();
+        assert_eq!(s.state.generation, 1);
+    }
+
+    #[tokio::test]
+    async fn stop_and_force_go_over_the_control_socket_once_each() {
+        let (_d, mut s, log) = sup();
+        s.start(Why::Initial);
+        s.on_message(1, ready(1));
+        s.on_restart();
+        s.on_message(2, ready(2));
+        take(&log);
+        s.on_stop("SIGTERM");
+        assert_eq!(take(&log), ["1 stop", "2 stop"]);
+        s.on_stop("SIGTERM");
+        assert_eq!(take(&log), ["1 force", "2 force"]);
+        s.on_exit(1, "exit status: 0");
+        assert!(!s.done());
+        s.on_exit(2, "exit status: 0");
+        assert!(s.done());
+        assert_eq!(s.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn the_drain_backstop_kills_once() {
+        let (_d, mut s, log) = sup();
+        s.start(Why::Initial);
+        s.on_message(1, ready(1));
+        s.on_restart();
+        s.on_message(2, ready(2));
+        s.on_message(1, FromWorker::Released);
+        take(&log);
+        s.worker_mut(1).unwrap().since = Instant::now() - DRAIN_BACKSTOP;
+        s.on_timer();
+        s.on_timer();
+        assert_eq!(take(&log), ["kill 1001"]);
+        assert!(s.next_deadline().is_none(), "no deadline left in the past");
+    }
+
+    #[tokio::test]
+    async fn the_first_worker_failing_stops_the_supervisor_with_1() {
+        let (_d, mut s, _log) = sup();
+        s.start(Why::Initial);
+        s.on_exit(1, "exit status: 1");
+        assert!(s.done());
+        assert_eq!(s.exit_code, 1);
     }
 }

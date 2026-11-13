@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 
-use super::{run_checked, stable_bin, CmdOutput, Env, Runner, Status, BOOTSTRAP_ATTEMPTS};
+use super::{
+    run_checked, stable_bin, CmdOutput, Env, Interrupts, Runner, Status, BOOTSTRAP_ATTEMPTS,
+};
 use crate::config::Paths;
 use crate::fsutil::atomic_write;
 
@@ -104,25 +106,73 @@ fn not_loaded(out: &CmdOutput) -> bool {
 /// drain). `Ok(false)` when it was not loaded. Any other failure is an error unless the job turns
 /// out to be gone anyway, so a still-running daemon is never mistaken for a stopped one.
 fn unload(env: &Env, r: &dyn Runner) -> anyhow::Result<bool> {
+    match unload_waiting(env, r, &Interrupts::none())? {
+        Unloaded::Gone => Ok(true),
+        Unloaded::NotLoaded => Ok(false),
+        Unloaded::StillLoaded(why) => Err(anyhow!("{why}")),
+    }
+}
+
+/// How an unload ended.
+enum Unloaded {
+    Gone,
+    NotLoaded,
+    /// `bootout` was accepted but the job is still there (draining): the wait timed out or was
+    /// cut short.
+    StillLoaded(String),
+}
+
+/// `launchctl bootout`, then wait (with progress) until the job is gone. A second Ctrl-C (seen
+/// by `interrupts`) stops the wait early.
+fn unload_waiting(env: &Env, r: &dyn Runner, interrupts: &Interrupts) -> anyhow::Result<Unloaded> {
     if is_loaded(env, r) {
-        eprintln!("stopping the running service...");
+        eprintln!(
+            "stopping the running service: it finishes its in-flight requests first (up to 10 \
+             minutes)"
+        );
     }
     let out = r
         .run("launchctl", &["bootout", &target(env)])
         .context("running `launchctl`: is it on PATH?")?;
     if out.success {
-        let gone = env.timing.wait_until_gone(|| is_loaded(env, r));
-        return if gone {
-            Ok(true)
+        let mut warned = 0;
+        let gone = env.timing.wait_until_gone_with(
+            || is_loaded(env, r),
+            |waited| {
+                let n = interrupts.count();
+                if n > warned {
+                    warned = n;
+                    if n == 1 {
+                        eprintln!(
+                            "still waiting, so the new service can be loaded once the old one \
+                             is gone; Ctrl-C again stops waiting (then run `pooltime service \
+                             install` once the old daemon has exited)"
+                        );
+                    }
+                }
+                if n >= 2 {
+                    return false;
+                }
+                if waited.as_secs() > 0 && waited.as_secs() % 15 == 0 {
+                    eprintln!(
+                        "  ... still waiting for in-flight requests ({}s)",
+                        waited.as_secs()
+                    );
+                }
+                true
+            },
+        );
+        return Ok(if gone {
+            Unloaded::Gone
         } else {
-            Err(anyhow!(
+            Unloaded::StillLoaded(format!(
                 "the pooltime service is still loaded {}s after `launchctl bootout`",
                 env.timing.unload_timeout.as_secs()
             ))
-        };
+        });
     }
     if not_loaded(&out) {
-        return Ok(false);
+        return Ok(Unloaded::NotLoaded);
     }
     if is_loaded(env, r) {
         let why = out.stderr.trim();
@@ -134,7 +184,7 @@ fn unload(env: &Env, r: &dyn Runner) -> anyhow::Result<bool> {
             why
         ));
     }
-    Ok(false)
+    Ok(Unloaded::NotLoaded)
 }
 
 /// Write the plist atomically and (re)load it. An already-loaded definition is unloaded first
@@ -154,7 +204,13 @@ pub fn install(env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
         0o644,
     )
     .with_context(|| format!("writing {}", path.display()))?;
-    unload(env, r)?;
+    // A Ctrl-C while the old daemon drains must not leave the new definition unloaded: keep
+    // waiting, and load it on every way out of the wait.
+    let interrupts = Interrupts::catch();
+    let still = match unload_waiting(env, r, &interrupts)? {
+        Unloaded::Gone | Unloaded::NotLoaded => None,
+        Unloaded::StillLoaded(why) => Some(why),
+    };
     let mut attempt = 1;
     loop {
         match run_checked(
@@ -163,7 +219,15 @@ pub fn install(env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
             &["bootstrap", &domain(env), &path.to_string_lossy()],
         ) {
             Ok(_) => return Ok(()),
-            Err(e) if attempt >= BOOTSTRAP_ATTEMPTS => return Err(e),
+            Err(e) if attempt >= BOOTSTRAP_ATTEMPTS => {
+                return Err(match still {
+                    Some(why) => anyhow!(
+                        "{why}, so the new definition could not be loaded yet ({e:#}); run \
+                         `pooltime service install` again once the old daemon has exited"
+                    ),
+                    None => e,
+                })
+            }
             Err(_) => {
                 attempt += 1;
                 std::thread::sleep(env.timing.retry_delay);

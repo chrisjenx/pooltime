@@ -100,9 +100,9 @@ pub fn install_signals() -> io::Result<Signals> {
     install(false)
 }
 
-/// For a worker run by the supervisor: only `SIGTERM` (which the supervisor forwards) counts.
-/// `SIGINT` (a terminal's Ctrl-C reaches the whole process group) and `SIGHUP` are the
-/// supervisor's business and ignored here.
+/// For a worker run by the supervisor: `SIGINT` (a terminal's Ctrl-C reaches the whole process
+/// group) and `SIGHUP` are ignored, and `SIGTERM` is only counted: the worker acts on it only
+/// once its supervisor is gone (see `daemon::serve_supervised`).
 pub fn install_signals_supervised() -> io::Result<Signals> {
     install(true)
 }
@@ -149,6 +149,11 @@ impl Signals {
 
     pub fn second(&self) -> impl Future<Output = ()> + Send + 'static {
         self.nth(2)
+    }
+
+    /// The running count of counted signals.
+    pub fn counter(&self) -> watch::Receiver<u32> {
+        self.rx.clone()
     }
 }
 

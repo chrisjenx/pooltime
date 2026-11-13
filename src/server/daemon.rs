@@ -20,7 +20,7 @@ use anyhow::Context;
 use time::OffsetDateTime;
 use tokio::task::JoinHandle;
 
-use super::handoff::{reached, Control, Directive, Inherited};
+use super::handoff::{until, Control, Inherited};
 use super::shutdown::install_signals_supervised;
 use super::{
     health, mgmt, serve_until, serve_until_signal, AppState, Outcome, ServeOpts, StopKind,
@@ -229,7 +229,7 @@ struct Background {
     cache: StatusCache,
 }
 
-/// How long a handing-off worker waits for its background tasks to stop.
+/// How long a handing-off worker waits for its background work to stop.
 const RELEASE_BOUND: Duration = Duration::from_secs(5);
 
 impl Background {
@@ -237,17 +237,6 @@ impl Background {
     async fn stop(self) {
         drop(self.tasks);
         self.cache.shutdown().await;
-    }
-
-    /// Handing off to a newer generation: stop, and leave the status cache for it to update.
-    async fn release(self) {
-        let stopped = async {
-            self.tasks.stop().await;
-            self.cache.release().await;
-        };
-        if tokio::time::timeout(RELEASE_BOUND, stopped).await.is_err() {
-            tracing::warn!("background tasks still stopping at handoff");
-        }
     }
 }
 
@@ -316,10 +305,35 @@ fn spawn_background(
     Background { tasks, cache }
 }
 
-/// A worker run by the supervisor: serve the inherited socket at once, run the background tasks
-/// only while the supervisor says this is the active generation, and on `handoff` (or when the
-/// supervisor is gone) release them, answer `released`, stop accepting and drain. `SIGTERM` (the
-/// supervisor stopping) drains as an unsupervised daemon does.
+/// Handing off to a newer generation: stop the background tasks and wait for the blocking work
+/// they started, stop persisting account state, and get every queued write to disk, so that
+/// after `released` the next generation is the only writer (it reloads account state then).
+/// The status cache is left for it to update. Bounded by [`RELEASE_BOUND`].
+async fn release(app: &AppState, bg: Option<Background>) {
+    let work = async {
+        if let Some(bg) = bg {
+            bg.tasks.stop().await;
+            bg.cache.release().await;
+        }
+        crate::background::idle().await;
+        app.state.stop_persisting();
+        let _ = app.store.exec(|_| Ok(())).await;
+    };
+    if tokio::time::timeout(RELEASE_BOUND, work).await.is_err() {
+        tracing::warn!("background work still stopping at handoff");
+    }
+    app.state.stop_persisting();
+}
+
+/// A worker run by the supervisor: serve the inherited socket at once and follow the
+/// supervisor's orders over the control socket. `active`: reload account state from the
+/// database and start the background tasks. `handoff`: [`release`] them, answer `released`,
+/// stop accepting and drain. `stop`: drain as an unsupervised daemon does; `force`: stop now.
+///
+/// OS signals are ignored while the supervisor is there (it receives the service manager's
+/// signals and passes them on as orders), so a `SIGTERM` sent to the whole process group is
+/// never counted twice. If the control socket closes (the supervisor died), the worker hands
+/// off on its own, and from then on its second `SIGTERM` forces exit.
 async fn serve_supervised(
     app: Arc<AppState>,
     inherited: Inherited,
@@ -330,33 +344,53 @@ async fn serve_supervised(
     let listener = tokio::net::TcpListener::from_std(inherited.listener)?;
     let slot: Arc<std::sync::Mutex<Option<Background>>> = Arc::default();
     let life = tokio::spawn({
-        let (ctl, slot) = (ctl.clone(), slot.clone());
+        let (ctl, slot, app) = (ctl.clone(), slot.clone(), app.clone());
         async move {
-            let mut rx = ctl.directives();
-            reached(&mut rx, Directive::Active).await;
-            if *rx.borrow() == Directive::Active {
+            let mut rx = ctl.orders();
+            let o = until(&mut rx, |o| o.active || o.ending().is_some()).await;
+            if o.ending().is_none() {
+                // What the previous generation learned before it released.
+                let book = app.state.clone();
+                let now = OffsetDateTime::now_utc();
+                match tokio::task::spawn_blocking(move || book.reload(now)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %format!("{e:#}"), "could not reload account state")
+                    }
+                    Err(e) => tracing::warn!(error = %e, "account state reload failed"),
+                }
                 *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(spawn());
                 tracing::info!("active generation: background tasks started");
             }
-            reached(&mut rx, Directive::HandOff).await;
-            let bg = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
-            if let Some(bg) = bg {
-                bg.release().await;
-                tracing::info!("background tasks stopped for the handoff");
+            let o = until(&mut rx, |o| o.ending().is_some()).await;
+            if o.ending() == Some(StopKind::Handoff) {
+                let bg = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+                release(&app, bg).await;
+                tracing::info!("background work released for the handoff");
+                ctl.send(&FromWorker::Released);
             }
-            ctl.send(&FromWorker::Released);
         }
     });
 
-    let mut rx = ctl.directives();
-    let first = signals.first();
+    let mut rx = ctl.orders();
     let shutdown = async move {
-        tokio::select! {
-            _ = first => StopKind::Stop,
-            _ = reached(&mut rx, Directive::HandOff) => StopKind::Handoff,
-        }
+        until(&mut rx, |o| o.ending().is_some())
+            .await
+            .ending()
+            .unwrap_or(StopKind::Stop)
     };
-    let opts = ServeOpts::default().with_force(signals.second());
+    let mut rx = ctl.orders();
+    let mut sigs = signals.counter();
+    let force = async move {
+        let o = until(&mut rx, |o| o.force || o.orphaned).await;
+        if o.force {
+            return;
+        }
+        // Orphaned and draining on its own: the second SIGTERM from here on forces exit.
+        let from = *sigs.borrow_and_update();
+        let _ = sigs.wait_for(|n| *n >= from + 2).await;
+    };
+    let opts = ServeOpts::default().with_force(force);
     let router = super::router(app.clone());
     let serving = serve_until(listener, app.clone(), router, shutdown, opts);
     ctl.send(&FromWorker::Ready {

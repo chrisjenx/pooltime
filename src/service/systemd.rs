@@ -100,6 +100,13 @@ pub fn install(env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
     systemctl(r, &["daemon-reload"])?;
     systemctl(r, &["enable", "--now", UNIT])?;
     if existed {
+        if is_active(r) {
+            eprintln!(
+                "restarting the running service: it finishes its in-flight requests first (up \
+                 to 10 minutes). Interrupting this command is safe: systemd completes the \
+                 restart on its own."
+            );
+        }
         systemctl(r, &["restart", UNIT])?;
     }
     Ok(())

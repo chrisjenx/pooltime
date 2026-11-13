@@ -154,6 +154,10 @@ impl Runner for Rec {
         let mut loaded = self.loaded.lock().unwrap();
         let mut active = self.active.lock().unwrap();
         match (program, *verb) {
+            // launchd refuses a label it still has loaded.
+            ("launchctl", "bootstrap") if *loaded => {
+                reply(5, "", "Bootstrap failed: 5: Input/output error")
+            }
             ("launchctl", "bootstrap") => {
                 let mut left = self.bootstrap_failures.lock().unwrap();
                 if *left > 0 {
@@ -268,14 +272,25 @@ fn launchd_install_waits_for_the_unload_and_retries_bootstrap() {
     assert!(format!("{err:#}").contains("boom"), "{err:#}");
     assert_eq!(boots(&rec), 3);
 
-    // A job that will not unload is an error, and nothing is bootstrapped over it.
+    // A job still draining when the wait ends (timeout, or Ctrl-C twice): loading the new
+    // definition is still tried, so the service is not left down; launchd refuses while the
+    // old job is there, and the error says what to do.
     let rec = Rec {
         stuck: true,
         ..Rec::launchd_loaded()
     };
-    let err = launchd::install(&env, &rec).unwrap_err();
-    assert!(format!("{err:#}").contains("still loaded"), "{err:#}");
-    assert_eq!(boots(&rec), 0);
+    let err = format!("{:#}", launchd::install(&env, &rec).unwrap_err());
+    assert!(err.contains("still loaded"), "{err}");
+    assert!(err.contains("pooltime service install` again"), "{err}");
+    assert_eq!(boots(&rec), 3);
+
+    // Once the old job is gone in time, the new definition loads.
+    let rec = Rec {
+        stuck: false,
+        ..Rec::launchd_loaded()
+    };
+    launchd::install(&env, &rec).unwrap();
+    assert_eq!(boots(&rec), 1);
 }
 
 #[test]
@@ -402,6 +417,7 @@ fn systemd_install_enables_and_reinstall_restarts() {
         [
             "systemctl --user daemon-reload",
             "systemctl --user enable --now pooltime.service",
+            "systemctl --user is-active pooltime.service",
             "systemctl --user restart pooltime.service"
         ],
         "a replaced unit is picked up by the running daemon"
@@ -730,6 +746,7 @@ fn live_supervisor(restarts: u64) -> SupervisorState {
         worker_version: Some("1.1.0".into()),
         draining: vec![],
         restarts,
+        restarting: false,
         last_restart: None,
     }
 }
@@ -761,7 +778,8 @@ fn restart_signals_the_supervisor_and_reports_the_handover() {
     };
     let rec = rec_answering(&env.paths, ok);
     match restart(Backend::Launchd, &env, &rec).unwrap() {
-        Restarted::HandedOver(st) => {
+        Restarted::HandedOver { state: st, joined } => {
+            assert!(!joined);
             assert_eq!(st.generation, 2);
             assert_eq!(st.draining, [4242]);
         }
@@ -788,9 +806,39 @@ fn restart_signals_the_supervisor_and_reports_the_handover() {
     );
     assert!(matches!(
         restart(Backend::Systemd, &env, &rec).unwrap(),
-        Restarted::HandedOver(_)
+        Restarted::HandedOver { joined: false, .. }
     ));
     assert_eq!(rec.calls(), ["systemctl --user reload pooltime.service"]);
+}
+
+#[test]
+fn a_restart_already_in_progress_is_reported_as_such() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    launchd::install(&env, &Rec::default()).unwrap();
+    let mut busy = live_supervisor(0);
+    busy.restarting = true;
+    write_supervisor(&env.paths, &busy);
+    let ok = RestartResult {
+        ok: true,
+        generation: 2,
+        error: None,
+    };
+    let rec = rec_answering(&env.paths, ok);
+    assert!(matches!(
+        restart(Backend::Launchd, &env, &rec).unwrap(),
+        Restarted::HandedOver { joined: true, .. }
+    ));
+
+    write_supervisor(&env.paths, &busy);
+    let failed = RestartResult {
+        ok: false,
+        generation: 1,
+        error: Some("boom".into()),
+    };
+    let rec = rec_answering(&env.paths, failed);
+    let err = format!("{:#}", restart(Backend::Launchd, &env, &rec).unwrap_err());
+    assert!(err.contains("already in progress"), "{err}");
 }
 
 #[test]

@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod analytics;
+pub mod background;
 pub mod claude_code;
 pub mod cli;
 pub mod config;

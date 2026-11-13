@@ -87,55 +87,75 @@ impl Inherited {
     }
 }
 
-/// What the supervisor has told this worker so far (only ever moves forward).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Directive {
-    /// Serving, but another generation still runs the background tasks.
-    Standby,
+/// What the supervisor has told this worker so far. Every flag only ever turns on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Orders {
     /// Run the background tasks.
-    Active,
-    /// Stop accepting, stop the background tasks, drain. Also when the supervisor is gone.
-    HandOff,
+    pub active: bool,
+    /// A newer generation serves: stop accepting, release the background tasks, drain.
+    pub handoff: bool,
+    /// The service is stopping: drain (503 for new requests meanwhile).
+    pub stop: bool,
+    /// Stop without waiting for in-flight requests.
+    pub force: bool,
+    /// The control socket closed: the supervisor is gone. Implies `handoff` (unless already
+    /// stopping); from here on the worker's own OS signals count again.
+    pub orphaned: bool,
+}
+
+impl Orders {
+    /// Serving should end: how.
+    pub fn ending(&self) -> Option<crate::server::StopKind> {
+        if self.stop {
+            Some(crate::server::StopKind::Stop)
+        } else if self.handoff {
+            Some(crate::server::StopKind::Handoff)
+        } else {
+            None
+        }
+    }
 }
 
 /// The worker's end of the control socket.
 pub struct Control {
     writer: UnixStream,
-    rx: watch::Receiver<Directive>,
+    rx: watch::Receiver<Orders>,
 }
 
 impl Control {
-    /// Start reading directives from `stream` (a reader task; must run inside a runtime).
+    /// Start reading orders from `stream` (a reader task; must run inside a runtime).
     pub fn start(stream: UnixStream) -> anyhow::Result<Control> {
         let writer = stream.try_clone()?;
         stream.set_nonblocking(true)?;
         let reader = tokio::net::UnixStream::from_std(stream)?;
-        let (tx, rx) = watch::channel(Directive::Standby);
+        let (tx, rx) = watch::channel(Orders::default());
         tokio::spawn(async move {
             let mut lines = BufReader::new(reader).lines();
-            let advance = |d: Directive| {
-                tx.send_if_modified(|cur| {
-                    let moved = d > *cur;
-                    if moved {
-                        *cur = d;
-                    }
-                    moved
-                });
-            };
             loop {
                 match lines.next_line().await {
-                    Ok(Some(l)) => match ToWorker::parse(&l) {
-                        Some(ToWorker::Active) => advance(Directive::Active),
-                        Some(ToWorker::Handoff) => advance(Directive::HandOff),
-                        None => tracing::debug!("ignoring an unknown supervisor message"),
-                    },
+                    Ok(Some(l)) => {
+                        let Some(msg) = ToWorker::parse(&l) else {
+                            tracing::debug!("ignoring an unknown supervisor message");
+                            continue;
+                        };
+                        tracing::info!(order = ?msg, "supervisor order");
+                        tx.send_modify(|o| match msg {
+                            ToWorker::Active => o.active = true,
+                            ToWorker::Handoff => o.handoff = true,
+                            ToWorker::Stop => o.stop = true,
+                            ToWorker::Force => o.force = true,
+                        });
+                    }
                     _ => {
-                        if *tx.borrow() != Directive::HandOff {
+                        if tx.borrow().ending().is_none() {
                             tracing::warn!(
                                 "the supervisor is gone: no longer accepting, draining and exiting"
                             );
                         }
-                        advance(Directive::HandOff);
+                        tx.send_modify(|o| {
+                            o.orphaned = true;
+                            o.handoff = true;
+                        });
                         // Keep the sender alive so waiters see the final value.
                         std::future::pending::<()>().await;
                     }
@@ -151,14 +171,15 @@ impl Control {
         }
     }
 
-    pub fn directives(&self) -> watch::Receiver<Directive> {
+    pub fn orders(&self) -> watch::Receiver<Orders> {
         self.rx.clone()
     }
 }
 
-/// Wait until the directive is at least `d`.
-pub async fn reached(rx: &mut watch::Receiver<Directive>, d: Directive) {
-    let _ = rx.wait_for(|cur| *cur >= d).await;
+/// Wait until `f` holds for the orders; the orders then.
+pub async fn until(rx: &mut watch::Receiver<Orders>, f: impl Fn(&Orders) -> bool) -> Orders {
+    let got = rx.wait_for(|o| f(o)).await.map(|o| *o).ok();
+    got.unwrap_or_else(|| *rx.borrow())
 }
 
 #[cfg(test)]
@@ -167,11 +188,11 @@ mod tests {
     use std::time::Duration;
 
     #[tokio::test]
-    async fn directives_move_forward_and_eof_means_handoff() {
+    async fn orders_accumulate_and_eof_means_orphaned_handoff() {
         let (ours, theirs) = UnixStream::pair().unwrap();
         let ctl = Control::start(theirs).unwrap();
-        let mut rx = ctl.directives();
-        assert_eq!(*rx.borrow(), Directive::Standby);
+        let mut rx = ctl.orders();
+        assert_eq!(*rx.borrow(), Orders::default());
 
         ctl.send(&FromWorker::Ready {
             version: "9.9.9".into(),
@@ -180,17 +201,41 @@ mod tests {
         std::io::Read::read_exact(&mut &ours, &mut got).unwrap();
         assert_eq!(&got, b"ready 9.9.");
 
+        let wait = |rx: &mut watch::Receiver<Orders>, f: fn(&Orders) -> bool| {
+            let mut rx = rx.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), until(&mut rx, f))
+                    .await
+                    .unwrap()
+            }
+        };
         (&ours).write_all(b"active\n").unwrap();
-        tokio::time::timeout(Duration::from_secs(5), reached(&mut rx, Directive::Active))
-            .await
-            .unwrap();
-        assert_eq!(*rx.borrow(), Directive::Active);
+        assert!(wait(&mut rx, |o| o.active).await.ending().is_none());
         // Unknown lines change nothing.
-        (&ours).write_all(b"something new\n").unwrap();
+        (&ours).write_all(b"something new\nstop\n").unwrap();
+        let o = wait(&mut rx, |o| o.stop).await;
+        assert_eq!(o.ending(), Some(crate::server::StopKind::Stop));
+        (&ours).write_all(b"force\n").unwrap();
+        wait(&mut rx, |o| o.force).await;
         drop(ours);
-        tokio::time::timeout(Duration::from_secs(5), reached(&mut rx, Directive::HandOff))
+        let o = wait(&mut rx, |o| o.orphaned).await;
+        assert_eq!(
+            o.ending(),
+            Some(crate::server::StopKind::Stop),
+            "a stop stays a stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_vanished_supervisor_means_handoff() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let ctl = Control::start(theirs).unwrap();
+        let mut rx = ctl.orders();
+        drop(ours);
+        let o = tokio::time::timeout(Duration::from_secs(5), until(&mut rx, |o| o.orphaned))
             .await
             .unwrap();
+        assert_eq!(o.ending(), Some(crate::server::StopKind::Handoff));
     }
 
     #[test]

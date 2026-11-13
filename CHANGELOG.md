@@ -27,8 +27,12 @@
   [`docs/specs/2026-11-13-seamless-restart.md`](docs/specs/2026-11-13-seamless-restart.md).
 - **Once after upgrading:** run `pooltime service install` (or just `pooltime service restart`,
   which notices the old service definition and reinstalls it for you). That one restart still
-  waits for in-flight requests; every later one hands over without a pause. `doctor` warns
-  until it is done.
+  waits for in-flight requests (it shows progress, and a Ctrl-C does not leave the service
+  unloaded); every later one hands over without a pause. `doctor` warns until it is done.
+- One stop signal stops the pool gracefully even when it reaches every pooltime process at once
+  (`pkill pooltime`, a service manager signalling the process group): in-flight streams finish.
+- Only one daemon process at a time runs the background work and writes account state; the
+  new one picks up what the old one learned (rate limits, expired logins, billing blocks).
 - `/health` also reports the answering process's `pid`.
 
 ### Fixed

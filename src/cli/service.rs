@@ -75,7 +75,13 @@ pub fn run_with(
         }
         ServiceCmd::Restart => {
             match crate::service::restart(backend, env, r)? {
-                Restarted::HandedOver(sup) => {
+                Restarted::HandedOver { state: sup, joined } => {
+                    if joined {
+                        println!(
+                            "a restart was already in progress, so this request started nothing \
+                             new; that restart finished:"
+                        );
+                    }
                     println!(
                         "restarted without closing the port: generation {} (pid {}, version {}) \
                          serves new requests",

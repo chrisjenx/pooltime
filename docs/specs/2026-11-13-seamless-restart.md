@@ -41,23 +41,31 @@ process, which launchd kills (process group) and systemd kills (cgroup). Rejecte
 
 - **Control channel.** Each worker gets a `socketpair` end (fd inherited, `FD_CLOEXEC` set again
   in the worker) and the listener fd (hidden `serve --listen-fd N --control-fd M`). Line protocol:
-  worker → `ready <version>`, `released`; supervisor → `active`, `handoff`. EOF from the
-  supervisor = it died: the worker hands off (closes its listener so a restarted supervisor can
-  bind) and drains. No filesystem socket, so no other user can connect or inject a listener.
+  worker → `ready <version>`, `released`; supervisor → `active`, `handoff`, `stop`, `force`.
+  While the socket is open a worker ignores OS signals and acts on these orders only. EOF from
+  the supervisor = it died: the worker hands off (closes its listener so a restarted supervisor
+  can bind) and drains on its own; from then on its own second `SIGTERM` forces exit. No
+  filesystem socket, so no other user can connect or inject a listener.
 - **Single writer.** A worker serves at once but starts its background tasks (usage pollers,
   catalog, profile sync, health tick, alerts, status cache, sampler, session and retention prune)
-  only on `active`. On `handoff` the old worker aborts them, stops the status cache *without*
-  deleting it, answers `released`, and only then does the supervisor send `active` to the new
-  one (after at most 10 s). Request-path writes (journal, state, token refreshes) were already
-  safe across processes (SQLite WAL + busy timeout, refresh `flock`).
+  only on `active`. On `handoff` the old worker aborts them, waits for the blocking work they
+  started (profile writes, status-cache write, sampling round, notifications), stops the status
+  cache *without* deleting it, stops persisting `account_state` rows (its in-flight requests keep
+  updating its memory only) and flushes its queued database writes; then it answers `released`
+  (all of this bounded by 5 s). Only then does the supervisor send `active` to the new one (after
+  at most 10 s, even if the old one never answers); the new one first reloads account state from
+  the database, so it sees the rate limits, dead-token markers and billing blocks the old one
+  learned. If the generation waiting for `active` dies first, the pending release is kept and its
+  replacement waits for it too. Journal rows, timeline rows and token refreshes stay
+  multi-process safe as before (SQLite WAL + busy timeout, refresh `flock`).
 - **Handoff drain.** The old worker stops accepting and closes its copy of the listener at once,
   keeps its open connections for a 2 s grace (a client that just connected still gets its
   request served), then does today's graceful drain without the 503 holder. Refresh drain and
   store flush run as before.
-- **Stop.** `SIGTERM`/`SIGINT` to the supervisor is forwarded to every worker as `SIGTERM`
-  (a second one forces); workers then drain exactly as before, including the 503 holder.
-  Supervised workers ignore `SIGINT`/`SIGHUP` (a terminal's Ctrl-C reaches the whole process
-  group). The systemd unit uses `KillMode=mixed` so only the supervisor gets the first `SIGTERM`.
+- **Stop.** `SIGTERM`/`SIGINT` to the supervisor becomes `stop` for every worker (a second one:
+  `force`); workers then drain exactly as before, including the 503 holder. Because workers
+  ignore OS signals while supervised, a `SIGTERM` that reaches the whole process group (`pkill`,
+  launchd) is counted once. The systemd unit also uses `KillMode=mixed`.
 - **Crashes.** A worker that dies unexpectedly is respawned at once; the port stays bound so
   clients wait in the backlog instead of being refused. Repeated failures back off (1, 2, 4,
   8 s); after 5 in a row, or if the very first worker never gets ready, the supervisor exits
@@ -68,7 +76,11 @@ process, which launchd kills (process group) and systemd kills (cgroup). Rejecte
   `service restart` waits on it and reports the outcome; `service status` and `doctor` show it.
 - **Old service definitions.** A plist/unit written before this change runs plain `serve`.
   `service restart` notices, explains, and reinstalls the definition once (that restart drains
-  the old way); `doctor` warns until then.
+  the old way); `doctor` warns until then. While the old daemon drains, the CLI says so, shows
+  progress and keeps waiting through a first Ctrl-C; on a timeout or a second Ctrl-C it still
+  tries to load the new definition and, if launchd refuses because the old job is still there,
+  says to run `pooltime service install` again. systemd queues the restart itself, so
+  interrupting `systemctl` is harmless there.
 - **Foreground.** `pooltime serve` without `--supervise` is unchanged.
 
 **The supervisor is not upgraded by `service restart`.** It is deliberately small (no database,

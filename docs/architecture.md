@@ -86,20 +86,24 @@ The background service runs `pooltime serve --supervise` instead
 ([design](specs/2026-11-13-seamless-restart.md)). The supervisor binds the port once and runs
 `pooltime serve --listen-fd N --control-fd M` workers that inherit the listening socket and an
 anonymous `socketpair` (no filesystem path, nothing another user can connect to). Protocol, one
-line each: worker `ready <version>` / `released`, supervisor `active` / `handoff`.
+line each: worker `ready <version>` / `released`, supervisor `active` / `handoff` / `stop` /
+`force`. Workers ignore OS signals while the socket is open.
 
 1. `service restart` sends the supervisor `SIGHUP` (`launchctl kill SIGHUP`, `systemctl reload`).
 2. It starts a new worker from the configured binary path (the Homebrew symlink, so upgrades take
    effect). The worker skips the "already running" preflight and serves at once.
 3. On `ready`, the old worker gets `handoff`: it stops accepting, closes its copy of the socket
-   (queued connections stay in the shared backlog), stops its background tasks without deleting
-   the status cache, answers `released`, serves its open connections for a 2 s grace and drains.
-4. On `released` (or after 10 s) the new worker gets `active` and starts the background tasks.
+   (queued connections stay in the shared backlog), stops its background tasks and waits for
+   their blocking work, stops persisting account state, flushes its database queue, answers
+   `released`, serves its open connections for a 2 s grace and drains.
+4. On `released` (or after 10 s) the new worker gets `active`: it reloads account state from the
+   database and starts the background tasks.
 
 A worker that dies is respawned at once (1, 2, 4, 8 s backoff after repeated failures; after 5,
 or if the first worker never starts, the supervisor exits non-zero for launchd/systemd to
-restart). A new worker that fails during a restart leaves the old one serving. `SIGTERM` to the
-supervisor is forwarded once to every worker; workers ignore `SIGINT`/`SIGHUP`. State for the CLI:
+restart). A new worker that fails during a restart leaves the old one serving. `SIGTERM`/`SIGINT`
+to the supervisor becomes `stop` for every worker (again: `force`); if the control socket closes
+(supervisor gone) a worker hands off and drains on its own. State for the CLI:
 `run/supervisor.json` (0600). The supervisor itself changes only with `service install`.
 
 ## Data

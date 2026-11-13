@@ -19,6 +19,12 @@ pub enum ToWorker {
     /// A newer generation serves now: stop accepting, stop the background tasks, answer
     /// [`FromWorker::Released`], drain and exit.
     Handoff,
+    /// The service is stopping: drain (the port answers 503 meanwhile) and exit. A supervised
+    /// worker ignores OS signals while the supervisor is there, so one `SIGTERM` that reaches
+    /// both (a process-group signal, `pkill`) is never counted twice.
+    Stop,
+    /// Stop now, without waiting for in-flight requests (a second stop signal).
+    Force,
 }
 
 /// Worker -> supervisor.
@@ -35,6 +41,8 @@ impl ToWorker {
         match self {
             ToWorker::Active => "active\n",
             ToWorker::Handoff => "handoff\n",
+            ToWorker::Stop => "stop\n",
+            ToWorker::Force => "force\n",
         }
     }
 
@@ -42,6 +50,8 @@ impl ToWorker {
         match line.trim() {
             "active" => Some(ToWorker::Active),
             "handoff" => Some(ToWorker::Handoff),
+            "stop" => Some(ToWorker::Stop),
+            "force" => Some(ToWorker::Force),
             _ => None,
         }
     }
@@ -86,6 +96,10 @@ pub struct SupervisorState {
     /// to go up.
     #[serde(default)]
     pub restarts: u64,
+    /// A restart is under way (a new generation booting or the old one releasing): another
+    /// `SIGHUP` now is ignored.
+    #[serde(default)]
+    pub restarting: bool,
     pub last_restart: Option<RestartResult>,
 }
 
@@ -136,7 +150,12 @@ mod tests {
 
     #[test]
     fn messages_round_trip_and_unknown_lines_are_ignored() {
-        for m in [ToWorker::Active, ToWorker::Handoff] {
+        for m in [
+            ToWorker::Active,
+            ToWorker::Handoff,
+            ToWorker::Stop,
+            ToWorker::Force,
+        ] {
             assert_eq!(ToWorker::parse(m.line()), Some(m));
         }
         for m in [
@@ -172,6 +191,7 @@ mod tests {
             worker_version: Some("1.0.1".into()),
             draining: vec![6],
             restarts: 1,
+            restarting: false,
             last_restart: Some(RestartResult {
                 ok: true,
                 generation: 2,

@@ -120,8 +120,36 @@ impl Timing {
     }
 
     /// Poll `present` until it is false; `false` if it is still true after `unload_timeout`.
-    pub(crate) fn wait_until_gone(&self, mut present: impl FnMut() -> bool) -> bool {
-        self.wait_until(self.unload_timeout, || !present())
+    /// `go_on(waited)` runs between polls (`waited` is zero except once per whole second): it
+    /// may print progress, and stops the wait by returning `false`.
+    pub(crate) fn wait_until_gone_with(
+        &self,
+        mut present: impl FnMut() -> bool,
+        mut go_on: impl FnMut(Duration) -> bool,
+    ) -> bool {
+        let start = Instant::now();
+        let mut last = 0;
+        loop {
+            if !present() {
+                return true;
+            }
+            let waited = start.elapsed();
+            if waited >= self.unload_timeout {
+                return false;
+            }
+            // Once per whole second, so progress lines are not repeated.
+            let secs = waited.as_secs();
+            let tick = if secs != last {
+                last = secs;
+                waited
+            } else {
+                Duration::ZERO
+            };
+            if !go_on(tick) {
+                return false;
+            }
+            std::thread::sleep(self.poll_step);
+        }
     }
 
     /// Poll `done` until it is true; `false` if it is still false after `timeout`.
@@ -223,6 +251,67 @@ pub fn stable_bin(bin: &Path) -> PathBuf {
     keg.unwrap_or_else(|| bin.to_path_buf())
 }
 
+static INTERRUPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+extern "C" fn count_interrupt(_: libc::c_int) {
+    INTERRUPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Ctrl-C counted instead of obeyed while a service definition is being swapped (only when
+/// stdin is a terminal: nobody presses Ctrl-C in a script or a test). The previous `SIGINT`
+/// disposition is restored on drop.
+pub(crate) struct Interrupts {
+    previous: Option<libc::sigaction>,
+}
+
+impl Interrupts {
+    /// Count nothing.
+    pub(crate) fn none() -> Interrupts {
+        Interrupts { previous: None }
+    }
+
+    pub(crate) fn catch() -> Interrupts {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return Interrupts::none();
+        }
+        INTERRUPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: installing a handler that only touches an atomic; `old` receives the
+        // previous action, restored on drop.
+        unsafe {
+            let mut new: libc::sigaction = std::mem::zeroed();
+            new.sa_sigaction = count_interrupt as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut new.sa_mask);
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(libc::SIGINT, &new, &mut old) != 0 {
+                return Interrupts::none();
+            }
+            Interrupts {
+                previous: Some(old),
+            }
+        }
+    }
+
+    /// Ctrl-Cs so far.
+    pub(crate) fn count(&self) -> u32 {
+        if self.previous.is_none() {
+            return 0;
+        }
+        INTERRUPTS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for Interrupts {
+    fn drop(&mut self) {
+        if let Some(old) = self.previous.take() {
+            // SAFETY: restoring the action saved in `catch`.
+            unsafe {
+                libc::sigaction(libc::SIGINT, &old, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
 /// What `service status` reports.
 #[derive(Debug, Clone)]
 pub struct Status {
@@ -319,7 +408,12 @@ pub fn definition_is_supervised(definition: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Restarted {
     /// A new worker generation serves; the previous one finishes its requests.
-    HandedOver(SupervisorState),
+    /// `joined`: another restart was already under way, so the supervisor started nothing new
+    /// and this is that restart's outcome.
+    HandedOver {
+        state: SupervisorState,
+        joined: bool,
+    },
     /// No supervisor was running: the service was started the ordinary way.
     Started,
     /// The definition predated seamless restarts: it was rewritten and reloaded (that restart
@@ -367,9 +461,17 @@ pub fn restart(backend: Backend, env: &Env, r: &dyn Runner) -> anyhow::Result<Re
         ));
     };
     match &after.last_restart {
-        Some(res) if res.ok => Ok(Restarted::HandedOver(after)),
+        Some(res) if res.ok => Ok(Restarted::HandedOver {
+            state: after,
+            joined: before.restarting,
+        }),
         Some(res) => Err(anyhow!(
-            "restart failed: {}; the running daemon keeps serving",
+            "{}restart failed: {}; the running daemon keeps serving",
+            if before.restarting {
+                "a restart was already in progress (this request started nothing new) and that "
+            } else {
+                ""
+            },
             res.error.as_deref().unwrap_or("unknown error")
         )),
         None => Err(anyhow!(

@@ -182,7 +182,7 @@ pub fn spawn_sampler(
         loop {
             // The registry listing reads account files: keep it off the async threads.
             let (r, s, st) = (registry.clone(), state.clone(), store.clone());
-            sampler = match tokio::task::spawn_blocking(move || {
+            sampler = match crate::background::blocking(move || {
                 sample_all(&mut sampler, &r, &s, &st);
                 sampler
             })
