@@ -3,9 +3,10 @@
 //! - The daemon keeps `run/status-cache.json` current ([`spawn_status_cache`]): rewritten when the
 //!   pool's picture changes (at most once a second) and at least every [`HEARTBEAT`]. It holds
 //!   counts only, never tokens or emails:
-//!   `{written_at, port, pool: {available, total}, seven_day_left, counts: {needs_login,
-//!   expiring_today, expiring, erroring}}`.
-//! - [`segment`] renders it without any network: `pool 6/8 · 7d 41% left · ⚠ 2 need login`, or
+//!   `{written_at, port, pool: {available, total}, seven_day_used, seven_day_left, counts:
+//!   {needs_login, expiring_today, expiring, erroring}}` (`seven_day_left` is kept for older
+//!   readers; the segment shows `seven_day_used`).
+//! - [`segment`] renders it without any network: `pool 6/8 · 7d 59% used · ⚠ 2 need login`, or
 //!   `pool down` when the cache is missing, unreadable or older than [`STALE_AFTER`].
 //! - `connect --statusline` ([`install`]) puts `pooltime statusline --wrap <profile-id>` into the
 //!   profile's `statusLine`, keeping the user's own value in the profile snapshot
@@ -46,7 +47,7 @@ pub fn cache_path(paths: &Paths) -> PathBuf {
 }
 
 /// The cache document (without `written_at`) for a `GET /api/v1/status` document. The 7-day
-/// figure is `pooltime status`'s ([`crate::cli::status::pool_seven_day_left`]).
+/// figure is `pooltime status`'s ([`crate::cli::status::pool_seven_day_used`]).
 pub fn cache_body(status: &Value, port: u16) -> Value {
     let pool = &status["pool"];
     let counts = &status["counts"];
@@ -54,10 +55,13 @@ pub fn cache_body(status: &Value, port: u16) -> Value {
     let erroring = status["accounts"].as_array().map_or(0, |a| {
         a.iter().filter(|a| a["status"] == "erroring").count()
     });
+    let used = crate::cli::status::pool_seven_day_used(status);
     json!({
         "port": port,
         "pool": { "available": n(&pool["available"]), "total": n(&pool["accounts"]) },
-        "seven_day_left": crate::cli::status::pool_seven_day_left(status),
+        "seven_day_used": used,
+        // Older readers (a status line from a previous version) still look for this.
+        "seven_day_left": used.map(|u| 1.0 - u),
         "counts": {
             "needs_login": n(&counts["needs_login"]),
             "expiring_today": n(&counts["expiring_today"]),
@@ -71,6 +75,8 @@ pub fn cache_body(status: &Value, port: u16) -> Value {
 struct Cache {
     written_at: i64,
     pool: PoolCounts,
+    seven_day_used: Option<f64>,
+    /// Written by a daemon older than `seven_day_used`; read as `1 - left` when that is absent.
     seven_day_left: Option<f64>,
     counts: Counts,
 }
@@ -106,10 +112,10 @@ pub fn segment(cache: Option<&[u8]>, now: i64) -> String {
         return POOL_DOWN.into();
     };
     let mut out = format!("pool {}/{}", c.pool.available, c.pool.total);
-    if let Some(left) = c.seven_day_left {
+    if let Some(used) = c.seven_day_used.or(c.seven_day_left.map(|left| 1.0 - left)) {
         out.push_str(&format!(
-            " · 7d {} left",
-            crate::cli::status::pct(Some(left.clamp(0.0, 1.0)))
+            " · 7d {} used",
+            crate::cli::status::pct(Some(used.clamp(0.0, 1.0)))
         ));
     }
     if c.counts.needs_login > 0 {
@@ -440,12 +446,12 @@ pub fn restore(p: &Profile, paths: &Paths) -> anyhow::Result<WriteOutcome> {
 mod tests {
     use super::*;
 
-    fn cache(written_at: i64, left: Value, needs_login: u64, today: u64) -> Vec<u8> {
+    fn cache(written_at: i64, used: Value, needs_login: u64, today: u64) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "written_at": written_at,
             "port": 3460,
             "pool": {"available": 6, "total": 8},
-            "seven_day_left": left,
+            "seven_day_used": used,
             "counts": {"needs_login": needs_login, "expiring_today": today, "expiring": 3, "erroring": 0},
         }))
         .unwrap()
@@ -457,12 +463,12 @@ mod tests {
         assert_eq!(segment(None, now), "pool down", "no cache");
         assert_eq!(segment(Some(b"{not json"), now), "pool down", "unparsable");
         assert_eq!(segment(Some(b"{}"), now), "pool down", "wrong shape");
-        let stale = cache(now - 151, json!(0.41), 0, 0);
+        let stale = cache(now - 151, json!(0.59), 0, 0);
         assert_eq!(segment(Some(&stale), now), "pool down", "older than 150 s");
-        let fresh = cache(now - 150, json!(0.41), 2, 0);
+        let fresh = cache(now - 150, json!(0.59), 2, 0);
         assert_eq!(
             segment(Some(&fresh), now),
-            "pool 6/8 · 7d 41% left · ⚠ 2 need login"
+            "pool 6/8 · 7d 59% used · ⚠ 2 need login"
         );
     }
 
@@ -475,15 +481,31 @@ mod tests {
         );
         assert_eq!(
             segment(Some(&cache(now, json!(1.0), 0, 1)), now),
-            "pool 6/8 · 7d 100% left · ⏳ 1 expiring"
+            "pool 6/8 · 7d 100% used · ⏳ 1 expiring"
         );
+        assert_eq!(
+            segment(Some(&cache(now, json!(0.0), 0, 0)), now),
+            "pool 6/8 · 7d 0% used"
+        );
+    }
+
+    #[test]
+    fn segment_reads_a_cache_from_before_the_used_field() {
+        let now = 1_800_000_000;
+        let old = serde_json::to_vec(&json!({
+            "written_at": now, "port": 3460, "pool": {"available": 6, "total": 8},
+            "seven_day_left": 0.41,
+            "counts": {"needs_login": 0, "expiring_today": 0, "expiring": 0, "erroring": 0},
+        }))
+        .unwrap();
+        assert_eq!(segment(Some(&old), now), "pool 6/8 · 7d 59% used");
     }
 
     #[test]
     fn cache_body_reuses_the_status_figures() {
         let status = json!({
             "accounts": [{"status": "erroring"}, {"status": "ready"}, {"status": "needs_login"}],
-            "pool": {"seven_day_left_total": 1.5, "accounts": 3, "available": 2},
+            "pool": {"seven_day_left_total": 1.5, "seven_day_used_total": 1.5, "accounts": 3, "available": 2},
             "counts": {"needs_login": 1, "expiring_today": 0, "expiring": 1},
         });
         assert_eq!(
@@ -491,11 +513,13 @@ mod tests {
             json!({
                 "port": 3460,
                 "pool": {"available": 2, "total": 3},
+                "seven_day_used": 0.5,
                 "seven_day_left": 0.5,
                 "counts": {"needs_login": 1, "expiring_today": 0, "expiring": 1, "erroring": 1},
             })
         );
-        let empty = json!({"pool": {"seven_day_left_total": 0.0, "accounts": 0, "available": 0}});
+        let empty = json!({"pool": {"seven_day_used_total": 0.0, "accounts": 0, "available": 0}});
+        assert!(cache_body(&empty, 1)["seven_day_used"].is_null());
         assert!(cache_body(&empty, 1)["seven_day_left"].is_null());
     }
 

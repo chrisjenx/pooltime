@@ -40,6 +40,7 @@
         }
       ],
       "seven_day_left": 0.63,
+      "seven_day_used": 0.37,
       "expires_at": "2026-11-07T18:00:00Z",
       "refresh_expires_at": "2026-12-01T00:00:00Z",
       "identity": {
@@ -110,6 +111,7 @@
         }
       ],
       "seven_day_left": 0.88,
+      "seven_day_used": 0.12,
       "expires_at": "2026-11-07T19:00:00Z",
       "refresh_expires_at": "2026-11-09T06:00:00Z",
       "identity": {
@@ -180,6 +182,7 @@
         }
       ],
       "seven_day_left": 0.1,
+      "seven_day_used": 0.9,
       "expires_at": "2026-11-07T18:00:00Z",
       "refresh_expires_at": "2026-12-01T00:00:00Z",
       "identity": {
@@ -253,6 +256,7 @@
         }
       ],
       "seven_day_left": null,
+      "seven_day_used": null,
       "expires_at": "2026-11-05T18:00:00Z",
       "refresh_expires_at": "2026-11-06T00:00:00Z",
       "identity": {
@@ -311,6 +315,7 @@
       "effective_weight": 1.0,
       "windows": [],
       "seven_day_left": null,
+      "seven_day_used": null,
       "expires_at": null,
       "refresh_expires_at": null,
       "identity": {
@@ -362,6 +367,7 @@
       "effective_weight": 1.0,
       "windows": [],
       "seven_day_left": null,
+      "seven_day_used": null,
       "expires_at": "2026-11-07T20:00:00Z",
       "refresh_expires_at": "2026-12-03T00:00:00Z",
       "identity": {
@@ -428,6 +434,7 @@
         }
       ],
       "seven_day_left": 0.6,
+      "seven_day_used": 0.4,
       "expires_at": "2026-11-07T17:00:00Z",
       "refresh_expires_at": "2026-11-28T00:00:00Z",
       "identity": {
@@ -480,6 +487,7 @@
   "expiry_warn_secs": 259200,
   "pool": {
     "seven_day_left_total": 2.21,
+    "seven_day_used_total": 4.79,
     "accounts": 7,
     "available": 2
   },

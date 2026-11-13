@@ -44,9 +44,10 @@ pub(super) fn list() -> Value {
     json!({ "tools": [
         {
             "name": "pool_usage",
-            "description": "Subscription usage: each account's 7-day headroom left (0-1) and \
-                windows, the pool total (in subscriptions), this week's burn and the forecast \
-                for the week.",
+            "description": "Subscription usage: each account's 7-day usage as the share used (0-1, \
+                seven_day_used; seven_day_left is its complement) and windows, the pool total \
+                used (seven_day_used_total, in subscriptions), this week's burn and the \
+                forecast for the week.",
             "inputSchema": {"type": "object", "properties": {}},
         },
         {
@@ -246,6 +247,7 @@ async fn pool_usage(app: &Arc<AppState>) -> Result<Value, String> {
                 "id": a["id"],
                 "provider": a["provider"],
                 "status": a["status"],
+                "seven_day_used": a["seven_day_used"],
                 "seven_day_left": a["seven_day_left"],
                 "windows": a["windows"],
             })

@@ -88,8 +88,11 @@ with `POOLTIME_HOME=<dir>` when your data dir is not the default `~/.pooltime`),
 status line command (with Claude Code's stdin), then appends the pool segment:
 
 ```text
-pool 6/8 · 7d 41% left · ⚠ 2 need login
+pool 6/8 · 7d 59% used · ⚠ 2 need login
 ```
+
+`6/8` is accounts ready of all; `7d 59% used` is the pool's 7-day usage (the same figure as the
+first line of `pooltime status`: the accounts' 7-day usage added up, over the number of accounts).
 
 It reads a cache file the daemon keeps current (`~/.pooltime/run/status-cache.json`; counts only)
 and never makes a network call. A cache older than 150 s prints `pool down`. `disconnect` puts the

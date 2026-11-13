@@ -74,7 +74,7 @@ The daemon raises a desktop notification, once per event (remembered across rest
 Turn them off with `alerts.notify = false` in `config.toml` or `POOLTIME_ALERTS_NOTIFY=0`; the
 events are still logged and shown on the dashboard. `pooltime doctor` reports which notifier would be
 used. The [status line](profiles.md#status-line) shows the same counts:
-`pool 6/8 · 7d 41% left · ⚠ 2 need login`.
+`pool 6/8 · 7d 59% used · ⚠ 2 need login`.
 
 ## Expiry rules
 

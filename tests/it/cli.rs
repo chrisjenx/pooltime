@@ -381,7 +381,7 @@ async fn seed_account(pt: &Path, name: &str, util: f64) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn status_prints_7d_left() {
+async fn status_prints_7d_used() {
     let h = Home::new();
     seed_account(&h.pt(), "alpha", 0.4).await;
     seed_account(&h.pt(), "beta", 0.9).await;
@@ -390,23 +390,27 @@ async fn status_prints_7d_left() {
         h.cli(&["accounts", "add", "gamma"]).success(); // never logged in
 
         let out = stdout_of(&h.cli(&["status"]).success());
-        // Pool line: 2 of 3 ready; 7-day headroom 0.6 + 0.1 = 0.7 of 3 accounts = 23%.
+        // Pool line: 2 of 3 ready; 7-day usage 0.4 + 0.9 + 1.0 (gamma, never logged in: no
+        // headroom) = 2.3 of 3 accounts = 77%.
         assert!(out.contains("2/3 ready"), "{out}");
-        assert!(out.contains("7d 23% left"), "{out}");
+        assert!(out.contains("7d 77% used"), "{out}");
+        assert!(out.contains("7D USED"), "{out}");
+        assert!(!out.contains("left"), "{out}");
         let line = |name: &str| {
             out.lines()
                 .find(|l| l.trim_start().starts_with(name))
                 .unwrap_or_else(|| panic!("no row for {name} in\n{out}"))
                 .to_string()
         };
-        assert!(line("alpha").contains("60%"), "{out}");
-        assert!(line("beta").contains("10%"), "{out}");
+        assert!(line("alpha").contains("40%"), "{out}");
+        assert!(line("beta").contains("90%"), "{out}");
         assert!(line("gamma").contains("needs_login"), "{out}");
         assert!(out.contains("gamma needs login"), "{out}");
         assert!(!out.contains("SECRET"), "{out}");
 
         let v = status_json(&h);
         assert_eq!(v["pool"]["seven_day_left_total"].as_f64(), Some(0.7));
+        assert_eq!(v["pool"]["seven_day_used_total"].as_f64(), Some(2.3));
     });
 }
 

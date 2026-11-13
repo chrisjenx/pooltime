@@ -179,7 +179,7 @@ mod tests {
     }
 
     fn seg() -> String {
-        "pool 6/8 · 7d 41% left · ⚠ 2 need login".into()
+        "pool 6/8 · 7d 59% used · ⚠ 2 need login".into()
     }
 
     /// Budget for tests about composition, not timing: an instant segment is always in, however
@@ -198,7 +198,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "{\"model\":\"x\"} · pool 6/8 · 7d 41% left · ⚠ 2 need login\n"
+            "{\"model\":\"x\"} · pool 6/8 · 7d 59% used · ⚠ 2 need login\n"
         );
         // No trailing newline in, none out; stderr never reaches the output.
         let out = wrap_with(
@@ -210,7 +210,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "orig · pool 6/8 · 7d 41% left · ⚠ 2 need login"
+            "orig · pool 6/8 · 7d 59% used · ⚠ 2 need login"
         );
         // A failing original still has its stdout shown.
         let out = wrap_with(
@@ -222,7 +222,7 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "partial · pool 6/8 · 7d 41% left · ⚠ 2 need login\n"
+            "partial · pool 6/8 · 7d 59% used · ⚠ 2 need login\n"
         );
         // No prior (or nothing printed): the segment alone.
         for prior in [Value::Null, cmd("true"), json!({"type": "static"})] {

@@ -54,9 +54,9 @@ binding it; `--yes` binds without asking.
 ## Look at them
 
 ```sh
-pooltime accounts list            # state, 7-day headroom, priority, weight, email
+pooltime accounts list            # state, 7-day usage, priority, weight, email
 pooltime accounts list --json
-pooltime status                   # one screen: accounts, 7-day headroom, alerts
+pooltime status                   # one screen: accounts, 7-day usage, alerts
 ```
 
 Each account is in exactly one state, with the same words in the CLI, dashboard, status line and

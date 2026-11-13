@@ -54,7 +54,7 @@ sign in in the browser. Never print tokens, key files or the dashboard URL.
 ## Everyday commands
 
 ```sh
-pooltime status                       # accounts, 7-day headroom, alerts
+pooltime status                       # accounts, 7-day usage, alerts
 pooltime accounts list                # every account and its state
 pooltime accounts relogin --dead      # re-sign-in every account that needs it, one after another
 pooltime connect default --statusline --mcp   # status line segment + MCP tools in a profile

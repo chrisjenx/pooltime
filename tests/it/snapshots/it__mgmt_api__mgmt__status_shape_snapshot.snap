@@ -44,6 +44,7 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
         }
       ],
       "seven_day_left": 0.63,
+      "seven_day_used": 0.37,
       "expires_at": "2026-11-07T18:00:00Z",
       "refresh_expires_at": "2026-12-01T00:00:00Z",
       "identity": {
@@ -114,6 +115,7 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
         }
       ],
       "seven_day_left": 0.1,
+      "seven_day_used": 0.9,
       "expires_at": "2026-11-07T18:00:00Z",
       "refresh_expires_at": "2026-12-01T00:00:00Z",
       "identity": {
@@ -168,6 +170,7 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
       "effective_weight": 1.0,
       "windows": [],
       "seven_day_left": null,
+      "seven_day_used": null,
       "expires_at": "2026-11-07T18:00:00Z",
       "refresh_expires_at": "2026-12-01T00:00:00Z",
       "identity": {
@@ -223,6 +226,7 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
       "effective_weight": 1.0,
       "windows": [],
       "seven_day_left": null,
+      "seven_day_used": null,
       "expires_at": null,
       "refresh_expires_at": null,
       "identity": {
@@ -262,6 +266,7 @@ expression: "serde_json::to_string_pretty(&v).unwrap()"
   ],
   "pool": {
     "seven_day_left_total": 0.73,
+    "seven_day_used_total": 3.27,
     "accounts": 4,
     "available": 1
   },
