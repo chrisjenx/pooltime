@@ -33,7 +33,9 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-/// The launch agent definition for `bin serve`. A Homebrew Cellar path is replaced by the stable
+/// The launch agent definition for `bin serve --supervise` (the supervisor is the job's main
+/// process; its workers live in its process group, so launchd's tracking, `KeepAlive` and
+/// `bootout` cover them). A Homebrew Cellar path is replaced by the stable
 /// `<prefix>/bin/pooltime` symlink so `brew upgrade` does not strand the agent.
 pub fn render_launchd_plist(bin: &Path, paths: &Paths) -> String {
     let s = |p: &Path| xml_escape(&p.to_string_lossy());
@@ -49,6 +51,7 @@ pub fn render_launchd_plist(bin: &Path, paths: &Paths) -> String {
   <array>
     <string>{bin}</string>
     <string>serve</string>
+    <string>--supervise</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -203,9 +206,16 @@ pub fn status(env: &Env, r: &dyn Runner) -> anyhow::Result<Status> {
     })
 }
 
-/// Kill and restart the loaded agent in place.
+/// Kill and restart the loaded agent in place (the supervisor too: in-flight requests drain
+/// first, and new ones get 503 meanwhile).
 pub fn restart(env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
     run_checked(r, "launchctl", &["kickstart", "-k", &target(env)])
         .context("is the service installed? try `pooltime service install`")?;
+    Ok(())
+}
+
+/// Ask the running supervisor for a new worker generation (`SIGHUP` to the job's main process).
+pub fn reload(env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
+    run_checked(r, "launchctl", &["kill", "SIGHUP", &target(env)])?;
     Ok(())
 }

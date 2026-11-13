@@ -17,6 +17,7 @@ pub mod service;
 pub mod signin;
 pub mod sse;
 pub mod store;
+pub mod supervisor;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod upstream;

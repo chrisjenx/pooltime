@@ -1,5 +1,7 @@
 //! Run the daemon as a background user service: a launchd agent on macOS ([`launchd`]), a systemd
-//! user unit on Linux ([`systemd`]). Both wrap `pooltime serve`.
+//! user unit on Linux ([`systemd`]). Both run `pooltime serve --supervise`: a small supervisor
+//! that owns the port and runs the daemon as worker generations, so `service restart` hands over
+//! to a new worker without closing the port ([`restart`], [`crate::supervisor`]).
 //!
 //! The render functions are pure so their output is testable on every platform. Everything that
 //! shells out goes through a [`Runner`], so tests substitute a recorder (or a `PATH` shim) for the
@@ -17,6 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context};
 
 use crate::config::Paths;
+use crate::supervisor::proto::{self, SupervisorState};
 
 pub use launchd::render_launchd_plist;
 pub use systemd::render_systemd_unit;
@@ -79,21 +82,28 @@ pub(crate) fn run_checked(
 /// Tries at `launchctl bootstrap` (it can race the teardown of the job it replaces).
 pub(crate) const BOOTSTRAP_ATTEMPTS: u32 = 3;
 
-/// How long to wait for a job to unload, and how often to look; and the pause between retries of
-/// a failed load. Injectable so tests need not sleep.
+/// How long to wait for a job to unload, and how often to look; the pause between retries of a
+/// failed load; how long to wait for the supervisor to confirm a restart. Injectable so tests
+/// need not sleep.
 #[derive(Debug, Clone, Copy)]
 pub struct Timing {
     pub poll_step: Duration,
+    /// Covers the daemon's drain (in-flight requests get up to 10 minutes).
     pub unload_timeout: Duration,
     pub retry_delay: Duration,
+    pub handoff_timeout: Duration,
 }
 
 impl Default for Timing {
     fn default() -> Timing {
         Timing {
             poll_step: Duration::from_millis(200),
-            unload_timeout: Duration::from_secs(15),
+            unload_timeout: crate::server::shutdown::DRAIN_TIMEOUT + Duration::from_secs(60),
             retry_delay: Duration::from_secs(1),
+            // A worker's boot budget, plus the old generation's release.
+            handoff_timeout: crate::supervisor::BOOT_TIMEOUT
+                + crate::supervisor::RELEASE_TIMEOUT
+                + Duration::from_secs(10),
         }
     }
 }
@@ -105,17 +115,23 @@ impl Timing {
             poll_step: Duration::ZERO,
             unload_timeout: Duration::ZERO,
             retry_delay: Duration::ZERO,
+            handoff_timeout: Duration::ZERO,
         }
     }
 
     /// Poll `present` until it is false; `false` if it is still true after `unload_timeout`.
     pub(crate) fn wait_until_gone(&self, mut present: impl FnMut() -> bool) -> bool {
+        self.wait_until(self.unload_timeout, || !present())
+    }
+
+    /// Poll `done` until it is true; `false` if it is still false after `timeout`.
+    pub(crate) fn wait_until(&self, timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
         let start = Instant::now();
         loop {
-            if !present() {
+            if done() {
                 return true;
             }
-            if start.elapsed() >= self.unload_timeout {
+            if start.elapsed() >= timeout {
                 return false;
             }
             std::thread::sleep(self.poll_step);
@@ -270,10 +286,94 @@ impl Backend {
         }
     }
 
+    /// Stop and start the whole service (supervisor included).
     pub fn restart(self, env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
         match self {
             Backend::Launchd => launchd::restart(env, r),
             Backend::Systemd => systemd::restart(env, r),
         }
+    }
+
+    /// Send the supervisor its restart signal (`SIGHUP`).
+    pub fn reload(self, env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
+        match self {
+            Backend::Launchd => launchd::reload(env, r),
+            Backend::Systemd => systemd::reload(env, r),
+        }
+    }
+
+    /// Whether the installed definition runs the supervisor; `None` when nothing is installed.
+    pub fn supervised(self, env: &Env) -> Option<bool> {
+        std::fs::read_to_string(self.definition_path(env))
+            .ok()
+            .map(|d| definition_is_supervised(&d))
+    }
+}
+
+/// A definition written before seamless restarts runs plain `serve`.
+pub fn definition_is_supervised(definition: &str) -> bool {
+    definition.contains("--supervise")
+}
+
+/// What `service restart` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Restarted {
+    /// A new worker generation serves; the previous one finishes its requests.
+    HandedOver(SupervisorState),
+    /// No supervisor was running: the service was started the ordinary way.
+    Started,
+    /// The definition predated seamless restarts: it was rewritten and reloaded (that restart
+    /// drained the old way).
+    Reinstalled,
+}
+
+/// `service restart`: with a supervised definition and a live supervisor, ask it for a new
+/// worker generation and wait for its verdict; with no supervisor running, restart the service;
+/// with a definition from before seamless restarts, reinstall it once.
+pub fn restart(backend: Backend, env: &Env, r: &dyn Runner) -> anyhow::Result<Restarted> {
+    match backend.supervised(env) {
+        None => {
+            return Err(anyhow!(
+                "the pooltime service is not installed: run `pooltime service install`"
+            ))
+        }
+        Some(false) => {
+            eprintln!(
+                "the installed service predates seamless restarts: reinstalling it once (this \
+                 restart still waits for in-flight requests, up to 10 minutes); later restarts \
+                 hand over without a pause"
+            );
+            backend.install(env, r)?;
+            return Ok(Restarted::Reinstalled);
+        }
+        Some(true) => {}
+    }
+    let Some(before) = proto::live_state(&env.paths) else {
+        backend.restart(env, r)?;
+        return Ok(Restarted::Started);
+    };
+    backend
+        .reload(env, r)
+        .context("signalling the pooltime supervisor")?;
+    let mut after = None;
+    env.timing.wait_until(env.timing.handoff_timeout, || {
+        after = proto::read_state(&env.paths).filter(|s| s.restarts > before.restarts);
+        after.is_some()
+    });
+    let Some(after) = after else {
+        return Err(anyhow!(
+            "the pooltime supervisor did not confirm the restart within {}s; see `pooltime logs`",
+            env.timing.handoff_timeout.as_secs()
+        ));
+    };
+    match &after.last_restart {
+        Some(res) if res.ok => Ok(Restarted::HandedOver(after)),
+        Some(res) => Err(anyhow!(
+            "restart failed: {}; the running daemon keeps serving",
+            res.error.as_deref().unwrap_or("unknown error")
+        )),
+        None => Err(anyhow!(
+            "the pooltime supervisor reported no restart result"
+        )),
     }
 }

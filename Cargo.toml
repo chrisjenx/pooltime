@@ -37,7 +37,7 @@ subtle = "2"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["macros", "serde-well-known"] }
-tokio = { version = "1.54.1", features = ["sync", "rt", "rt-multi-thread", "macros", "time", "net", "signal"] }
+tokio = { version = "1.54.1", features = ["sync", "rt", "rt-multi-thread", "macros", "time", "net", "signal", "process", "io-util"] }
 toml = "1.2.1"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"

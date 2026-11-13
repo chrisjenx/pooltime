@@ -16,7 +16,7 @@ use crate::config::Config;
 /// Where bro's pool listens by default.
 pub const BRO_PORT: u16 = 3456;
 
-/// `{"service":"pooltime","status":"ok","version","accounts","available","pending"}`, or
+/// `{"service":"pooltime","status":"ok","version","accounts","available","pending","pid"}`, or
 /// 503 `{"service":"pooltime","status":"draining"}` once shutdown has begun.
 pub async fn health(State(app): State<Arc<AppState>>) -> Response {
     if app.runtime.draining() {
@@ -52,6 +52,8 @@ pub async fn health(State(app): State<Arc<AppState>>) -> Response {
             "accounts": accounts,
             "available": available,
             "pending": pending,
+            // Which process answered: two supervised generations overlap during a restart.
+            "pid": std::process::id(),
         }),
     )
 }

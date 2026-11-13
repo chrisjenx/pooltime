@@ -8,7 +8,9 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/pooltime serve
+ExecStart=/usr/local/bin/pooltime serve --supervise
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
 Environment=POOLTIME_HOME=/Users/test/.pooltime
 Restart=on-failure
 RestartSec=10

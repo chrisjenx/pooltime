@@ -42,7 +42,10 @@ fn word(s: &str, exec: bool) -> String {
     }
 }
 
-/// The user unit for `bin serve`. A Homebrew Cellar path is replaced by the stable
+/// The user unit for `bin serve --supervise`. `KillMode=mixed`: a stop sends `SIGTERM` to the
+/// supervisor only (it forwards it to its workers once, so they drain instead of reading a
+/// second signal as "force"); anything left at `TimeoutStopSec` is killed. `ExecReload` is the
+/// supervisor's restart signal. A Homebrew Cellar path is replaced by the stable
 /// `<prefix>/bin/pooltime` symlink.
 pub fn render_systemd_unit(bin: &Path, paths: &Paths) -> String {
     let bin = word(&stable_bin(bin).to_string_lossy(), true);
@@ -57,7 +60,9 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart={bin} serve
+ExecStart={bin} serve --supervise
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
 Environment={home}
 Restart=on-failure
 RestartSec=10
@@ -161,6 +166,12 @@ pub fn status(env: &Env, r: &dyn Runner) -> anyhow::Result<Status> {
     })
 }
 
+/// Ask the running supervisor for a new worker generation (`ExecReload`: `SIGHUP`).
+pub fn reload(_env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
+    systemctl(r, &["reload", UNIT])
+}
+
+/// Stop and start the unit (the supervisor too: in-flight requests drain first).
 pub fn restart(_env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
     systemctl(r, &["restart", UNIT])
         .context("is the service installed? try `pooltime service install`")
