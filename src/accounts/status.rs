@@ -543,11 +543,21 @@ impl StateBook {
     /// (what an older daemon generation learned before it handed off: rate limits, dead-token
     /// markers, billing blocks, usage). Memory-only verdicts (error streaks) are kept. An
     /// unreadable row fails closed (`unverified`), as at load. Emits no transitions; a changed
-    /// status shows on its next read.
+    /// status shows on its next read. Blocking: under the book's lock (writes are queued under
+    /// it too) it waits for this book's queued writes to land, then reads and applies the rows,
+    /// so no change of ours is lost or slips in between.
     pub fn reload(&self, now: OffsetDateTime) -> anyhow::Result<()> {
-        let (states, _) = read_rows(&self.store)?;
         {
             let mut map = self.lock();
+            let (done, landed) = std::sync::mpsc::channel();
+            self.store.submit(move |_| {
+                let _ = done.send(());
+                Ok(())
+            })?;
+            landed
+                .recv()
+                .map_err(|_| anyhow::anyhow!("the database writer stopped"))?;
+            let (states, _) = read_rows(&self.store)?;
             for (id, state) in states {
                 match map.get_mut(&id) {
                     Some(e) => e.state = state,

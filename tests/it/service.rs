@@ -111,6 +111,8 @@ struct Rec {
     /// Runs when the supervisor is signalled (`launchctl kill`, `systemctl reload`): stands in
     /// for the supervisor recording its restart.
     on_reload: Option<Box<dyn Fn() + Send + Sync>>,
+    /// The next N `launchctl print` calls die of a signal (a Ctrl-C reaching them).
+    print_signals: Mutex<u32>,
 }
 
 impl Rec {
@@ -151,6 +153,18 @@ impl Runner for Rec {
             return reply(1, "", "boom");
         }
         let verb = args.iter().find(|a| !a.starts_with("--")).unwrap_or(&"");
+        if (program, *verb) == ("launchctl", "print") {
+            let mut left = self.print_signals.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Ok(CmdOutput {
+                    success: false,
+                    code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+        }
         let mut loaded = self.loaded.lock().unwrap();
         let mut active = self.active.lock().unwrap();
         match (program, *verb) {
@@ -301,9 +315,61 @@ fn launchd_install_stops_on_a_real_bootout_failure() {
         fail: vec!["launchctl bootout"],
         ..Rec::launchd_loaded()
     };
-    let err = launchd::install(&env, &rec).unwrap_err();
-    assert!(format!("{err:#}").contains("boom"), "{err:#}");
-    assert!(!rec.calls().iter().any(|c| c.contains("bootstrap")));
+    // The old job is still loaded: loading the new definition is still tried (launchd refuses
+    // while the old one is there), and the error says what to do.
+    let err = format!("{:#}", launchd::install(&env, &rec).unwrap_err());
+    assert!(err.contains("boom"), "{err}");
+    assert!(err.contains("pooltime service install` again"), "{err}");
+    assert!(rec.calls().iter().any(|c| c.contains("bootstrap")));
+
+    // uninstall keeps reporting it as an error (and keeps the plist).
+    let rec = Rec {
+        fail: vec!["launchctl bootout"],
+        ..Rec::launchd_loaded()
+    };
+    assert!(launchd::uninstall(&env, &rec).is_err());
+    assert!(launchd::plist_path(&env).exists());
+}
+
+#[test]
+fn a_print_killed_by_a_signal_is_not_read_as_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut env = env_in(dir.path());
+    // The old job drains: still loaded after bootout. A `print` killed by Ctrl-C answers
+    // nothing, which must not end the wait as if the job were gone.
+    let rec = Rec {
+        stuck: true,
+        print_signals: Mutex::new(5),
+        ..Rec::launchd_loaded()
+    };
+    let err = format!("{:#}", launchd::install(&env, &rec).unwrap_err());
+    assert!(err.contains("still loaded"), "{err}");
+    assert!(err.contains("pooltime service install` again"), "{err}");
+
+    // With time to wait: an unanswered print keeps the wait going until a real answer.
+    env.timing.unload_timeout = std::time::Duration::from_secs(5);
+    let rec = Rec {
+        print_signals: Mutex::new(2),
+        ..Rec::launchd_loaded()
+    };
+    launchd::install(&env, &rec).unwrap();
+    let calls = rec.calls();
+    let after_bootout: Vec<_> = calls
+        .iter()
+        .skip_while(|c| !c.starts_with("launchctl bootout"))
+        .collect();
+    assert_eq!(
+        after_bootout
+            .iter()
+            .filter(|c| c.starts_with("launchctl print"))
+            .count(),
+        2,
+        "kept polling past the unanswered print: {calls:?}"
+    );
+    assert!(after_bootout
+        .last()
+        .unwrap()
+        .starts_with("launchctl bootstrap"));
 }
 
 #[test]

@@ -203,7 +203,12 @@ impl Drop for Supervised {
 }
 
 fn kill(sig: &str, pid: impl std::fmt::Display) {
-    let _ = procs::spawn(Command::new("kill").args([sig, &pid.to_string()])).wait();
+    let _ = procs::spawn(
+        Command::new("kill")
+            .args([sig, &pid.to_string()])
+            .stderr(Stdio::null()),
+    )
+    .wait();
 }
 
 fn alive(pid: u64) -> bool {
@@ -475,6 +480,46 @@ async fn sigterm_to_the_whole_group_drains_instead_of_forcing() {
         assert_intact(slow.join().unwrap(), "from-generation-one");
         assert_eq!(sup.wait_exit().code(), Some(0), "{}", h.stderr());
         wait_gone(gen1);
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_orphaned_worker_drains_and_its_second_sigterm_forces() {
+    // The supervisor is killed outright: its worker hands off (stops accepting) and drains on
+    // its own. SIGTERMs count from then on, including during the 2 s handoff grace: the first
+    // changes nothing, the second forces exit.
+    let fake = upstream(Duration::from_secs(30)).await;
+    let h = Home::new(&fake.url());
+    tokio::task::block_in_place(|| {
+        let mut sup = h.supervise();
+        let gen1 = h.health_pid();
+        let slow = slow_stream(&h, &fake);
+        kill("-KILL", sup.pid());
+        sup.wait_exit();
+        std::thread::sleep(Duration::from_millis(500));
+        kill("-TERM", gen1);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            alive(gen1),
+            "one SIGTERM does not force: the stream is still running"
+        );
+        kill("-TERM", gen1);
+        let start = Instant::now();
+        while alive(gen1) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the second SIGTERM did not force exit\n{}",
+                h.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Forced: the 30 s stream was cut, not finished.
+        let cut = slow.join().unwrap();
+        assert!(
+            cut.as_ref()
+                .is_none_or(|(_, b)| !b.contains("message_stop")),
+            "{cut:?}"
+        );
     });
 }
 

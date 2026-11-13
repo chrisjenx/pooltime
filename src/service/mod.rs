@@ -12,6 +12,7 @@ pub mod launchd;
 pub mod systemd;
 
 use std::io;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -43,9 +44,13 @@ pub struct SystemRunner;
 
 impl Runner for SystemRunner {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<CmdOutput> {
+        // Its own process group: a Ctrl-C at the terminal (which `Interrupts` counts while a
+        // service definition is swapped) must not kill a `launchctl print` mid-wait or a
+        // `bootout` half-way.
         let out = Command::new(program)
             .args(args)
             .stdin(Stdio::null())
+            .process_group(0)
             .output()?;
         Ok(CmdOutput {
             success: out.status.success(),

@@ -379,16 +379,22 @@ async fn serve_supervised(
             .ending()
             .unwrap_or(StopKind::Stop)
     };
+    // Spawned now, not when the drain first polls it (after the handoff grace): SIGTERMs are
+    // counted from the moment the supervisor is found gone.
     let mut rx = ctl.orders();
     let mut sigs = signals.counter();
-    let force = async move {
+    let (forced_tx, mut forced) = tokio::sync::watch::channel(false);
+    let watch_force = tokio::spawn(async move {
         let o = until(&mut rx, |o| o.force || o.orphaned).await;
-        if o.force {
-            return;
+        if !o.force {
+            // Orphaned and draining on its own: the second SIGTERM from here on forces exit.
+            let from = *sigs.borrow_and_update();
+            let _ = sigs.wait_for(|n| *n >= from + 2).await;
         }
-        // Orphaned and draining on its own: the second SIGTERM from here on forces exit.
-        let from = *sigs.borrow_and_update();
-        let _ = sigs.wait_for(|n| *n >= from + 2).await;
+        let _ = forced_tx.send(true);
+    });
+    let force = async move {
+        let _ = forced.wait_for(|f| *f).await;
     };
     let opts = ServeOpts::default().with_force(force);
     let router = super::router(app.clone());
@@ -397,6 +403,7 @@ async fn serve_supervised(
         version: env!("CARGO_PKG_VERSION").into(),
     });
     let served = serving.await;
+    watch_force.abort();
     if matches!(served, Ok((_, StopKind::Handoff))) {
         // Released long ago (it races only the grace period); let it finish its message.
         let _ = tokio::time::timeout(RELEASE_BOUND, life).await;

@@ -87,6 +87,16 @@ process, which launchd kills (process group) and systemd kills (cgroup). Rejecte
 no providers, no HTTP) so it rarely needs to change. Picking up a new supervisor needs a full
 restart: `pooltime service install`. The worker protocol must stay backward compatible.
 
+**Known limits.** The wait for background blocking work counts every tracked blocking job in
+the process, so a profile sync started by a request (`connect`) also delays `released`; the
+whole release is bounded at 5 s either way. If that bound runs out while the old generation is
+still flushing its queue, a few `account_state` rows it queued may land after the new generation
+reloaded; the new one overwrites them on its next change of those accounts. If the supervisor is
+killed, an orphaned worker counts `SIGTERM`s from the moment it notices: the first changes
+nothing (it already drains), the second forces exit. Service-manager commands (`launchctl`,
+`systemctl`) run in their own process group, so a Ctrl-C during the one-time reinstall reaches
+only the CLI, which counts it; a `launchctl print` that cannot answer is read as "still loaded".
+
 **Residual risks.** An idle keep-alive connection the old worker closes after the grace can race
 a request the client is sending on it at that instant (the SDK retries a connection error; no
 503). A new version's database migration must stay compatible with the previous binary for the

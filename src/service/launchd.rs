@@ -91,8 +91,15 @@ fn target(env: &Env) -> String {
 }
 
 fn is_loaded(env: &Env, r: &dyn Runner) -> bool {
-    r.run("launchctl", &["print", &target(env)])
-        .is_ok_and(|o| o.success)
+    loaded(env, r) == Some(true)
+}
+
+/// `launchctl print`: `Some(true)` loaded, `Some(false)` not; `None` when it could not tell
+/// (it did not run, or a signal ended it), which a wait for the job to go must not read as gone.
+fn loaded(env: &Env, r: &dyn Runner) -> Option<bool> {
+    let out = r.run("launchctl", &["print", &target(env)]).ok()?;
+    out.code?;
+    Some(out.success)
 }
 
 /// `launchctl bootout` says the job was not loaded: exit 3 or 113, or its usual messages.
@@ -137,7 +144,7 @@ fn unload_waiting(env: &Env, r: &dyn Runner, interrupts: &Interrupts) -> anyhow:
     if out.success {
         let mut warned = 0;
         let gone = env.timing.wait_until_gone_with(
-            || is_loaded(env, r),
+            || loaded(env, r) != Some(false),
             |waited| {
                 let n = interrupts.count();
                 if n > warned {
@@ -174,15 +181,17 @@ fn unload_waiting(env: &Env, r: &dyn Runner, interrupts: &Interrupts) -> anyhow:
     if not_loaded(&out) {
         return Ok(Unloaded::NotLoaded);
     }
-    if is_loaded(env, r) {
+    if loaded(env, r) != Some(false) {
+        // Not an error yet: `install` still tries to load the new definition (and says what to
+        // do if launchd refuses); `uninstall` reports it and keeps the plist.
         let why = out.stderr.trim();
-        return Err(anyhow!(
+        return Ok(Unloaded::StillLoaded(format!(
             "`launchctl bootout {}` failed ({}) and the service is still loaded{}{}",
             target(env),
             out.code.map_or("signal".into(), |c| format!("exit {c}")),
             if why.is_empty() { "" } else { ": " },
             why
-        ));
+        )));
     }
     Ok(Unloaded::NotLoaded)
 }
