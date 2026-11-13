@@ -18,7 +18,7 @@ Anthropic-compatible endpoint that Claude Code talks to. It lives in a new repo,
 
 Why now — what actually hurts today (all verified on the live machine on 2026-11-07):
 
-- **Accounts die silently.** Two of eight accounts (`haynet-chris`, `haynet-christopherjenkins`) had been dead for
+- **Accounts die silently.** Two of eight accounts (`acct-a`, `acct-d`) had been dead for
   6 and 16 days; the pool log contains zero lines about it. The dashboard files them under a vague "Sidelined".
 - **Re-login every few weeks.** Root cause found: Anthropic issues each Claude OAuth refresh token with a hard
   ~27–30-day lifetime from sign-in (`refreshTokenExpiresAt` in the credentials file; Claude Code itself treats it as

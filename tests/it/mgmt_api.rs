@@ -1939,6 +1939,21 @@ mod mgmt {
         let meta = pool.reg.get(&id("fresh")).expect("created by login");
         assert_eq!(meta.provider, ProviderId::Anthropic);
 
+        // Claude's emailed verification code is not the code#state line: a specific hint.
+        let r = call(
+            &srv,
+            "POST",
+            &format!("/api/v1/signin/{signin_id}/code"),
+            Some(json!({"code": "123456"})),
+        )
+        .await;
+        assert_eq!(r.status, 400, "{}", r.text());
+        let msg = r.json()["error"]["message"].as_str().unwrap().to_string();
+        assert!(
+            msg.starts_with("That looks like Claude's email verification code."),
+            "{msg}"
+        );
+
         let r = call(
             &srv,
             "POST",

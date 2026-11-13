@@ -1,6 +1,6 @@
 # pooltime — parity inventory of bro-cli (appendix to the design)
 
-Source: bro-cli @ `bd0019f` (`/Users/christopherjenkins/git/personal/bro-cli`). Compiled 2026-11-07 from a full read of
+Source: bro-cli @ `bd0019f` (`~/git/personal/bro-cli`). Compiled 2026-11-07 from a full read of
 the root CLI (`src/*.js`), the Bun pool (`pool/src/**`), `pool/ARCHITECTURE.md`, and ~650 test titles
 (root `node:test` 58, pool `bun:test` ~594; biggest: `manager.test.ts` 138, `codex-translate.test.ts` 58,
 `openai-codex.test.ts` 43, `anthropic.test.ts` 36). File:line refs are to that commit.
