@@ -15,7 +15,7 @@ account and for the pool, against pooltime's **Overview** and **Accounts** views
 | Active sessions, total | metric | missing | in the 7-day picture |
 | In-flight requests, total | metric | missing | in the 7-day picture |
 | Usage-check warnings | count in the attention box, "View usage warnings" filter | missing | count in the 7-day picture, "Usage check failing" filter, row chip, attention list |
-| Pool 7-day headroom | — | "N of M subscriptions left", bar | same (bro has none) |
+| Pool 7-day usage | — | "N of M subscriptions used", bar | same (bro has none) |
 
 ## Account list (bro's overview table)
 
@@ -24,13 +24,13 @@ account and for the pool, against pooltime's **Overview** and **Accounts** views
 | Provider · plan | "Anthropic · max" under the name | provider on cards only, no plan | "anthropic · max" on table rows; provider and plan badges on cards |
 | Non-default priority / weight | `P10` / `×2` chips | Accounts card text only | chips on table rows (`P10`, `×2`, `×5 until 17:00`) |
 | Status | Ready / Cooldown / Logged out / Sidelined / Billing | seven exact state words, since when | same, plus "for 2d" on every row |
-| 5-hour used | meter | cards only | "5-hour left" meter with reset on the Overview table |
-| 7-day used | meter | "7-day left" bar | same |
+| 5-hour used | meter | cards only | "5-hour used" meter with reset on the Overview table |
+| 7-day used | meter | "7-day used" bar | same |
 | 7-day reset | relative time column | absolute + relative | own column, absolute + relative |
 | Next reset (soonest of 5h / 7d) | column | missing | both resets shown (5-hour cell and 7-day column), so a separate column adds nothing |
 | Reset already passed | rolled forward, "Reset assumed — awaiting usage check" | "resets 3h ago" | rolled forward one window, marked "assumed"; made-up resets marked "estimated" |
 | Sessions, in flight per account | columns | cards only | "Activity" column |
-| Sort | every column, asc/desc; default name | fixed: most severe first | **Sort** menu: 7-day reset (default, soonest first), 7-day left, 5-hour left, state, name, activity; **Reverse**; remembered in localStorage. Unknown reset / needs login go last, then by name. Applies to Overview, Accounts and Routing |
+| Sort | every column, asc/desc; default name | fixed: most severe first | **Sort** menu: 7-day reset (default, soonest first), 7-day used, 5-hour used, state, name, activity; **Reverse**; remembered in localStorage. Unknown reset / needs login go last, then by name. Applies to Overview, Accounts and Routing |
 | Search / filters | name search; provider; status incl. unavailable, usage warning; clear | missing | search (name or email), state (incl. unavailable, usage check failing), provider (when there are several), shown count, **Clear filters** |
 | Attention list | "N unavailable" box, filter shortcut | "Accounts by severity" (all accounts) | **Needs attention**: only accounts that need a look, most severe first, so needs-login stays on top whatever the sort |
 

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed
+
+- Usage is shown as **used**, not left, everywhere a person reads it, matching the usage page on
+  claude.ai ("40% used"). Dashboard bars fill from 0 to 100% as usage grows (blue, amber from 60%,
+  red from 85%); the Overview table reads "5-hour used" and "7-day used", the pool picture reads
+  "1.79 of 7 subscriptions used this week", and the Sort menu offers "7-day used" and "5-hour used"
+  (a sort saved as "7-day left" or "5-hour left" keeps its order). `pooltime status` and
+  `accounts list` show `7D USED` and `pool 2/3 ready · 7d 77% used`; the Claude Code status line
+  segment reads `pool 6/8 · 7d 59% used`. The JSON API only gains fields: `seven_day_used` per
+  account and `pool.seven_day_used_total` (also in the MCP `pool_usage` answer); `seven_day_left`
+  and `seven_day_left_total` are unchanged, and routing is untouched.
+
 ### Fixed
 
 - `POST /v1/messages/count_tokens` (Claude Code's token counting) no longer fails with

@@ -370,6 +370,12 @@ fn seven_day_left(windows: &[Window]) -> Option<f64> {
         .map(|w| round4(1.0 - w.utilization.clamp(0.0, 1.0)))
 }
 
+/// Share used of the account-wide 7-day window (`utilization`), `None` when unknown. The
+/// presentation twin of [`seven_day_left`]: the two always add up to 1.
+fn seven_day_used(windows: &[Window]) -> Option<f64> {
+    seven_day_left(windows).map(|left| round4(1.0 - left))
+}
+
 /// The classified reason behind a non-ready status (`None` when ready).
 fn reason_of(v: &AccountView, now: OffsetDateTime) -> Option<String> {
     match &v.status {
@@ -461,6 +467,7 @@ fn account_json(v: &AccountView, now: OffsetDateTime) -> Value {
             "reset_estimated": w.reset_synthetic,
         })).collect::<Vec<_>>(),
         "seven_day_left": seven_day_left(windows),
+        "seven_day_used": seven_day_used(windows),
         "expires_at": ts_opt(expires_at),
         "refresh_expires_at": ts_opt(refresh_expires_at),
         "identity": identity_json(&v.meta.identity),
@@ -567,7 +574,12 @@ fn banner_counts(inputs: &StatusInputs, now: OffsetDateTime) -> Value {
 ///
 /// `pool.seven_day_left_total` counts one account as one subscription (spec §5): the sum of the
 /// accounts' 7-day headroom, where an account with no known 7-day window (including every
-/// account that needs login) contributes nothing.
+/// account that needs login) contributes nothing. `pool.seven_day_used_total` is its mirror, what
+/// the dashboard, `pooltime status` and the status line present: the accounts' 7-day usage
+/// summed, so it is always `pool.accounts - seven_day_left_total`, "N of `pool.accounts`
+/// subscriptions used". An account with no known 7-day window counts as fully used (it has no
+/// headroom), exactly as it counts as empty in the headroom total, which keeps the figure in
+/// step with the weekly burn.
 pub fn build_status(inputs: &StatusInputs, now: OffsetDateTime) -> Value {
     let accounts: Vec<Value> = inputs
         .accounts
@@ -578,11 +590,16 @@ pub fn build_status(inputs: &StatusInputs, now: OffsetDateTime) -> Value {
         .iter()
         .filter_map(|a| a["seven_day_left"].as_f64())
         .sum();
+    let used: f64 = accounts
+        .iter()
+        .map(|a| a["seven_day_used"].as_f64().unwrap_or(1.0))
+        .sum();
     let available = inputs.accounts.iter().filter(|v| v.available).count();
     json!({
         "accounts": accounts,
         "pool": {
             "seven_day_left_total": round4(total),
+            "seven_day_used_total": round4(used),
             "accounts": inputs.accounts.len(),
             "available": available,
         },

@@ -144,9 +144,12 @@ async fn mcp_tools_listed() {
     }
     assert_eq!(v["pool"]["accounts"], 1);
 
-    // pool_usage: per-account 7d left, pool total, this week's burn and the forecast.
+    // pool_usage: per-account 7d used (and its complement), pool total, this week's burn and the
+    // forecast.
     let v = tool_json(&srv, "pool_usage", json!({})).await;
+    assert!(account(&v, "work").get("seven_day_used").is_some(), "{v}");
     assert!(account(&v, "work").get("seven_day_left").is_some(), "{v}");
+    assert!(v["pool"]["seven_day_used_total"].is_number(), "{v}");
     assert!(v["pool"]["seven_day_left_total"].is_number(), "{v}");
     assert!(v["this_week"].is_object(), "{v}");
     assert!(v["forecast"].is_object(), "{v}");
