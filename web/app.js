@@ -68,8 +68,16 @@
   const SORT_STORE = "pooltime-sort";
   try {
     const saved = JSON.parse(localStorage.getItem(SORT_STORE) || "null");
-    if (saved && typeof saved.key === "string") ui.sort = { key: saved.key, reversed: !!saved.reversed };
+    if (saved && typeof saved.key === "string") ui.sort = migrateSort(saved);
   } catch (_) { /* private mode or junk: keep the default */ }
+  // The sort menu used to order by headroom left ("left7", "left5": most left first). Those saved
+  // values keep their order under the used keys: least used first is "used" ascending, which is the
+  // reverse of the menu's natural direction.
+  const OLD_SORT_KEYS = { left7: "used7", left5: "used5" };
+  function migrateSort(saved) {
+    const key = OLD_SORT_KEYS[saved.key];
+    return key ? { key, reversed: !saved.reversed } : { key: saved.key, reversed: !!saved.reversed };
+  }
   function setSort(next) {
     ui.sort = next;
     try { localStorage.setItem(SORT_STORE, JSON.stringify(next)); } catch (_) { /* private mode */ }
@@ -148,9 +156,23 @@
   // A dead account never shows leftover usage as headroom (spec §4): its windows are ignored
   // even if a stale snapshot is present.
   function windowsOf(a) { return isDead(a) ? [] : (a.windows || []); }
-  function sevenDayLeft(a) {
-    return isDead(a) || typeof a.seven_day_left !== "number" ? null : a.seven_day_left;
+  // ---- usage as "used" (pure): shares are 0-1, null = unknown / not shown ----------------------
+  function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+  // Share used of the account-wide 7-day window. The API's `seven_day_left` is its complement and
+  // stays the fallback for a daemon that predates `seven_day_used`.
+  function sevenDayUsed(a) {
+    if (isDead(a)) return null;
+    if (typeof a.seven_day_used === "number") return clamp01(a.seven_day_used);
+    return typeof a.seven_day_left === "number" ? clamp01(1 - a.seven_day_left) : null;
   }
+  // Pool total in subscriptions (one account = 1.0): the sum of the accounts' 7-day usage. An
+  // account with no known usage (logged out, no window yet) has no headroom, so it counts as fully
+  // used, the mirror of the old "left" total (and in step with the weekly burn).
+  function poolUsed(accts) {
+    return accts.reduce((t, a) => { const u = sevenDayUsed(a); return t + (u === null ? 1 : u); }, 0);
+  }
+  // Bar tone for a used share: accent while there is room, warning from 60%, red from 85%.
+  function usedTone(used) { return used > 0.85 ? "bad" : used > 0.6 ? "warn" : ""; }
   function reasonText(r) {
     if (!r) return null;
     if (r.startsWith("quota:")) return windowLabel(r.slice(6)) + " quota spent";
@@ -172,8 +194,8 @@
   // key -> [label, natural direction: 1 = ascending]. The first is the default.
   const SORTS = {
     reset7: ["7-day reset (soonest)", 1],
-    left7: ["7-day left (most)", -1],
-    left5: ["5-hour left (most)", -1],
+    used7: ["7-day used (most)", -1],
+    used5: ["5-hour used (most)", -1],
     severity: ["State (most severe)", 1],
     name: ["Name", 1],
     activity: ["Activity (busiest)", -1],
@@ -196,15 +218,15 @@
     const d = windowMs(w.key);
     return d ? { at: r + (Math.floor((t - r) / d) + 1) * d, assumed: true } : null;
   }
-  function fiveHourLeft(a) {
-    const w = accountWindow(a, "5h");
-    return w && typeof w.utilization === "number" ? 1 - Math.max(0, Math.min(1, w.utilization)) : null;
+  function fiveHourUsed(a) {
+    const w = isDead(a) ? null : accountWindow(a, "5h");
+    return w && typeof w.utilization === "number" ? clamp01(w.utilization) : null;
   }
   function sortValue(a, key, t) {
     switch (key) {
       case "reset7": { const r = nextReset(accountWindow(a, "7d"), t); return r ? r.at : null; }
-      case "left7": return sevenDayLeft(a);
-      case "left5": return fiveHourLeft(a);
+      case "used7": return sevenDayUsed(a);
+      case "used5": return fiveHourUsed(a);
       case "severity": return SEVERITY[a.status] ?? 9;
       case "name": return String(a.id);
       case "activity": return (a.in_flight || 0) + (a.sessions || 0);
@@ -302,12 +324,12 @@
             " · " + ms(a.ms))))
         : h("p", { class: "empty", text: "No upstream attempt." }));
   }
-  function bar(fraction, invert) {
-    // fraction = share to fill; invert = true when the fill is "used" (high is bad)
-    if (typeof fraction !== "number") return h("div", { class: "bar none", title: "unknown" });
-    const f = Math.max(0, Math.min(1, fraction));
-    const good = invert ? 1 - f : f;
-    const cls = good < 0.15 ? "bar low" : good < 0.4 ? "bar mid" : "bar";
+  // A usage bar: filled from 0 to 100% as the used share grows (like Anthropic's usage page).
+  function bar(used) {
+    if (typeof used !== "number") return h("div", { class: "bar none", title: "unknown" });
+    const f = clamp01(used);
+    const tone = usedTone(f);
+    const cls = tone ? "bar " + tone : "bar";
     const fill = h("span");
     fill.style.width = (f * 100).toFixed(1) + "%";
     return h("div", { class: cls }, fill);
@@ -627,17 +649,17 @@
     overview(d) {
       const accts = d.accounts || [];
       const pool = d.pool || {};
-      const total = typeof pool.seven_day_left_total === "number" ? pool.seven_day_left_total : 0;
       const n = pool.accounts || accts.length;
       const counts = {};
       accts.forEach((a) => { counts[a.status] = (counts[a.status] || 0) + 1; });
+      const total = poolUsed(accts);
       const hero = h("div", { class: "panel" },
         h("h2", { text: "7-day picture" }),
         h("div", { class: "hero" },
           h("div", null,
-            h("div", { class: "big" }, Math.max(0, total).toFixed(2), " ", h("small", { text: "of " + n + " subscriptions left this week" })),
+            h("div", { class: "big" }, Math.max(0, total).toFixed(2), " ", h("small", { text: "of " + n + " subscriptions used this week" })),
             h("div", { class: "sub", text: heroSub(accts, pool, n) })),
-          bar(n ? total / n : null, false)),
+          bar(n ? total / n : null)),
         h("div", { class: "counts" },
           Object.keys(WORDS).filter((s) => counts[s]).map((s) =>
             h("span", { class: "pill " + s, text: counts[s] + " " + WORDS[s] }))));
@@ -648,7 +670,7 @@
         accts.length ? accountToolbar(accts, rows.length) : null,
         rows.length
           ? h("div", { class: "table-wrap" }, h("table", { class: "accounts" }, h("thead", null, h("tr", null,
-              ["Account", "State", "5-hour left", "7-day left", "7-day reset", "Activity"].map((t) => h("th", { text: t })))),
+              ["Account", "State", "5-hour used", "7-day used", "7-day reset", "Activity"].map((t) => h("th", { text: t })))),
             h("tbody", null, rows)))
           : h("p", { class: "empty", text: accts.length ? "No accounts match the filters." : "No accounts yet. Add one with `pooltime accounts add`." }));
 
@@ -720,8 +742,8 @@
         h("h2", { text: "Tuning" }),
         h("div", { class: "form-grid" },
           field("five_hour_exp", "5-hour exponent", "How strongly 5-hour usage lowers an account's score."),
-          field("min_headroom", "Minimum headroom", "Accounts below this 7-day headroom are skipped while others have room."),
-          field("headroom_taper_start", "Headroom taper start", "Below this headroom an account's share tapers off.")),
+          field("min_headroom", "Minimum headroom", "Accounts with less 7-day headroom than this are skipped while others have room (0.1 = skipped above 90% used)."),
+          field("headroom_taper_start", "Headroom taper start", "Below this headroom an account's share tapers off (0.2 = from 80% 5-hour used).")),
         h("div", { class: "inline card-actions" },
           manage ? h("button", { type: "button", onclick: saveTuning }, "Save tuning") : null, msgEl(tk)));
       return [table, tuning];
@@ -932,11 +954,11 @@
 
   // One row of the Overview accounts table.
   function accountRow(a) {
-    const left5 = fiveHourLeft(a), left7 = sevenDayLeft(a);
+    const used5 = fiveHourUsed(a), used7 = sevenDayUsed(a);
     const w5 = accountWindow(a, "5h"), w7 = accountWindow(a, "7d");
     const r7 = nextReset(w7, now());
-    const meter = (left, w) => h("div", { class: "meter" }, bar(left, false),
-      h("span", { class: "dim", text: left === null ? "—" : pct(left) + (w ? " · " + resetText(w, true) : "") }));
+    const meter = (used, w) => h("div", { class: "meter" }, bar(used),
+      h("span", { class: "dim", text: used === null ? "—" : pct(used) + " used" + (w ? " · " + resetText(w, true) : "") }));
     const busy = (a.in_flight || 0) + (a.sessions || 0);
     return h("tr", { class: "sev-" + a.status },
       h("td", null,
@@ -946,9 +968,9 @@
       h("td", null, pill(a.status),
         loginExpiringSoon(a) && a.status !== "expiring" ? [" ", h("span", { class: "pill badge warn", text: "expiring" })] : null,
         h("div", { class: "dim small nowrap", text: a.status_since ? "for " + dur(now() - Date.parse(a.status_since)) : "" })),
-      h("td", { class: "metercell" }, isDead(a) ? h("span", { class: "dim", text: "—" }) : meter(left5, w5)),
-      h("td", { class: "metercell" }, isDead(a) ? h("span", { class: "dim", text: "—" }) : meter(left7, null)),
-      h("td", { class: "num" }, left7 === null || !r7
+      h("td", { class: "metercell" }, isDead(a) ? h("span", { class: "dim", text: "—" }) : meter(used5, w5)),
+      h("td", { class: "metercell" }, isDead(a) ? h("span", { class: "dim", text: "—" }) : meter(used7, null)),
+      h("td", { class: "num" }, used7 === null || !r7
         ? h("span", { class: "dim", text: "—" })
         : [h("div", { text: clock(r7.at) }),
            h("div", { class: "dim small", text: rel(new Date(r7.at).toISOString()) + (r7.assumed ? " (assumed)" : w7.reset_estimated ? " (estimated)" : "") })]),
@@ -981,15 +1003,15 @@
     const tokens = c.window && (win.input_tokens || win.output_tokens || win.cache_read || win.cache_write)
       ? compact(win.input_tokens) + " in · " + compact(win.output_tokens) + " out · " + compact(win.cache_read) + " cache read · " + compact(win.cache_write) + " cache write" + since
       : null;
-    const left7 = sevenDayLeft(a);
+    const used7 = sevenDayUsed(a);
     const w7 = accountWindow(a, "7d");
-    const week = left7 === null ? "—" : pct(left7) + " left" + (w7 ? " · " + resetText(w7) : "");
+    const week = used7 === null ? "—" : pct(used7) + " used" + (w7 ? " · " + resetText(w7) : "");
     const wins = windowsOf(a);
     const windows = dead || !wins.length
       ? h("p", { class: "dim usage-none", text: dead ? "— (no usage shown while logged out)" : "—" })
       : h("div", { class: "windows" }, wins.map((w) => [
           h("span", { class: "label", text: windowLabel(w.key, w.model) }),
-          bar(w.utilization, true),
+          bar(w.utilization),
           h("span", { class: "val", text: pct(w.utilization) + " used · " + resetText(w, true) }),
         ]));
     const fresh = [

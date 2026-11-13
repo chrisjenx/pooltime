@@ -4,10 +4,10 @@
 //!
 //! ```text
 //! pooltime 1.0.1 on 127.0.0.1:3460
-//! pool 2/3 ready · 7d 23% left
+//! pool 2/3 ready · 7d 77% used
 //! this week: 1.4 subs used · on pace for ~2.6 of 3
 //!
-//! ACCOUNT  PROVIDER   STATUS       7D LEFT  PRIO  WEIGHT  EMAIL
+//! ACCOUNT  PROVIDER   STATUS       7D USED  PRIO  WEIGHT  EMAIL
 //! gamma    anthropic  needs_login  -        0     1       -
 //! alpha    anthropic  ready        60%      0     1       a@example.com
 //!
@@ -17,11 +17,12 @@
 //! Accounts are listed most severe state first (spec §4: `needs_login > billing >
 //! access_denied > erroring > rate_limited > expiring > ready`), then by id.
 //!
-//! "7d N% left" for the pool is the summed 7-day headroom (`pool.seven_day_left_total`, one
-//! account = 1.0) over the number of accounts, so a pool of fresh accounts reads 100% and an
-//! account without a known 7-day window (including one that needs login) counts as empty.
-//! Per account it is that account's own `seven_day_left`, `-` when unknown. Percentages are
-//! rounded to whole numbers.
+//! "7d N% used" for the pool is the summed 7-day usage (`pool.seven_day_used_total`, one
+//! account = 1.0) over the number of accounts, so a pool of fresh accounts reads 0% and an
+//! account without a known 7-day window (including one that needs login) counts as fully used
+//! (it has no headroom).
+//! Per account it is that account's own `seven_day_used`, `-` when unknown. Percentages are
+//! rounded to whole numbers. (The JSON keeps the `seven_day_left*` fields too.)
 //!
 //! The "this week" line comes from `GET /api/v1/analytics/burn` (needs the management key); it is
 //! left out when that call fails.
@@ -106,7 +107,7 @@ pub fn accounts_table(status: &Value) -> String {
         return "no accounts (add one with `pooltime accounts login <name>`)\n".into();
     }
     let mut rows = vec![[
-        "ACCOUNT", "PROVIDER", "STATUS", "7D LEFT", "PRIO", "WEIGHT", "EMAIL",
+        "ACCOUNT", "PROVIDER", "STATUS", "7D USED", "PRIO", "WEIGHT", "EMAIL",
     ]
     .map(String::from)
     .to_vec()];
@@ -124,7 +125,7 @@ pub fn accounts_table(status: &Value) -> String {
             str_of(a, "id").into(),
             str_of(a, "provider").into(),
             str_of(a, "status").into(),
-            pct(a["seven_day_left"].as_f64()),
+            pct(a["seven_day_used"].as_f64()),
             num(&a["priority"]),
             weight,
             a["identity"]["email"].as_str().unwrap_or("-").into(),
@@ -166,12 +167,12 @@ fn alerts(status: &Value) -> Vec<String> {
     out
 }
 
-/// The pool's "7d N% left" fraction: the summed 7-day headroom over the number of accounts (see
+/// The pool's "7d N% used" fraction: the summed 7-day usage over the number of accounts (see
 /// the module docs); `None` with no accounts. The status line shows the same figure.
-pub fn pool_seven_day_left(status: &Value) -> Option<f64> {
+pub fn pool_seven_day_used(status: &Value) -> Option<f64> {
     let pool = &status["pool"];
     let n = pool["accounts"].as_u64().unwrap_or(0);
-    pool["seven_day_left_total"]
+    pool["seven_day_used_total"]
         .as_f64()
         .filter(|_| n > 0)
         .map(|t| t / n as f64)
@@ -198,12 +199,12 @@ pub fn render(status: &Value, addr: &str) -> String {
 pub fn render_with_burn(status: &Value, burn: Option<&Value>, addr: &str) -> String {
     let pool = &status["pool"];
     let n = pool["accounts"].as_u64().unwrap_or(0);
-    let left = pool_seven_day_left(status);
+    let used = pool_seven_day_used(status);
     let mut out = format!(
-        "pooltime {} on {addr}\npool {}/{n} ready · 7d {} left\n\n",
+        "pooltime {} on {addr}\npool {}/{n} ready · 7d {} used\n\n",
         str_of(status, "version"),
         pool["available"].as_u64().unwrap_or(0),
-        pct(left)
+        pct(used)
     );
     if let Some(line) = burn.and_then(burn_line) {
         // Right under the pool line (before its blank separator).
@@ -245,19 +246,19 @@ mod tests {
     fn renders_pool_and_rows() {
         let s = json!({
             "version": "0.1.0",
-            "pool": {"accounts": 2, "available": 1, "seven_day_left_total": 0.6},
+            "pool": {"accounts": 2, "available": 1, "seven_day_used_total": 0.4},
             "accounts": [
-                {"id": "alpha", "provider": "anthropic", "status": "ready", "seven_day_left": 0.6,
+                {"id": "alpha", "provider": "anthropic", "status": "ready", "seven_day_used": 0.4,
                  "priority": 0, "weight": 1.0, "identity": {"email": "a@x"}},
                 {"id": "beta", "provider": "anthropic", "status": "needs_login",
-                 "reason": "never_logged_in", "seven_day_left": null, "priority": 2,
+                 "reason": "never_logged_in", "seven_day_used": null, "priority": 2,
                  "weight": 2.5, "identity": {"email": null}}
             ]
         });
         let out = render(&s, "127.0.0.1:3460");
-        assert!(out.contains("pool 1/2 ready · 7d 30% left"), "{out}");
+        assert!(out.contains("pool 1/2 ready · 7d 20% used"), "{out}");
         assert!(
-            out.contains("alpha    anthropic  ready        60%"),
+            out.contains("alpha    anthropic  ready        40%"),
             "{out}"
         );
         assert!(
@@ -287,7 +288,7 @@ mod tests {
         let mut lapsed = row("lapsed", "expiring");
         lapsed["until"] = json!("2026-11-07T11:00:00Z");
         let s = json!({"version": "0.1.0", "now": "2026-11-07T12:00:00Z",
-            "pool": {"accounts": 5, "available": 4, "seven_day_left_total": 0.0},
+            "pool": {"accounts": 5, "available": 4, "seven_day_used_total": 0.0},
             "accounts": [row("a-ready", "ready"), soon, row("limited", "rate_limited"), flaky,
                 lapsed]});
         let out = render(&s, "x");
@@ -312,12 +313,12 @@ mod tests {
     #[test]
     fn status_shows_weekly_burn_line() {
         let s = json!({"version": "0.1.0", "pool": {"accounts": 3, "available": 3,
-            "seven_day_left_total": 1.2}, "accounts": []});
+            "seven_day_used_total": 1.8}, "accounts": []});
         let burn = json!({"weeks": [], "idle_accounts": [], "forecast": {"week": "2026-W45",
             "subs_used_so_far": 1.44, "elapsed_fraction": 0.55, "projected": 2.618, "accounts": 3}});
         let out = render_with_burn(&s, Some(&burn), "x");
         assert!(
-            out.contains("pool 3/3 ready · 7d 40% left\nthis week: 1.4 subs used · on pace for ~2.6 of 3\n\n"),
+            out.contains("pool 3/3 ready · 7d 60% used\nthis week: 1.4 subs used · on pace for ~2.6 of 3\n\n"),
             "{out}"
         );
         let mut early = burn.clone();
@@ -332,9 +333,9 @@ mod tests {
     #[test]
     fn empty_pool() {
         let s = json!({"version": "0.1.0", "pool": {"accounts": 0, "available": 0,
-            "seven_day_left_total": 0.0}, "accounts": []});
+            "seven_day_used_total": 0.0}, "accounts": []});
         let out = render(&s, "x");
-        assert!(out.contains("7d - left"), "{out}");
+        assert!(out.contains("7d - used"), "{out}");
         assert!(out.contains("no accounts"), "{out}");
     }
 }

@@ -852,7 +852,9 @@ mod mgmt {
         assert_eq!(v["pool"]["accounts"], 4);
         assert_eq!(v["pool"]["available"], 1);
         assert_eq!(v["pool"]["seven_day_left_total"].as_f64(), Some(0.73));
+        assert_eq!(v["pool"]["seven_day_used_total"].as_f64(), Some(3.27));
         assert_eq!(v["accounts"][2]["seven_day_left"], Value::Null);
+        assert_eq!(v["accounts"][2]["seven_day_used"], Value::Null);
         assert_eq!(v["accounts"][2]["windows"], json!([]));
 
         // Plan, tier, last used, usage freshness and counters (bro's account drawer).
@@ -930,6 +932,8 @@ mod mgmt {
         assert_eq!(v["pool"]["accounts"], 2);
         assert_eq!(v["pool"]["available"], 1);
         assert_eq!(v["pool"]["seven_day_left_total"].as_f64(), Some(0.5));
+        // The dead account has no headroom: fully used, like the headroom total counts it empty.
+        assert_eq!(v["pool"]["seven_day_used_total"].as_f64(), Some(1.5));
         assert_eq!(v["tuning"]["five_hour_exp"], 1.0);
         assert_eq!(v["mapping"]["enabled"], false);
 
@@ -938,6 +942,7 @@ mod mgmt {
         assert_eq!(dead_v["status"], "needs_login");
         assert_eq!(dead_v["reason"], "never_logged_in");
         assert_eq!(dead_v["seven_day_left"], Value::Null);
+        assert_eq!(dead_v["seven_day_used"], Value::Null);
         assert_eq!(dead_v["windows"], json!([]));
         assert!(dead_v["status_since"].as_str().is_some(), "{dead_v}");
         assert!(dead_v["expires_at"].is_null());
@@ -946,6 +951,7 @@ mod mgmt {
         assert_eq!(work["status"], "ready");
         assert_eq!(work["provider"], "anthropic");
         assert_eq!(work["seven_day_left"].as_f64(), Some(0.5));
+        assert_eq!(work["seven_day_used"].as_f64(), Some(0.5));
         assert_eq!(work["windows"].as_array().unwrap().len(), 2);
         assert!(work["expires_at"].as_str().is_some());
         assert_eq!(work["priority"], 100);

@@ -238,9 +238,9 @@ table.accounts tr.sev-needs_login td:first-child, table.accounts tr.sev-billing 
   border-radius: 999px;
   overflow: hidden;
 }
-.bar > span { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 999px; background: var(--ok); }
-.bar.mid > span { background: var(--warn); }
-.bar.low > span { background: var(--bad); }
+.bar > span { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 999px; background: var(--accent); }
+.bar.warn > span { background: var(--warn); }
+.bar.bad > span { background: var(--bad); }
 .bar.none { background: repeating-linear-gradient(45deg, var(--track), var(--track) 4px, transparent 4px, transparent 8px); }
 
 /* Fill widths are set through CSSOM (el.style.width), which CSP allows; no style attributes. */
