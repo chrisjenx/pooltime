@@ -5,6 +5,10 @@
 //! connection with a 503 (`/health` says `draining`), so a second instance cannot slip in on the
 //! port and a client's retry gets a clean "overloaded" instead of a refused connection. A second
 //! signal, or the timeout, ends the drain immediately.
+//!
+//! A worker run by the supervisor (`serve --supervise`) can instead be told to hand off: a newer
+//! generation accepts on the same listening socket, so this one stops accepting and drains
+//! without holding the port (see [`serve_until`] and [`crate::supervisor`]).
 
 use std::future::{Future, IntoFuture};
 use std::io;
@@ -28,6 +32,19 @@ use crate::providers::anthropic::anthropic_error;
 /// Long by design: a slow restart beats killing a generation mid-stream.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// How long a handing-off generation keeps serving its open connections before draining them:
+/// a client that connected just before the handoff still gets its request answered.
+pub const HANDOFF_GRACE: Duration = Duration::from_secs(2);
+
+/// Why serving stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopKind {
+    /// Shutting down: drain while the port answers 503.
+    Stop,
+    /// A newer generation took over the listening socket: stop accepting and drain.
+    Handoff,
+}
+
 /// How a server run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -42,6 +59,7 @@ pub enum Outcome {
 /// Drain behaviour. `force` resolves on the second signal; the default never does.
 pub struct ServeOpts {
     pub drain_timeout: Duration,
+    pub handoff_grace: Duration,
     force: BoxFuture<'static, ()>,
 }
 
@@ -49,6 +67,7 @@ impl Default for ServeOpts {
     fn default() -> Self {
         ServeOpts {
             drain_timeout: DRAIN_TIMEOUT,
+            handoff_grace: HANDOFF_GRACE,
             force: Box::pin(std::future::pending()),
         }
     }
@@ -57,6 +76,11 @@ impl Default for ServeOpts {
 impl ServeOpts {
     pub fn with_drain_timeout(mut self, d: Duration) -> Self {
         self.drain_timeout = d;
+        self
+    }
+
+    pub fn with_handoff_grace(mut self, d: Duration) -> Self {
+        self.handoff_grace = d;
         self
     }
 
@@ -73,16 +97,37 @@ pub struct Signals {
 }
 
 pub fn install_signals() -> io::Result<Signals> {
+    install(false)
+}
+
+/// For a worker run by the supervisor: `SIGINT` (a terminal's Ctrl-C reaches the whole process
+/// group) and `SIGHUP` are ignored, and `SIGTERM` is only counted: the worker acts on it only
+/// once its supervisor is gone (see `daemon::serve_supervised`).
+pub fn install_signals_supervised() -> io::Result<Signals> {
+    install(true)
+}
+
+fn install(supervised: bool) -> io::Result<Signals> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
+    let mut hup = if supervised {
+        Some(signal(SignalKind::hangup())?)
+    } else {
+        None
+    };
     let (tx, rx) = watch::channel(0u32);
     tokio::spawn(async move {
         loop {
             let name = tokio::select! {
                 _ = term.recv() => "SIGTERM",
                 _ = int.recv() => "SIGINT",
+                _ = async { hup.as_mut().expect("guarded").recv().await }, if hup.is_some() => "SIGHUP",
             };
+            if supervised && name != "SIGTERM" {
+                tracing::debug!(signal = name, "signal ignored: the supervisor handles it");
+                continue;
+            }
             tracing::info!(signal = name, "signal received");
             tx.send_modify(|n| *n += 1);
         }
@@ -104,6 +149,11 @@ impl Signals {
 
     pub fn second(&self) -> impl Future<Output = ()> + Send + 'static {
         self.nth(2)
+    }
+
+    /// The running count of counted signals.
+    pub fn counter(&self) -> watch::Receiver<u32> {
+        self.rx.clone()
     }
 }
 
@@ -144,35 +194,68 @@ pub async fn serve_listener(
     shutdown: impl Future<Output = ()> + Send + 'static,
     opts: ServeOpts,
 ) -> anyhow::Result<Outcome> {
-    let listener = Arc::new(listener);
-    let (started_tx, started_rx) = oneshot::channel::<()>();
-    let flag = state.clone();
-    let signal = async move {
+    let stop = async move {
         shutdown.await;
-        flag.runtime.begin_drain();
-        let _ = started_tx.send(());
+        StopKind::Stop
     };
-    let main = axum::serve(Shared(listener.clone()), app)
+    Ok(serve_until(listener, state, app, stop, opts).await?.0)
+}
+
+/// Serve `app` on `listener` until `shutdown` says how to stop, then drain:
+///
+/// - [`StopKind::Stop`]: as in the module docs (the port keeps answering 503 meanwhile).
+/// - [`StopKind::Handoff`]: another process serves the same listening socket now. Stop
+///   accepting and close our copy of the listener at once (queued connections stay in the
+///   shared backlog for the other process), keep serving the open connections for
+///   [`ServeOpts::handoff_grace`], then drain them without answering for the port.
+pub async fn serve_until(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    app: Router,
+    shutdown: impl Future<Output = StopKind> + Send + 'static,
+    opts: ServeOpts,
+) -> anyhow::Result<(Outcome, StopKind)> {
+    let gate = Gate::new(listener);
+    let (started_tx, started_rx) = oneshot::channel::<StopKind>();
+    let flag = state.clone();
+    let closer = gate.clone();
+    let grace = opts.handoff_grace;
+    let signal = async move {
+        let kind = shutdown.await;
+        if kind == StopKind::Handoff {
+            closer.close();
+            tracing::info!(
+                pending = flag.runtime.pending(),
+                "handing off: no longer accepting, the new generation takes new connections"
+            );
+            tokio::time::sleep(grace).await;
+        }
+        flag.runtime.begin_drain();
+        let _ = started_tx.send(kind);
+    };
+    let main = axum::serve(gate.acceptor(), app)
         .with_graceful_shutdown(signal)
         .into_future();
     let mut main = pin!(main);
 
-    tokio::select! {
+    let kind = tokio::select! {
         r = &mut main => {
             r.context("server stopped")?;
-            return Ok(Outcome::Drained);
+            return Ok((Outcome::Drained, StopKind::Stop));
         }
-        _ = started_rx => {}
-    }
+        k = started_rx => k.unwrap_or(StopKind::Stop),
+    };
 
     tracing::info!(
         pending = state.runtime.pending(),
         timeout_secs = opts.drain_timeout.as_secs(),
         "draining: waiting for in-flight requests (signal again to force)"
     );
-    // axum's graceful shutdown dropped its accept loop; keep the port answering meanwhile.
-    let holder =
-        tokio::spawn(axum::serve(Shared(listener.clone()), draining_router()).into_future());
+    // axum's graceful shutdown dropped its accept loop; keep the port answering meanwhile. A
+    // handoff holds nothing: the new generation answers.
+    let holder = (kind == StopKind::Stop)
+        .then(|| tokio::spawn(axum::serve(gate.acceptor(), draining_router()).into_future()));
+    drop(gate);
     let outcome = tokio::select! {
         r = &mut main => {
             r.context("server failed while draining")?;
@@ -181,7 +264,9 @@ pub async fn serve_listener(
         _ = tokio::time::sleep(opts.drain_timeout) => Outcome::TimedOut,
         _ = opts.force => Outcome::Forced,
     };
-    holder.abort();
+    if let Some(h) = holder {
+        h.abort();
+    }
     match outcome {
         Outcome::Drained => tracing::info!("drained, exiting"),
         Outcome::TimedOut => tracing::warn!(
@@ -193,7 +278,7 @@ pub async fn serve_listener(
             "second signal, exiting without waiting for in-flight requests"
         ),
     }
-    Ok(outcome)
+    Ok((outcome, kind))
 }
 
 /// Answers during the drain: health says `draining`, everything else is a retryable 503.
@@ -209,28 +294,84 @@ fn draining_router() -> Router {
         })
 }
 
-/// A listener shared by the serving and the draining server. `TCP_NODELAY` keeps SSE chunks from
-/// waiting on Nagle.
-struct Shared(Arc<TcpListener>);
+/// The listening socket, shared by the serving and the draining server. [`Gate::close`] (a
+/// handoff) stops every accept loop for good and drops the socket once they let go of it.
+#[derive(Clone)]
+struct Gate {
+    listener: Arc<std::sync::Mutex<Option<Arc<TcpListener>>>>,
+    closed: Arc<watch::Sender<bool>>,
+}
 
-impl Listener for Shared {
+impl Gate {
+    fn new(listener: TcpListener) -> Gate {
+        Gate {
+            listener: Arc::new(std::sync::Mutex::new(Some(Arc::new(listener)))),
+            closed: Arc::new(watch::channel(false).0),
+        }
+    }
+
+    fn current(&self) -> Option<Arc<TcpListener>> {
+        self.listener
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn close(&self) {
+        self.listener
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        self.closed.send_replace(true);
+    }
+
+    fn acceptor(&self) -> Acceptor {
+        Acceptor {
+            gate: self.clone(),
+            closed: self.closed.subscribe(),
+            addr: self.current().and_then(|l| l.local_addr().ok()),
+        }
+    }
+}
+
+/// One accept loop's handle on the [`Gate`]. `TCP_NODELAY` keeps SSE chunks from waiting on
+/// Nagle.
+struct Acceptor {
+    gate: Gate,
+    closed: watch::Receiver<bool>,
+    addr: Option<SocketAddr>,
+}
+
+impl Listener for Acceptor {
     type Io = TcpStream;
     type Addr = SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            match self.0.accept().await {
-                Ok((stream, addr)) => {
-                    let _ = stream.set_nodelay(true);
-                    return (stream, addr);
-                }
-                // Aborted handshakes retry at once; resource exhaustion (EMFILE) must not spin.
-                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            let open = !*self.closed.borrow();
+            let Some(l) = self.gate.current().filter(|_| open) else {
+                // Closed for good (handoff): never accept again.
+                return std::future::pending().await;
+            };
+            let closed = &mut self.closed;
+            tokio::select! {
+                biased;
+                _ = async { closed.wait_for(|c| *c).await.is_ok() } => continue,
+                r = l.accept() => match r {
+                    Ok((stream, addr)) => {
+                        let _ = stream.set_nodelay(true);
+                        return (stream, addr);
+                    }
+                    // Aborted handshakes retry at once; resource exhaustion (EMFILE) must not
+                    // spin.
+                    Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                },
             }
         }
     }
 
     fn local_addr(&self) -> io::Result<Self::Addr> {
-        self.0.local_addr()
+        self.addr
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "listener closed"))
     }
 }

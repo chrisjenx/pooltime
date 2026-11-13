@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod analytics;
+pub mod background;
 pub mod claude_code;
 pub mod cli;
 pub mod config;
@@ -17,6 +18,7 @@ pub mod service;
 pub mod signin;
 pub mod sse;
 pub mod store;
+pub mod supervisor;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod upstream;

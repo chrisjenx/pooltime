@@ -14,6 +14,27 @@
   account and `pool.seven_day_used_total` (also in the MCP `pool_usage` answer); `seven_day_left`
   and `seven_day_left_total` are unchanged, and routing is untouched.
 
+### Seamless restarts
+
+- `pooltime service restart` no longer makes new requests wait while the old daemon finishes its
+  streams (it used to answer them with 503 for as long as the longest reply took). The service
+  now runs `pooltime serve --supervise`: a small supervisor that owns the port and runs the
+  daemon as worker processes. A restart starts a new worker from the installed binary (so
+  `brew upgrade pooltime && pooltime service restart` picks up the new version), lets it take new
+  connections within about a second, and lets the old worker finish its in-flight requests and
+  exit. A crashed worker is replaced at once while clients wait on the open port. `service
+  status` and `doctor` show the supervisor and its worker generations. See
+  [`docs/specs/2026-11-13-seamless-restart.md`](docs/specs/2026-11-13-seamless-restart.md).
+- **Once after upgrading:** run `pooltime service install` (or just `pooltime service restart`,
+  which notices the old service definition and reinstalls it for you). That one restart still
+  waits for in-flight requests (it shows progress, and a Ctrl-C does not leave the service
+  unloaded); every later one hands over without a pause. `doctor` warns until it is done.
+- One stop signal stops the pool gracefully even when it reaches every pooltime process at once
+  (`pkill pooltime`, a service manager signalling the process group): in-flight streams finish.
+- Only one daemon process at a time runs the background work and writes account state; the
+  new one picks up what the old one learned (rate limits, expired logins, billing blocks).
+- `/health` also reports the answering process's `pid`.
+
 ### Fixed
 
 - `POST /v1/messages/count_tokens` (Claude Code's token counting) no longer fails with

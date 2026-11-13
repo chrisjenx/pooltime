@@ -6,7 +6,8 @@ does not parse or has an out-of-range value is an error. Precedence:
 **built-in defaults < `config.toml` < `POOLTIME_*` environment variables**
 
 Durations are strings: `"15m"`, `"2500ms"`, `"1h"`. Restart the daemon after editing
-(`pooltime service restart`). Some values are also written by pooltime itself: `[[profiles]]` by
+(`pooltime service restart`; a changed `port` or `host` needs `pooltime service install`, since
+the service's supervisor keeps the socket it bound). Some values are also written by pooltime itself: `[[profiles]]` by
 `connect`, `proxy_key` on first connect, `[routing]` tuning from the dashboard or `import bro`.
 
 ## Environment variables

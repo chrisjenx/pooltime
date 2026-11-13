@@ -8,7 +8,8 @@ use clap::Subcommand;
 use crate::claude_code::{disconnect, profile_of};
 use crate::config::{Config, Paths};
 use crate::fsutil::WriteOutcome;
-use crate::service::{Backend, Env, Runner, SystemRunner};
+use crate::service::{Backend, Env, Restarted, Runner, SystemRunner};
+use crate::supervisor::proto::{live_state, SupervisorState};
 
 #[derive(Debug, Subcommand)]
 pub enum ServiceCmd {
@@ -18,7 +19,8 @@ pub enum ServiceCmd {
     Uninstall,
     /// Is the service installed and running?
     Status,
-    /// Restart the running service.
+    /// Restart the daemon without closing the port: a new worker (the installed binary) takes
+    /// new requests while the old one finishes its in-flight ones.
     Restart,
 }
 
@@ -61,14 +63,83 @@ pub fn run_with(
             if !st.detail.is_empty() {
                 println!("{}", st.detail);
             }
+            if st.running {
+                if let Some(sup) = live_state(&env.paths) {
+                    println!("{}", supervisor_line(&sup));
+                }
+            }
+            if backend.supervised(env) == Some(false) {
+                println!("{OLD_DEFINITION}");
+            }
             Ok(if st.running { 0 } else { 1 })
         }
         ServiceCmd::Restart => {
-            backend.restart(env, r)?;
-            println!("restarted the pooltime service");
+            match crate::service::restart(backend, env, r)? {
+                Restarted::HandedOver { state: sup, joined } => {
+                    if joined {
+                        println!(
+                            "a restart was already in progress, so this request started nothing \
+                             new; that restart finished:"
+                        );
+                    }
+                    println!(
+                        "restarted without closing the port: generation {} (pid {}, version {}) \
+                         serves new requests",
+                        sup.generation,
+                        sup.worker_pid.map_or("?".into(), |p| p.to_string()),
+                        sup.worker_version.as_deref().unwrap_or("?"),
+                    );
+                    if !sup.draining.is_empty() {
+                        println!(
+                            "the previous generation finishes its in-flight requests, then exits"
+                        );
+                    }
+                    if sup
+                        .worker_version
+                        .as_deref()
+                        .is_some_and(|v| v != sup.version)
+                    {
+                        println!(
+                            "note: the supervisor itself stays at {} until `pooltime service \
+                             install` (a full restart); that is fine",
+                            sup.version
+                        );
+                    }
+                }
+                Restarted::Started => println!("restarted the pooltime service"),
+                Restarted::Reinstalled => println!(
+                    "reinstalled and restarted the pooltime service; from now on \
+                     `pooltime service restart` hands over without a pause"
+                ),
+            }
             Ok(0)
         }
     }
+}
+
+/// Shown wherever an installed definition from before seamless restarts is noticed.
+pub const OLD_DEFINITION: &str = "note: the installed service predates seamless restarts; run \
+     `pooltime service install` once (or `pooltime service restart`, which does it for you)";
+
+/// One line about the supervisor and its worker generations.
+pub fn supervisor_line(s: &SupervisorState) -> String {
+    let mut line = format!(
+        "supervisor: pid {} (v{}), generation {}",
+        s.pid, s.version, s.generation
+    );
+    if let Some(pid) = s.worker_pid {
+        line.push_str(&format!(
+            ": pid {pid} (v{})",
+            s.worker_version.as_deref().unwrap_or("?")
+        ));
+    }
+    if !s.draining.is_empty() {
+        line.push_str(&format!(
+            ", {} older generation(s) draining",
+            s.draining.len()
+        ));
+    }
+    line
 }
 
 /// Disconnect all configured profiles first, then unload and remove the service. A profile that

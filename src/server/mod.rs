@@ -3,8 +3,8 @@
 //! Layout: [`router`] builds the route table and middleware, [`auth`] guards inference and
 //! management traffic, [`mgmt`] is the `/api/v1/*` management API, [`dashboard`] serves the
 //! embedded web UI at `/`, [`models_route`] serves `/v1/models`, [`health`] serves `/health` and
-//! the startup preflight, [`shutdown`] owns signal handling and the drain sequence, [`daemon`]
-//! boots it all for `pooltime serve`.
+//! the startup preflight, [`shutdown`] owns signal handling and the drain sequence, [`handoff`]
+//! is a supervised worker's side of a restart, [`daemon`] boots it all for `pooltime serve`.
 
 pub mod analytics_api;
 pub mod auth;
@@ -13,6 +13,7 @@ pub mod count_tokens;
 pub mod daemon;
 pub mod dashboard;
 pub mod fallback;
+pub mod handoff;
 pub mod health;
 pub mod inference;
 pub mod journal_api;
@@ -38,7 +39,9 @@ use crate::upstream::Upstream;
 
 pub use daemon::run_daemon;
 pub use router::router;
-pub use shutdown::{serve, serve_listener, serve_until_signal, Outcome, ServeOpts};
+pub use shutdown::{
+    serve, serve_listener, serve_until, serve_until_signal, Outcome, ServeOpts, StopKind,
+};
 
 /// Everything a request handler can reach. Built once at startup (tests build it from fakes).
 pub struct AppState {

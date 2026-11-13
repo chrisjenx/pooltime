@@ -29,3 +29,4 @@ mod proxy_openai;
 mod routing;
 mod service;
 mod setup_doctor;
+mod supervisor;

@@ -22,7 +22,7 @@ runs).
 |---|---|
 | `main.rs`, `cli/` | clap entry point; one file per command (`setup`, `doctor`, `accounts`, ...); `cli/client.rs` finds the daemon and talks to it |
 | `config.rs` | `config.toml`, `POOLTIME_*` overlay, defaults, data-dir `Paths` |
-| `server/` | `daemon` (boot), `router` (routes + middleware), `auth`, `inference` (`/v1/messages` and the failover loop), `count_tokens`, `fallback` (cross-provider), `classifier`, `models_route`, `health`, `shutdown` (drain), `mgmt` (management API), `journal_api`, `analytics_api`, `dashboard` |
+| `server/` | `daemon` (boot), `router` (routes + middleware), `auth`, `inference` (`/v1/messages` and the failover loop), `count_tokens`, `fallback` (cross-provider), `classifier`, `models_route`, `health`, `shutdown` (drain, handoff), `handoff` (a supervised worker's side), `mgmt` (management API), `journal_api`, `analytics_api`, `dashboard` |
 | `providers/` | the `Provider` trait; `anthropic/` (passthrough proxy, OAuth refresh, rate-limit headers, usage poll, catalog) and `openai/` (Codex: request/stream translation, OAuth, usage, catalog); `stream_guard` (shared stream pump) |
 | `signin/` | OAuth PKCE sign-in flows (`claude`, `openai`), the localhost `callback` listener, paste-code mode |
 | `accounts/` | account ids, `account.toml` registry, credentials (0600), identity verification, the runtime `StateBook` (availability per account) |
@@ -33,7 +33,8 @@ runs).
 | `store/` | SQLite (one writer thread): migrations, request journal, account timeline, usage history, retention |
 | `analytics/` | usage sampler and weekly burn report |
 | `mcp/` | MCP JSON-RPC transport and the six tools |
-| `service/` | launchd and systemd unit rendering and control |
+| `service/` | launchd and systemd unit rendering and control; `service restart` |
+| `supervisor/` | `serve --supervise`: owns the port, runs worker generations, hands over on `SIGHUP`, respawns crashed workers; `proto` (control messages, `run/supervisor.json`) |
 | `import/` | `bro.rs`: plan and apply a bro-cli import |
 | `upstream.rs` | HTTP client with header-wait, per-read idle and per-attempt deadlines; no decompression |
 | `sse.rs` | SSE parser (observer for Anthropic, parser for Codex translation) |
@@ -73,12 +74,42 @@ fake upstreams in `tests/support/`), `packaging/homebrew/`, `install.sh`.
 ## Background tasks in the daemon
 
 Usage polling and rate-limit tracking, profile sync (every minute), health/alerts evaluation,
-status-line cache, usage sampler, session pruning (every minute), retention (hourly).
+status-line cache, usage sampler, session pruning (every minute), retention (hourly). Exactly one
+process runs them: under the supervisor, only the active worker generation.
+
+## Processes and restarts
+
+`pooltime serve` alone is one process that binds the port and serves until `SIGTERM`/`SIGINT`,
+then drains (in-flight requests finish, up to 10 minutes, while new ones get 503).
+
+The background service runs `pooltime serve --supervise` instead
+([design](specs/2026-11-13-seamless-restart.md)). The supervisor binds the port once and runs
+`pooltime serve --listen-fd N --control-fd M` workers that inherit the listening socket and an
+anonymous `socketpair` (no filesystem path, nothing another user can connect to). Protocol, one
+line each: worker `ready <version>` / `released`, supervisor `active` / `handoff` / `stop` /
+`force`. Workers ignore OS signals while the socket is open.
+
+1. `service restart` sends the supervisor `SIGHUP` (`launchctl kill SIGHUP`, `systemctl reload`).
+2. It starts a new worker from the configured binary path (the Homebrew symlink, so upgrades take
+   effect). The worker skips the "already running" preflight and serves at once.
+3. On `ready`, the old worker gets `handoff`: it stops accepting, closes its copy of the socket
+   (queued connections stay in the shared backlog), stops its background tasks and waits for
+   their blocking work, stops persisting account state, flushes its database queue, answers
+   `released`, serves its open connections for a 2 s grace and drains.
+4. On `released` (or after 10 s) the new worker gets `active`: it reloads account state from the
+   database and starts the background tasks.
+
+A worker that dies is respawned at once (1, 2, 4, 8 s backoff after repeated failures; after 5,
+or if the first worker never starts, the supervisor exits non-zero for launchd/systemd to
+restart). A new worker that fails during a restart leaves the old one serving. `SIGTERM`/`SIGINT`
+to the supervisor becomes `stop` for every worker (again: `force`); if the control socket closes
+(supervisor gone) a worker hands off and drains on its own. State for the CLI:
+`run/supervisor.json` (0600). The supervisor itself changes only with `service install`.
 
 ## Data
 
 `~/.pooltime/`: `config.toml`, `models.toml`, `accounts/<name>/{account.toml,credentials.json,lock}`,
-`pooltime.db`, `logs/`, `run/{mgmt.key,mcp.key,status-cache.json,profiles/}`. See
+`pooltime.db`, `logs/`, `run/{mgmt.key,mcp.key,status-cache.json,supervisor.json,profiles/}`. See
 [Install](install.md#data-directory).
 
 Related: [Adding a provider](adding-a-provider.md), [`AGENTS.md`](../AGENTS.md), [parity](parity.md),
