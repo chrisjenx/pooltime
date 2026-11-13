@@ -132,6 +132,16 @@ release (which creates the tag at that commit) and updates `Formula/pooltime.rb`
 - One-time setup: the repository secret `HOMEBREW_TAP_DEPLOY_KEY`, the private half of an SSH deploy
   key with write access to `chrisjenx/homebrew-tap`. Without it the tap job warns and skips; update
   the tap by hand with `packaging/homebrew/update-formula.sh <version> <tap checkout>/Formula/pooltime.rb`.
+  The key is kept only on GitHub (the secret plus the tap's "pooltime release CI" deploy key); no
+  machine holds a copy, so a new or lost machine changes nothing. To create or replace it (e.g. if the
+  tap job fails with a permission error), run this from any machine with `gh` signed in, then delete
+  the old "pooltime release CI" entry under the tap's Settings → Deploy keys:
+
+  ```sh
+  K=$(mktemp -d)/tapkey && ssh-keygen -q -t ed25519 -N "" -C "pooltime-release-ci" -f "$K" \
+    && gh repo deploy-key add "$K.pub" --repo chrisjenx/homebrew-tap --allow-write --title "pooltime release CI" \
+    && gh secret set HOMEBREW_TAP_DEPLOY_KEY --repo chrisjenx/pooltime < "$K"; rm -f "$K" "$K.pub"
+  ```
 - `packaging/homebrew/pooltime.rb` is only the template; the tap is the source of truth.
 - A hand-pushed `vX.Y.Z` tag still works (it must match `Cargo.toml`). The "Release" workflow can
   also be run manually: without `publish` it only builds the four targets as a check.
