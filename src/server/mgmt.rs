@@ -59,7 +59,7 @@ use super::AppState;
 use crate::accounts::registry::{MAX_WEIGHT, MIN_WEIGHT};
 use crate::accounts::status::window_duration;
 use crate::accounts::{
-    AccountId, AccountMeta, AccountState, AccountStatus, Identity, TimedOverride, Window,
+    AccountId, AccountMeta, AccountState, AccountStatus, Counters, Identity, TimedOverride, Window,
 };
 use crate::claude_code::{discover, profile_of, Profile};
 use crate::config::{Config, Paths, ProfileRef};
@@ -320,6 +320,10 @@ pub enum CredsInfo {
     Present {
         expires_at: Option<OffsetDateTime>,
         refresh_expires_at: Option<OffsetDateTime>,
+        /// Subscription plan saved at sign-in (e.g. `max`), when the provider reported one.
+        plan: Option<String>,
+        /// Provider rate tier saved at sign-in (e.g. `default_claude_max_20x`).
+        tier: Option<String>,
     },
 }
 
@@ -419,13 +423,23 @@ fn account_json(v: &AccountView, now: OffsetDateTime) -> Value {
         _ => (None, None),
     };
     let active = v.meta.weight_override.as_ref().filter(|o| o.until > now);
-    let (expires_at, refresh_expires_at) = match &v.creds {
+    let (expires_at, refresh_expires_at, plan, tier) = match &v.creds {
         CredsInfo::Present {
             expires_at,
             refresh_expires_at,
-        } => (*expires_at, *refresh_expires_at),
-        _ => (None, None),
+            plan,
+            tier,
+        } => (
+            *expires_at,
+            *refresh_expires_at,
+            plan.as_deref(),
+            tier.as_deref(),
+        ),
+        _ => (None, None, None, None),
     };
+    // Usage freshness follows the windows: nothing for a dead account (INV §10).
+    let snap = v.state.snapshot.as_ref().filter(|_| !dead);
+    let check = v.state.usage_check.as_ref();
     json!({
         "id": v.meta.id.as_str(),
         "provider": v.meta.provider.as_str(),
@@ -444,17 +458,46 @@ fn account_json(v: &AccountView, now: OffsetDateTime) -> Value {
             "model": w.model,
             "utilization": w.utilization,
             "reset": ts_opt(w.reset),
+            "reset_estimated": w.reset_synthetic,
         })).collect::<Vec<_>>(),
         "seven_day_left": seven_day_left(windows),
         "expires_at": ts_opt(expires_at),
         "refresh_expires_at": ts_opt(refresh_expires_at),
         "identity": identity_json(&v.meta.identity),
+        "plan": plan,
+        "tier": tier,
         "in_flight": v.in_flight,
         "sessions": v.sessions,
+        "last_used_at": ts_opt(v.state.last_used_at),
+        "usage_updated_at": ts_opt(snap.map(|s| s.updated_at)),
+        "unified_status": snap.and_then(|s| s.unified_status.as_deref()),
+        "usage_check": check.map(|c| json!({
+            "at": ts(c.at),
+            "ok": c.ok,
+            "error": c.error,
+        })),
+        "counters": {
+            "window_started_at": ts_opt(v.state.window_started_at),
+            "window": counters_json(&v.state.window_counters),
+            "lifetime": counters_json(&v.state.lifetime),
+        },
         "last_error": v.state.last_error.as_ref().map(|e| json!({
             "at": ts(e.at),
             "reason": e.reason.detail(),
         })),
+    })
+}
+
+/// Request and token counts (never content).
+fn counters_json(c: &Counters) -> Value {
+    json!({
+        "requests": c.requests,
+        "successes": c.successes,
+        "errors": c.errors,
+        "input_tokens": c.input_tokens,
+        "output_tokens": c.output_tokens,
+        "cache_read": c.cache_read,
+        "cache_write": c.cache_write,
     })
 }
 
@@ -598,6 +641,8 @@ pub async fn try_gather(
                     Ok(Some(c)) => CredsInfo::Present {
                         expires_at: c.expires_at,
                         refresh_expires_at: c.refresh_expires_at,
+                        plan: c.plan,
+                        tier: c.tier,
                     },
                     Ok(None) => CredsInfo::Missing,
                     Err(_) => CredsInfo::Unreadable,

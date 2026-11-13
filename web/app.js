@@ -61,7 +61,19 @@
     journal: { requests: null, stats: null, events: null, errorsOnly: false, open: {}, details: {}, error: null },
     // Weekly burn (Overview, key holders only): refetched at most every BURN_MS.
     burn: null, burnAt: 0, burnError: null,
+    // Account order (Overview, Accounts, Routing), remembered in localStorage; filters are not.
+    sort: { key: "reset7", reversed: false },
+    filter: { q: "", state: "all", provider: "all" },
   };
+  const SORT_STORE = "pooltime-sort";
+  try {
+    const saved = JSON.parse(localStorage.getItem(SORT_STORE) || "null");
+    if (saved && typeof saved.key === "string") ui.sort = { key: saved.key, reversed: !!saved.reversed };
+  } catch (_) { /* private mode or junk: keep the default */ }
+  function setSort(next) {
+    ui.sort = next;
+    try { localStorage.setItem(SORT_STORE, JSON.stringify(next)); } catch (_) { /* private mode */ }
+  }
 
   let manage = false;
 
@@ -91,6 +103,13 @@
 
   // ---- time & number formatting -------------------------------------------------------------
   function now() { return Date.now() + ui.skew; }
+  function num(n) { return typeof n === "number" ? n.toLocaleString() : "—"; }
+  function compact(n) {
+    if (typeof n !== "number") return "—";
+    if (n < 1000) return String(n);
+    if (n < 1e6) return (n / 1000).toFixed(n < 10000 ? 1 : 0) + "k";
+    return (n / 1e6).toFixed(n < 1e7 ? 1 : 0) + "M";
+  }
   function dur(ms) {
     let s = Math.round(Math.abs(ms) / 1000);
     const d = Math.floor(s / 86400); s -= d * 86400;
@@ -129,9 +148,6 @@
   // A dead account never shows leftover usage as headroom (spec §4): its windows are ignored
   // even if a stale snapshot is present.
   function windowsOf(a) { return isDead(a) ? [] : (a.windows || []); }
-  function weekWindow(a) {
-    return windowsOf(a).find((w) => !w.model && String(w.key).split(/[-_]/).includes("7d")) || null;
-  }
   function sevenDayLeft(a) {
     return isDead(a) || typeof a.seven_day_left !== "number" ? null : a.seven_day_left;
   }
@@ -146,9 +162,91 @@
     if (m) base = m[1] + (m[2] === "h" ? "-hour" : m[2] === "d" ? "-day" : "-min");
     return model ? base + " · " + model : base;
   }
+  // Most severe first (the attention list and the Re-login queue).
   function sorted(accounts) {
     return accounts.slice().sort((a, b) =>
       (SEVERITY[a.status] ?? 9) - (SEVERITY[b.status] ?? 9) || String(a.id).localeCompare(String(b.id)));
+  }
+
+  // ---- account order (pure: no DOM, no clock; `t` is "now" in ms) ---------------------------
+  // key -> [label, natural direction: 1 = ascending]. The first is the default.
+  const SORTS = {
+    reset7: ["7-day reset (soonest)", 1],
+    left7: ["7-day left (most)", -1],
+    left5: ["5-hour left (most)", -1],
+    severity: ["State (most severe)", 1],
+    name: ["Name", 1],
+    activity: ["Activity (busiest)", -1],
+  };
+  function windowMs(key) {
+    const m = /^(\d+)([hdm])/.exec(String(key));
+    if (!m) return null;
+    return Number(m[1]) * (m[2] === "d" ? 86400000 : m[2] === "h" ? 3600000 : 60000);
+  }
+  function accountWindow(a, token) {
+    return windowsOf(a).find((w) => !w.model && String(w.key).split(/[-_]/).includes(token)) || null;
+  }
+  // The window's next reset in ms. A reported reset already passed rolls forward by the window
+  // length (`assumed`: the next usage check will confirm it); unknown -> null.
+  function nextReset(w, t) {
+    if (!w || !w.reset) return null;
+    const r = Date.parse(w.reset);
+    if (isNaN(r)) return null;
+    if (r > t) return { at: r, assumed: false };
+    const d = windowMs(w.key);
+    return d ? { at: r + (Math.floor((t - r) / d) + 1) * d, assumed: true } : null;
+  }
+  function fiveHourLeft(a) {
+    const w = accountWindow(a, "5h");
+    return w && typeof w.utilization === "number" ? 1 - Math.max(0, Math.min(1, w.utilization)) : null;
+  }
+  function sortValue(a, key, t) {
+    switch (key) {
+      case "reset7": { const r = nextReset(accountWindow(a, "7d"), t); return r ? r.at : null; }
+      case "left7": return sevenDayLeft(a);
+      case "left5": return fiveHourLeft(a);
+      case "severity": return SEVERITY[a.status] ?? 9;
+      case "name": return String(a.id);
+      case "activity": return (a.in_flight || 0) + (a.sessions || 0);
+      default: return null;
+    }
+  }
+  // Comparator for `sort` = { key, reversed }. Accounts without a value (no known 7-day reset,
+  // needs login, ...) always go after those with one, then by name; ties break on the soonest
+  // 7-day reset, then the name.
+  function compareAccounts(sort, t) {
+    const key = SORTS[sort.key] ? sort.key : "reset7";
+    const dir = SORTS[key][1] * (sort.reversed ? -1 : 1);
+    const byName = (a, b) => String(a.id).localeCompare(String(b.id));
+    const nullsLast = (va, vb) => (va == null ? (vb == null ? 0 : 1) : -1);
+    return (a, b) => {
+      const va = sortValue(a, key, t), vb = sortValue(b, key, t);
+      if (va == null || vb == null) return nullsLast(va, vb) || byName(a, b);
+      const d = (typeof va === "string" ? va.localeCompare(vb) : va - vb) * dir;
+      if (d || key === "name") return d || byName(a, b);
+      if (key !== "reset7") {
+        const ra = sortValue(a, "reset7", t), rb = sortValue(b, "reset7", t);
+        if (ra == null || rb == null) { if (ra !== rb) return nullsLast(ra, rb); } else if (ra !== rb) return ra - rb;
+      }
+      return byName(a, b);
+    };
+  }
+  function sortAccounts(accounts, sort, t) { return accounts.slice().sort(compareAccounts(sort, t)); }
+  // ---- end account order ----
+
+  // Not usable for new requests right now (bro's "unavailable").
+  function isUnavailable(a) { return ["needs_login", "billing", "access_denied", "rate_limited"].includes(a.status); }
+  // The last ground-truth usage poll failed (a dead account's failure is its state already).
+  function usageWarning(a) { return !isDead(a) && !!a.usage_check && a.usage_check.ok === false; }
+  function matchesFilter(a, f) {
+    const q = f.q.trim().toLowerCase();
+    if (q && !String(a.id).toLowerCase().includes(q) &&
+        !String((a.identity && a.identity.email) || "").toLowerCase().includes(q)) return false;
+    if (f.provider !== "all" && a.provider !== f.provider) return false;
+    if (f.state === "all") return true;
+    if (f.state === "unavailable") return isUnavailable(a);
+    if (f.state === "usage_warning") return usageWarning(a);
+    return a.status === f.state;
   }
   // The server decides `expiring` (warn window from config); an account showing a more severe
   // state (e.g. rate-limited) whose login also expires soon still counts for re-login.
@@ -421,8 +519,59 @@
     renderBanner();
     // Leave the view alone while the user is typing in it; drafts survive the next render.
     if (editing()) return;
+    paintView();
+  }
+
+  function paintView() {
     const fn = VIEWS[ui.view] || VIEWS.overview;
     $("view-" + ui.view).replaceChildren(...[].concat(fn(ui.data)));
+  }
+
+  // Sort and filter bar over an account list (Overview table, Accounts cards). Changes repaint
+  // at once; the search box keeps focus and caret across the repaint.
+  function accountToolbar(all, shown) {
+    const v = ui.view;
+    const f = ui.filter;
+    const pick = (fn) => (ev) => { fn(ev.target.value); ev.target.blur(); paintView(); };
+    const providers = [...new Set(all.map((a) => a.provider))].sort();
+    const present = Object.keys(WORDS).filter((s) => all.some((a) => a.status === s));
+    const warned = all.some(usageWarning);
+    const searchId = "acct-search-" + v;
+    return h("div", { class: "toolbar" },
+      h("label", { class: "inline" }, h("span", { class: "dim", text: "Sort" }),
+        h("select", { "aria-label": "Sort accounts", onchange: pick((k) => setSort({ key: k, reversed: false })) },
+          Object.keys(SORTS).map((k) => h("option", { value: k, selected: ui.sort.key === k, text: SORTS[k][0] })))),
+      h("button", { type: "button", class: "small ghost", title: "Reverse the order", "aria-pressed": ui.sort.reversed ? "true" : "false",
+        onclick: () => { setSort({ key: ui.sort.key, reversed: !ui.sort.reversed }); paintView(); } },
+        ui.sort.reversed ? "Reversed" : "Reverse"),
+      h("input", { id: searchId, type: "search", placeholder: "Search name or email", value: f.q, "aria-label": "Search accounts",
+        oninput: (ev) => {
+          const pos = ev.target.selectionStart;
+          f.q = ev.target.value;
+          paintView();
+          const el = $(searchId);
+          if (el) { el.focus(); try { el.setSelectionRange(pos, pos); } catch (_) { /* type=search */ } }
+        } }),
+      h("select", { "aria-label": "Account state", onchange: pick((x) => { f.state = x; }) },
+        h("option", { value: "all", text: "All states" }),
+        h("option", { value: "unavailable", selected: f.state === "unavailable", text: "Unavailable" }),
+        warned || f.state === "usage_warning" ? h("option", { value: "usage_warning", selected: f.state === "usage_warning", text: "Usage check failing" }) : null,
+        present.concat(present.includes(f.state) || !WORDS[f.state] ? [] : [f.state]).map((s) =>
+          h("option", { value: s, selected: f.state === s, text: WORDS[s] }))),
+      providers.length > 1 || f.provider !== "all"
+        ? h("select", { "aria-label": "Provider", onchange: pick((x) => { f.provider = x; }) },
+            h("option", { value: "all", text: "All providers" }),
+            providers.map((p) => h("option", { value: p, selected: f.provider === p, text: p })))
+        : null,
+      h("span", { class: "dim grow-right", text: shown === all.length ? all.length + (all.length === 1 ? " account" : " accounts") : shown + " of " + all.length + " accounts" }),
+      shown !== all.length
+        ? h("button", { type: "button", class: "small ghost", onclick: () => { ui.filter = { q: "", state: "all", provider: "all" }; paintView(); } }, "Clear filters")
+        : null);
+  }
+
+  // The accounts to list, filtered and in the chosen order.
+  function listed(all) {
+    return sortAccounts(all.filter((a) => matchesFilter(a, ui.filter)), ui.sort, now());
   }
 
   function renderConn() {
@@ -487,52 +636,51 @@
         h("div", { class: "hero" },
           h("div", null,
             h("div", { class: "big" }, Math.max(0, total).toFixed(2), " ", h("small", { text: "of " + n + " subscriptions left this week" })),
-            h("div", { class: "sub", text: (pool.available ?? 0) + " of " + n + " accounts ready" })),
+            h("div", { class: "sub", text: heroSub(accts, pool, n) })),
           bar(n ? total / n : null, false)),
         h("div", { class: "counts" },
           Object.keys(WORDS).filter((s) => counts[s]).map((s) =>
             h("span", { class: "pill " + s, text: counts[s] + " " + WORDS[s] }))));
 
-      const rows = sorted(accts).map((a) => {
-        const left = sevenDayLeft(a);
-        const w = weekWindow(a);
-        return h("tr", null,
-          h("td", { class: "nowrap" }, h("strong", { text: a.id })),
-          h("td", null, pill(a.status)),
-          h("td", { class: "barcell" }, bar(left, false)),
-          h("td", { class: "num", text: left === null ? "—" : pct(left) + " left" }),
-          h("td", { class: "num dim", text: left === null || !w || !w.reset ? "—" : "resets " + clock(w.reset) + " (" + rel(w.reset) + ")" }));
-      });
-      const bars = h("div", { class: "panel" },
-        h("h2", { text: "7-day headroom by account" }),
+      const rows = listed(accts).map(accountRow);
+      const table = h("div", { class: "panel" },
+        h("h2", { text: "Accounts" }),
+        accts.length ? accountToolbar(accts, rows.length) : null,
         rows.length
-          ? h("table", null, h("thead", null, h("tr", null,
-              ["Account", "State", "7-day left", "", "Reset"].map((t) => h("th", { text: t })))),
-            h("tbody", null, rows))
-          : h("p", { class: "empty", text: "No accounts yet. Add one with `pooltime accounts add`." }));
+          ? h("div", { class: "table-wrap" }, h("table", { class: "accounts" }, h("thead", null, h("tr", null,
+              ["Account", "State", "5-hour left", "7-day left", "7-day reset", "Activity"].map((t) => h("th", { text: t })))),
+            h("tbody", null, rows)))
+          : h("p", { class: "empty", text: accts.length ? "No accounts match the filters." : "No accounts yet. Add one with `pooltime accounts add`." }));
 
-      const attention = sorted(accts).map((a) => h("tr", null,
+      // Anything that needs a look, most severe first (needs login on top), whatever the sort.
+      const attention = sorted(accts.filter((a) => a.status !== "ready" || loginExpiringSoon(a) || usageWarning(a))).map((a) => h("tr", null,
         h("td", { class: "nowrap" }, h("strong", { text: a.id })),
         h("td", null, pill(a.status)),
         h("td", { class: "dim nowrap", text: a.status_since ? "for " + dur(now() - Date.parse(a.status_since)) : "—" }),
-        h("td", { text: statusDetail(a) || "" }),
-        h("td", { class: "nowrap" }, (isDead(a) || a.status === "expiring") && manage
+        h("td", { text: [statusDetail(a), usageWarning(a) ? usageCheckText(a) : ""].filter(Boolean).join(" · ") }),
+        h("td", { class: "nowrap" }, (isDead(a) || loginExpiringSoon(a)) && manage
           ? h("button", { type: "button", class: "small", onclick: () => relogin.start([a.id]) }, "Re-login")
           : null)));
       const list = h("div", { class: "panel" },
-        h("h2", { text: "Accounts by severity" }),
-        attention.length ? h("table", null, h("tbody", null, attention)) : h("p", { class: "empty", text: "—" }));
-      return [hero, manage ? burnPanel() : lockedPanel("Weekly burn"), bars, list];
+        h("h2", { text: "Needs attention" }),
+        attention.length
+          ? h("table", null, h("tbody", null, attention))
+          : h("p", { class: "empty", text: accts.length ? "Nothing: every account is ready." : "—" }));
+      return [hero, list, table, manage ? burnPanel() : lockedPanel("Weekly burn")];
     },
 
     accounts(d) {
-      const accts = sorted(d.accounts || []);
-      if (!accts.length) return h("div", { class: "panel empty", text: "No accounts yet. Add one with `pooltime accounts add`." });
-      return h("div", { class: "cards" }, accts.map(accountCard));
+      const all = d.accounts || [];
+      if (!all.length) return h("div", { class: "panel empty", text: "No accounts yet. Add one with `pooltime accounts add`." });
+      const accts = listed(all);
+      return [
+        h("div", { class: "panel toolbar-panel" }, accountToolbar(all, accts.length)),
+        accts.length ? h("div", { class: "cards" }, accts.map(accountCard)) : h("div", { class: "panel empty", text: "No accounts match the filters." }),
+      ];
     },
 
     routing(d) {
-      const accts = sorted(d.accounts || []);
+      const accts = sortAccounts(d.accounts || [], ui.sort, now());
       const ro = !manage;
       const rows = accts.map((a) => {
         const key = "routing:" + a.id;
@@ -747,6 +895,66 @@
     return bits.join(" · ");
   }
 
+  // "2 of 7 accounts ready · 3 in flight · 4 active sessions · 1 usage check failing"
+  function heroSub(accts, pool, n) {
+    const sum = (k) => accts.reduce((t, a) => t + (a[k] || 0), 0);
+    const warned = accts.filter(usageWarning).length;
+    return [(pool.available ?? 0) + " of " + n + " accounts ready",
+      sum("in_flight") + " in flight",
+      sum("sessions") + (sum("sessions") === 1 ? " active session" : " active sessions"),
+      warned ? warned + (warned === 1 ? " usage check failing" : " usage checks failing") : null,
+    ].filter(Boolean).join(" · ");
+  }
+  function usageCheckText(a) {
+    const c = a.usage_check;
+    if (!c) return "usage not checked yet";
+    return c.ok ? "usage checked " + rel(c.at) : "usage check failed (" + (c.error || "error") + ", " + rel(c.at) + ")";
+  }
+  // "anthropic · max" (plan when known).
+  function planText(a) {
+    return [a.provider, a.plan].filter(Boolean).join(" · ");
+  }
+  // Routing knobs off their defaults, as chips: "P10", "×5 until 00:00".
+  function routingChips(a) {
+    const chips = [];
+    if (typeof a.priority === "number" && a.priority !== 100) chips.push(h("span", { class: "chip", title: "priority (lower is preferred)", text: "P" + a.priority }));
+    if (a.weight_override) chips.push(h("span", { class: "chip", title: "temporary weight, base " + a.weight, text: "×" + a.weight_override.weight + " until " + clock(a.weight_override.until) }));
+    else if (typeof a.weight === "number" && a.weight !== 1) chips.push(h("span", { class: "chip", title: "routing weight", text: "×" + a.weight }));
+    return chips;
+  }
+  // Reset text for a window: "resets 09:00 (in 4d 21h)", flagged when estimated or rolled forward.
+  function resetText(w, short) {
+    const r = nextReset(w, now());
+    if (!r) return w && w.reset ? "reset passed, next not reported" : "reset not reported";
+    const when = short ? rel(new Date(r.at).toISOString()) : clock(r.at) + " (" + rel(new Date(r.at).toISOString()) + ")";
+    return "resets " + when + (r.assumed ? ", assumed (awaiting usage check)" : w.reset_estimated ? ", estimated" : "");
+  }
+
+  // One row of the Overview accounts table.
+  function accountRow(a) {
+    const left5 = fiveHourLeft(a), left7 = sevenDayLeft(a);
+    const w5 = accountWindow(a, "5h"), w7 = accountWindow(a, "7d");
+    const r7 = nextReset(w7, now());
+    const meter = (left, w) => h("div", { class: "meter" }, bar(left, false),
+      h("span", { class: "dim", text: left === null ? "—" : pct(left) + (w ? " · " + resetText(w, true) : "") }));
+    const busy = (a.in_flight || 0) + (a.sessions || 0);
+    return h("tr", { class: "sev-" + a.status },
+      h("td", null,
+        h("div", { class: "nowrap" }, h("strong", { text: a.id })),
+        h("div", { class: "meta" }, h("span", { class: "dim", text: planText(a) }), routingChips(a),
+          usageWarning(a) ? h("span", { class: "chip warn", title: usageCheckText(a), text: "usage check failed" }) : null)),
+      h("td", null, pill(a.status),
+        loginExpiringSoon(a) && a.status !== "expiring" ? [" ", h("span", { class: "pill badge warn", text: "expiring" })] : null,
+        h("div", { class: "dim small nowrap", text: a.status_since ? "for " + dur(now() - Date.parse(a.status_since)) : "" })),
+      h("td", { class: "metercell" }, isDead(a) ? h("span", { class: "dim", text: "—" }) : meter(left5, w5)),
+      h("td", { class: "metercell" }, isDead(a) ? h("span", { class: "dim", text: "—" }) : meter(left7, null)),
+      h("td", { class: "num" }, left7 === null || !r7
+        ? h("span", { class: "dim", text: "—" })
+        : [h("div", { text: clock(r7.at) }),
+           h("div", { class: "dim small", text: rel(new Date(r7.at).toISOString()) + (r7.assumed ? " (assumed)" : w7.reset_estimated ? " (estimated)" : "") })]),
+      h("td", { class: "num" + (busy ? "" : " dim"), text: (a.in_flight || 0) + " in flight · " + (a.sessions || 0) + (a.sessions === 1 ? " session" : " sessions") }));
+  }
+
   function accountCard(a) {
     const dead = isDead(a);
     const kv = (k, v, cls) => [h("dt", { text: k }), h("dd", { class: cls || null }, v)];
@@ -757,21 +965,43 @@
       expiry = (left > 0 ? "expires " : "expired ") + rel(a.refresh_expires_at) + " (" + clock(a.refresh_expires_at) + ")";
       expiryCls = left <= 0 ? "bad-text" : left < expiryWarnMs() ? "warn-text" : null;
     }
+    // The access token refreshes by itself; shown for completeness (never for a dead account).
+    const token = dead || !a.expires_at ? null
+      : Date.parse(a.expires_at) > now() ? "expires " + rel(a.expires_at) + " (refreshes by itself)" : "expired, refreshes on next use";
     const ov = a.weight_override;
     const routingText = "priority " + a.priority + " · weight " + a.effective_weight +
       (ov ? " (override until " + clock(ov.until) + ", base " + a.weight + ")" : "");
+    const c = a.counters || {};
+    const win = c.window || {};
+    const life = c.lifetime || {};
+    const since = c.window_started_at ? " since " + clock(c.window_started_at) : "";
+    const requests = c.window
+      ? num(win.requests) + since + (win.errors ? " (" + num(win.errors) + " failed)" : "") + " · " + num(life.requests) + " all time"
+      : null;
+    const tokens = c.window && (win.input_tokens || win.output_tokens || win.cache_read || win.cache_write)
+      ? compact(win.input_tokens) + " in · " + compact(win.output_tokens) + " out · " + compact(win.cache_read) + " cache read · " + compact(win.cache_write) + " cache write" + since
+      : null;
+    const left7 = sevenDayLeft(a);
+    const w7 = accountWindow(a, "7d");
+    const week = left7 === null ? "—" : pct(left7) + " left" + (w7 ? " · " + resetText(w7) : "");
     const wins = windowsOf(a);
     const windows = dead || !wins.length
       ? h("p", { class: "dim usage-none", text: dead ? "— (no usage shown while logged out)" : "—" })
       : h("div", { class: "windows" }, wins.map((w) => [
           h("span", { class: "label", text: windowLabel(w.key, w.model) }),
           bar(w.utilization, true),
-          h("span", { class: "val", text: pct(w.utilization) + " used · " + (w.reset ? "resets " + rel(w.reset) : "—") }),
+          h("span", { class: "val", text: pct(w.utilization) + " used · " + resetText(w, true) }),
         ]));
+    const fresh = [
+      a.usage_updated_at ? "snapshot " + rel(a.usage_updated_at) : null,
+      a.unified_status ? "status " + a.unified_status : null,
+    ].filter(Boolean).join(" · ");
+    const check = a.usage_check;
     return h("div", { class: "card sev-" + a.status },
       h("div", { class: "card-head" },
         h("h3", { text: a.id }),
         h("span", { class: "pill badge", text: a.provider }),
+        a.plan ? h("span", { class: "pill badge", title: "subscription plan", text: a.plan }) : null,
         pill(a.status),
         loginExpiringSoon(a) && a.status !== "expiring" ? h("span", { class: "pill badge warn", text: "expiring" }) : null),
       a.identity && a.identity.email ? h("div", { class: "email", text: a.identity.email }) : null,
@@ -781,12 +1011,22 @@
           ? statusDetail(a)
           : reasonText(a.reason) || (a.status === "ready" ? "usable" : "—")),
         a.until && a.status !== "expiring" ? kv("Until", clock(a.until) + " (" + rel(a.until) + ")") : null,
+        dead && !manage ? kv("Fix", h("code", { text: "pooltime accounts login " + a.id })) : null,
+        kv("7-day", week),
         kv("Login", expiry, expiryCls),
+        token ? kv("Token", token) : null,
+        a.tier ? kv("Rate tier", h("span", { class: "mono", text: a.tier })) : null,
         kv("Routing", routingText),
-        kv("Activity", a.in_flight + " in flight · " + a.sessions + " sessions"),
-        a.last_error ? kv("Last error", reasonText(a.last_error.reason) + " · " + rel(a.last_error.at)) : null,
-        kv("7-day left", sevenDayLeft(a) === null ? "—" : pct(sevenDayLeft(a)))),
-      h("div", { class: "usage" }, h("div", { class: "usage-title", text: "Usage" }), windows),
+        kv("Activity", a.in_flight + " in flight · " + a.sessions + (a.sessions === 1 ? " session" : " sessions")),
+        kv("Last used", a.last_used_at ? rel(a.last_used_at) + " (" + clock(a.last_used_at) + ")" : "—"),
+        requests ? kv("Requests", requests) : null,
+        tokens ? kv("Tokens", tokens) : null,
+        a.last_error ? kv("Last error", reasonText(a.last_error.reason) + " · " + rel(a.last_error.at)) : null),
+      h("div", { class: "usage" },
+        h("div", { class: "usage-title" }, "Usage",
+          check || fresh ? h("span", { class: "usage-fresh" + (check && !check.ok ? " warn-text" : ""),
+            text: [check ? usageCheckText(a) : null, fresh || null].filter(Boolean).join(" · ") }) : null),
+        windows),
       manage ? h("div", { class: "card-actions" },
         h("button", { type: "button", class: dead ? "small" : "small ghost", onclick: () => relogin.start([a.id]) }, "Re-login"),
         a.status === "billing" ? h("button", { type: "button", class: "small ghost", onclick: () => recheck(a.id) }, "Recheck billing") : null,
