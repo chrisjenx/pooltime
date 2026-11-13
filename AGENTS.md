@@ -43,7 +43,8 @@ CI (`.github/workflows/ci.yml`) runs fmt, clippy, test and the docs check on mac
 See [docs/architecture.md](docs/architecture.md) for the module map and request flow. In short:
 
 - `src/cli/`: one file per command; thin clients of the management API (`cli/client.rs`).
-- `src/server/`: axum daemon: `/v1/messages` (`inference`, `fallback`, `classifier`), `/v1/models`,
+- `src/server/`: axum daemon: `/v1/messages` (`inference`, `fallback`, `classifier`),
+  `/v1/messages/count_tokens` (`count_tokens`), `/v1/models`,
   `/health`, `/api/v1/*` (`mgmt`, `journal_api`, `analytics_api`), dashboard, drain.
 - `src/providers/`: the `Provider` trait; `anthropic/` passthrough, `openai/` Codex translation.
 - `src/signin/`: OAuth PKCE flows (callback and paste-code).

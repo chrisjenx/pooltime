@@ -9,6 +9,7 @@
 pub mod analytics_api;
 pub mod auth;
 pub mod classifier;
+pub mod count_tokens;
 pub mod daemon;
 pub mod dashboard;
 pub mod fallback;

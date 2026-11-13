@@ -34,6 +34,11 @@ first: they are the deliberate differences the checklist refers to.
 - **bro's `/models` alias is dropped** (ledger Ruling T23): only OpenAI-style clients used it, via
   the dropped `/v1/chat/completions` (INV §9). Unknown paths get an Anthropic-shaped 404 that is
   logged (`unknown_path_anthropic_404_logged`).
+- **`POST /v1/messages/count_tokens` is served** (new; bro answered 404 and Claude Code fell back
+  to its own estimate). Claude models are forwarded to Anthropic with a pooled account like
+  `/v1/messages` but without sticky sessions, served-attempt accounting or journal attempts;
+  Codex-served models get a local `ceil(bytes / 4)` estimate (`x-pool-estimate: 1`). See
+  [architecture](architecture.md#post-v1messagescount_tokens). Tests: `count_tokens::*`.
 
 ## Checklist
 

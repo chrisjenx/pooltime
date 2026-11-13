@@ -127,6 +127,25 @@ pub trait Provider: Send + Sync {
         req: &InboundRequest,
         state: &StateBook,
     ) -> AttemptOutcome;
+    /// One `POST /v1/messages/count_tokens` attempt on `ctx.account`. Not an inference attempt:
+    /// implementations must not record a success, token usage or a served request on the
+    /// account. Providers without such an upstream endpoint answer 404 (the server never routes
+    /// a count there; it estimates locally instead).
+    async fn count_tokens(
+        &self,
+        _ctx: AttemptCtx<'_>,
+        _req: &InboundRequest,
+        _state: &StateBook,
+    ) -> AttemptOutcome {
+        AttemptOutcome::Terminal(
+            crate::providers::anthropic::anthropic_error(
+                404,
+                "not_found_error",
+                "pooltime: this provider has no token-counting endpoint",
+            ),
+            FailReason::Status(404),
+        )
+    }
     async fn poll_usage(&self, acct: &AccountMeta) -> Result<RateLimitSnapshot, UsageError>;
     async fn catalog(&self, acct: &AccountMeta) -> anyhow::Result<Vec<RouteDef>>;
     /// Live `/v1/models` rows for this provider's own listing (Anthropic: its upstream catalog,

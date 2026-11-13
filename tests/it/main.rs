@@ -17,6 +17,7 @@ mod cli;
 mod codex_discovery;
 mod codex_translate_req;
 mod codex_translate_stream;
+mod count_tokens;
 mod docs;
 mod import_bro;
 mod journal;
