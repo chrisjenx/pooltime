@@ -6,6 +6,8 @@ configurable and not hard-code an assumption.
 
 Nothing in this document is a token, secret or credential. The OAuth `client_id` is a public client identifier, and the
 S2 fingerprints are truncated hashes of refresh tokens (16 hex chars of SHA-256), not tokens.
+Account names (`acct-a` ...) and fingerprints (`fp-a-1` ...) are placeholders; the same placeholder always
+stands for the same real account or value within this document.
 
 ---
 
@@ -252,21 +254,21 @@ account sets disjoint (spec §16 already requires disjointness; this spike only 
   - mtime advanced and fingerprint identical → **no rotation** (bro rewrites the file with `refresh_token ?? current` on every
     refresh: `pool/src/upstream/oauth-token.ts`, `mgr.updateOAuthCreds`, so an advanced mtime proves a write happened).
   - mtime not advanced → no information for that account (compare only accounts whose mtime advanced). The accounts whose
-    mtime is old (`haynet-chris` 2026-11-01, `haynet-christopherjenkins` 2026-10-25) look dormant or dead and are not
+    mtime is old (`acct-a` 2026-11-01, `acct-d` 2026-10-25) look dormant or dead and are not
     usable as evidence.
 
 ### Baseline (captured 2026-11-07T17:15:14 local)
 
 | account | sha256(refreshToken)[:16] | credentials mtime (local) |
 |---|---|---|
-| haynet-chris | `9335cde77db2558b` | 2026-11-01T05:40:27 |
-| haynet-chrisjenkins | `3160d89a7053e60d` | 2026-11-07T12:31:22 |
-| haynet-chrisjenx | `de34fccdda07f426` | 2026-11-07T12:32:23 |
-| haynet-christopherjenkins | `8fcd58f8807b29e2` | 2026-10-25T16:01:37 |
-| haynet-cjenkins | `9c8846b7c12026da` | 2026-11-07T12:36:23 |
-| haynet-cjenks | `530cd163797226fe` | 2026-11-07T12:39:23 |
-| personal-adbrchfam | `2b8807966162f032` | 2026-11-07T11:25:24 |
-| personal-chrismarkjenkins | `cf878cf68b0d4c04` | 2026-11-07T12:27:23 |
+| acct-a | `fp-a-1` | 2026-11-01T05:40:27 |
+| acct-b | `fp-b-1` | 2026-11-07T12:31:22 |
+| acct-c | `fp-c-1` | 2026-11-07T12:32:23 |
+| acct-d | `fp-d-1` | 2026-10-25T16:01:37 |
+| acct-e | `fp-e-1` | 2026-11-07T12:36:23 |
+| acct-f | `fp-f-1` | 2026-11-07T12:39:23 |
+| acct-g | `fp-g-1` | 2026-11-07T11:25:24 |
+| acct-h | `fp-h-1` | 2026-11-07T12:27:23 |
 
 Observation: six accounts were rewritten between 11:25 and 12:39 today (11:25, 12:27, 12:31, 12:32, 12:36, 12:39),
 consistent with bro refreshing each account when its access token neared expiry; their next refresh should land roughly one
@@ -298,14 +300,14 @@ refresh anything by hand).
 
 | account | sha256(refreshToken)[:16] | credentials mtime (local) | vs baseline |
 |---|---|---|---|
-| haynet-chris | `9335cde77db2558b` | 2026-11-01T05:40:27 | unchanged (dormant, no evidence) |
-| haynet-chrisjenkins | `d41f484aaceb7700` | 2026-11-07T20:26:23 | **rotated** |
-| haynet-chrisjenx | `de34fccdda07f426` | 2026-11-07T12:32:23 | unchanged (not refreshed since baseline) |
-| haynet-christopherjenkins | `8fcd58f8807b29e2` | 2026-10-25T16:01:37 | unchanged (dormant, no evidence) |
-| haynet-cjenkins | `b9afd551c9125240` | 2026-11-07T20:31:24 | **rotated** |
-| haynet-cjenks | `f00f5521c1182d8e` | 2026-11-07T20:35:27 | **rotated** |
-| personal-adbrchfam | `befa1e186b847b82` | 2026-11-07T19:22:27 | **rotated** |
-| personal-chrismarkjenkins | `e3288752f6b42f7c` | 2026-11-07T20:23:27 | **rotated** |
+| acct-a | `fp-a-1` | 2026-11-01T05:40:27 | unchanged (dormant, no evidence) |
+| acct-b | `fp-b-2` | 2026-11-07T20:26:23 | **rotated** |
+| acct-c | `fp-c-1` | 2026-11-07T12:32:23 | unchanged (not refreshed since baseline) |
+| acct-d | `fp-d-1` | 2026-10-25T16:01:37 | unchanged (dormant, no evidence) |
+| acct-e | `fp-e-2` | 2026-11-07T20:31:24 | **rotated** |
+| acct-f | `fp-f-2` | 2026-11-07T20:35:27 | **rotated** |
+| acct-g | `fp-g-2` | 2026-11-07T19:22:27 | **rotated** |
+| acct-h | `fp-h-2` | 2026-11-07T20:23:27 | **rotated** |
 
 Every account whose mtime advanced (5 of 5) has a new fingerprint; no account was rewritten with the same token. The
 writes landed ~7h56m–7h58m after the previous ones (an ~8 h access-token lifetime, refreshed on use). Refresh tokens are
