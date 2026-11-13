@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.1 - 2026-11-13
+
+### Fixed
+
+- Claude Code's connectivity probe (`HEAD /api/hello`) gets an empty 200 instead of a 404, so it
+  no longer adds "unknown endpoint" lines to the log and error rows to the request journal.
+
 ## 1.1.0 - 2026-11-13
 
 ### Changed
