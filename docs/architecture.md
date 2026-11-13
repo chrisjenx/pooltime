@@ -7,6 +7,7 @@ One Rust binary. `pooltime serve` is a tokio/axum daemon on `127.0.0.1:3460` tha
 | `POST /v1/messages` | Anthropic Messages API (what Claude Code calls); the proxy key is optional in config, but `connect` generates one and the running daemon enforces it at once |
 | `POST /v1/messages/count_tokens` | token counting: forwarded to Anthropic with a pooled account for Claude models, a local estimate for Codex-served models (see below); same Host/Origin guard and proxy key as `/v1/messages` |
 | `GET /v1/models` | the model list Claude Code sees |
+| `GET`/`HEAD /api/hello` | Claude Code's connectivity probe: an empty 200, not logged or journaled as an unknown endpoint |
 | `GET /health` | identity check (so nobody trusts or kills a foreign listener) |
 | `/api/v1/*` | management API: the one layer the dashboard, CLI and MCP all call |
 | `GET /` | embedded dashboard (`web/`, compiled in) |
