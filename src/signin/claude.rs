@@ -21,8 +21,8 @@ use tokio::time::Instant;
 use super::callback::{self, page_html, CallbackEvent, Handler};
 use super::pkce::{random_token, state_eq, Pkce};
 use super::{
-    parse_pasted, FlowControl, PendingSignIn, SignInFlow, SignInMode, SignInResult, SubmitError,
-    FLOW_TTL,
+    parse_submission, FlowControl, PendingSignIn, SignInFlow, SignInMode, SignInResult,
+    SubmitError, FLOW_TTL,
 };
 use crate::accounts::{
     fetch_profile, verify, AccountId, Credentials, Identity, Registry, StateBook, Verify,
@@ -579,7 +579,7 @@ struct Ctl(Arc<Flow>);
 
 impl FlowControl for Ctl {
     fn submit_code(&self, pasted: &str) -> Result<(), SubmitError> {
-        let (code, state) = parse_pasted(pasted).ok_or(SubmitError::Malformed)?;
+        let (code, state) = parse_submission(pasted)?;
         if !state_eq(&state, &self.0.oauth_state) {
             return Err(SubmitError::StateMismatch);
         }
@@ -1125,6 +1125,11 @@ mod tests {
                 "{bad:?}"
             );
         }
+        // Claude's emailed verification code goes in the sign-in tab, not here.
+        assert_eq!(
+            p.submit_code(" 123456 ").unwrap_err(),
+            SubmitError::EmailVerificationCode
+        );
         // A wrong state is refused without spending the flow.
         assert_eq!(
             p.submit_code("c#wrong").unwrap_err(),

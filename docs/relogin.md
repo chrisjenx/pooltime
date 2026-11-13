@@ -83,3 +83,14 @@ used. The [status line](profiles.md#status-line) shows the same counts:
 - At or after the recorded expiry pooltime makes one probe refresh. Only a refusal
   (`invalid_grant`, refresh token expired or reused) moves the account to `needs_login`; a network
   or 5xx failure shows `erroring` and is retried.
+
+## Troubleshooting
+
+**"That looks like Claude's email verification code."** While signing in, claude.ai can email a
+magic link. If the link opens in a different tab from the one you started in, Claude shows a short
+numeric "verification code" and asks you to enter it where you first tried to sign in. That code
+belongs in the Claude sign-in tab (the one where you entered your email), not in pooltime's paste
+box or at the `Code:` prompt. Type it there; pooltime finishes on its own after you approve access.
+The paste box only wants the `code#state` line from the manual redirect page, or a full redirect
+URL. The same message appears in the dashboard, `pooltime accounts login --mode paste` and over the
+API.

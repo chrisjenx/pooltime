@@ -65,6 +65,12 @@ pub enum SignInResult {
 pub enum SubmitError {
     #[error("expected the pasted line to look like <code>#<state>")]
     Malformed,
+    #[error(
+        "That looks like Claude's email verification code. Type it into the Claude sign-in tab \
+         (the one where you entered your email), not here. pooltime finishes on its own after you \
+         approve access."
+    )]
+    EmailVerificationCode,
     #[error("the pasted code belongs to a different sign-in (state mismatch)")]
     StateMismatch,
     #[error("this sign-in already received its code or has expired")]
@@ -193,9 +199,84 @@ pub(crate) fn parse_pasted(raw: &str) -> Option<(String, String)> {
     (!code.is_empty() && !state.is_empty()).then(|| (code.to_owned(), state.to_owned()))
 }
 
+/// [`parse_pasted`] for `submit_code`: distinguishes the 4-8 digit verification code Claude shows
+/// when a magic link is opened in another tab (it belongs in that tab, not here) from other
+/// unparseable input.
+pub(crate) fn parse_submission(raw: &str) -> Result<(String, String), SubmitError> {
+    if let Some(parsed) = parse_pasted(raw) {
+        return Ok(parsed);
+    }
+    let digits = raw
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    let only_digits_and_space = raw.chars().all(|c| c.is_ascii_digit() || c.is_whitespace());
+    if only_digits_and_space && (4..=8).contains(&digits.len()) {
+        return Err(SubmitError::EmailVerificationCode);
+    }
+    Err(SubmitError::Malformed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn email_verification_codes_get_their_own_hint() {
+        for digits in [
+            "123456",
+            "  123456\n",
+            "123 456",
+            "1234",
+            "12345678",
+            "12 34 56",
+        ] {
+            assert_eq!(
+                parse_submission(digits).unwrap_err(),
+                SubmitError::EmailVerificationCode,
+                "{digits:?}"
+            );
+        }
+        let msg = SubmitError::EmailVerificationCode.to_string();
+        assert!(msg.starts_with("That looks like Claude's email verification code."));
+        assert!(msg.contains("not here"));
+        assert!(msg.ends_with("after you approve access."));
+    }
+
+    #[test]
+    fn real_submissions_still_parse_and_other_junk_stays_malformed() {
+        assert_eq!(
+            parse_submission(" abc#def ").unwrap(),
+            ("abc".to_owned(), "def".to_owned())
+        );
+        assert_eq!(
+            parse_submission("https://platform.claude.com/oauth/code/callback?code=abc&state=def")
+                .unwrap(),
+            ("abc".to_owned(), "def".to_owned())
+        );
+        // All digits, but a real code#state is not mistaken for a verification code.
+        assert_eq!(
+            parse_submission("123456#state").unwrap(),
+            ("123456".to_owned(), "state".to_owned())
+        );
+        for junk in [
+            "",
+            "abc",
+            "#def",
+            "abc#",
+            "123",
+            "123456789",
+            "12a456",
+            "12-34-56",
+            "http://x/y",
+        ] {
+            assert_eq!(
+                parse_submission(junk).unwrap_err(),
+                SubmitError::Malformed,
+                "{junk:?}"
+            );
+        }
+    }
 
     #[test]
     fn parses_code_hash_state_and_redirect_urls() {
