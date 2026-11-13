@@ -1,8 +1,11 @@
 # frozen_string_literal: true
 
-# Homebrew formula for pooltime; the published copy lives in chrisjenx/homebrew-tap (Formula/pooltime.rb).
-# Installs the prebuilt release binary (the version is read from the URLs). After a release, run
-# `packaging/homebrew/update-formula.sh <version>` to fill in the URLs and sha256s.
+# TEMPLATE for the Homebrew formula. The published formula, and the source of truth for what
+# `brew install` gets, is Formula/pooltime.rb in chrisjenx/homebrew-tap; the release workflow
+# (.github/workflows/release.yml, job "tap") rewrites it there with update-formula.sh after every
+# release, so the URLs and sha256s in this copy are not kept current. Change the formula's shape
+# (desc, test, install) here, then copy that change to the tap.
+# The prebuilt release binary is installed; the version is read from the URLs.
 class Pooltime < Formula
   desc "Pool Claude Max and ChatGPT/Codex accounts behind one local endpoint"
   homepage "https://github.com/chrisjenx/pooltime"
