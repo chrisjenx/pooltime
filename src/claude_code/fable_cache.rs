@@ -12,8 +12,11 @@
 use serde_json::{Map, Value};
 
 use super::pins::{newest_fable, Newest};
-use super::{patch_json, Profile};
+use super::{patch_json_keys, Profile};
 use crate::fsutil::WriteOutcome;
+
+/// The `.claude.json` key holding the cached picker rows; the only one this module parses.
+pub(super) const CACHE_KEY: &str = "additionalModelOptionsCache";
 
 /// Rewrite the stale `claude-fable-*` rows in `p`'s `.claude.json` to the newest
 /// Fable in `catalog`, through the guarded writer (`.claude.json` is rewritten
@@ -24,12 +27,14 @@ pub fn rewrite_fable_rows(p: &Profile, catalog: &[Value]) -> anyhow::Result<Writ
     let Some(fable) = newest_fable(catalog) else {
         return Ok(WriteOutcome::Unchanged);
     };
-    patch_json(&p.claude_json, |obj| refresh_rows(obj, &fable))
+    patch_json_keys(&p.claude_json, 0o600, &[CACHE_KEY], |obj| {
+        refresh_rows(obj, &fable)
+    })
 }
 
 /// Rewrite stale Fable rows of a parsed `.claude.json`; whether anything changed.
 pub(super) fn refresh_rows(obj: &mut Map<String, Value>, fable: &Newest) -> bool {
-    let Some(Value::Array(rows)) = obj.get_mut("additionalModelOptionsCache") else {
+    let Some(Value::Array(rows)) = obj.get_mut(CACHE_KEY) else {
         return false;
     };
     let mut changed = false;

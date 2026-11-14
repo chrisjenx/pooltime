@@ -26,11 +26,13 @@ use rand::RngExt;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
-use super::fable_cache::refresh_rows;
+use super::fable_cache::{refresh_rows, CACHE_KEY};
+use super::mcp::{NEW_FILE_MODE, SERVERS_KEY};
 use super::pins::{derive_pins, max_context, newest_fable};
+use super::safe_write::read_top_key;
 use super::scrub::{context_is_managed, CONTEXT_KEY};
 use super::statusline::{install as install_statusline, restore as restore_statusline};
-use super::{apply, clear, is_connected, patch_json, EnvBlock, Pin, Pins, Profile};
+use super::{apply, clear, is_connected, patch_json_keys, EnvBlock, Pin, Pins, Profile};
 use crate::config::{Config, Paths, ProfileRef};
 use crate::fsutil::WriteOutcome;
 use crate::providers::ProviderId;
@@ -175,14 +177,10 @@ fn first_no_key_warning(id: &str) -> bool {
 /// all present; the context value only when a marker proves it is ours. An
 /// unreadable settings file preserves nothing (and `apply` will report it).
 fn current_pins(p: &Profile) -> (Pins, Option<u32>) {
-    let env = std::fs::read(&p.settings_json)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|v| match v.get("env") {
-            Some(Value::Object(m)) => Some(m.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
+    let env = match read_top_key(&p.settings_json, "env") {
+        Some(Value::Object(m)) => m,
+        _ => Default::default(),
+    };
     let pin = |family: &str| {
         let base = format!("ANTHROPIC_DEFAULT_{family}_MODEL");
         let get = |k: String| env.get(&k)?.as_str().map(str::to_string);
@@ -254,7 +252,8 @@ fn sync_profile(
     if patch_memo_hit(&p.claude_json, &inputs) {
         return Ok(env);
     }
-    let cached = patch_json(&p.claude_json, |obj| {
+    let keys = [CACHE_KEY, SERVERS_KEY];
+    let cached = patch_json_keys(&p.claude_json, NEW_FILE_MODE, &keys, |obj| {
         let rows = fable.as_ref().is_some_and(|f| refresh_rows(obj, f));
         let entry = mcp.is_some_and(|(url, token)| super::mcp::refresh_entry(obj, url, token));
         rows || entry

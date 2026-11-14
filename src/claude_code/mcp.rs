@@ -12,7 +12,7 @@ use anyhow::anyhow;
 use serde_json::{json, Map, Value};
 
 use super::snapshot::{self, SnapshotState};
-use super::{patch_json, patch_json_mode, Profile};
+use super::{patch_json_keys, Profile};
 use crate::config::Paths;
 use crate::fsutil::WriteOutcome;
 
@@ -20,7 +20,10 @@ use crate::fsutil::WriteOutcome;
 pub const MCP_SERVER_NAME: &str = "pooltime";
 
 /// Mode of a `.claude.json` we create (it holds the MCP token).
-const NEW_FILE_MODE: u32 = 0o600;
+pub(super) const NEW_FILE_MODE: u32 = 0o600;
+
+/// The `.claude.json` key holding the MCP servers; the only one this module parses.
+pub(super) const SERVERS_KEY: &str = "mcpServers";
 
 /// The entry Claude Code's http transport reads.
 pub fn mcp_entry(url: &str, token: &str) -> Value {
@@ -37,14 +40,14 @@ pub fn mcp_entry(url: &str, token: &str) -> Value {
 fn put_entry(obj: &mut Map<String, Value>, entry: &Value, only_if_present: bool) -> Option<bool> {
     if only_if_present
         && obj
-            .get("mcpServers")
+            .get(SERVERS_KEY)
             .and_then(|s| s.get(MCP_SERVER_NAME))
             .is_none()
     {
         return Some(false);
     }
     let Value::Object(servers) = obj
-        .entry("mcpServers")
+        .entry(SERVERS_KEY)
         .or_insert_with(|| Value::Object(Map::new()))
     else {
         return None;
@@ -92,7 +95,7 @@ pub fn register(
 ) -> anyhow::Result<WriteOutcome> {
     let entry = mcp_entry(url, token);
     let mut foreign = false;
-    let out = patch_json_mode(&p.claude_json, NEW_FILE_MODE, |obj| {
+    let out = patch_json_keys(&p.claude_json, NEW_FILE_MODE, &[SERVERS_KEY], |obj| {
         let r = put_entry(obj, &entry, false);
         foreign = r.is_none();
         r == Some(true)
@@ -112,8 +115,8 @@ pub fn register(
 /// Remove `mcpServers.pooltime` and nothing else (absent, or no file = `Unchanged`), and clear
 /// the snapshot mark.
 pub fn unregister(paths: &Paths, p: &Profile) -> anyhow::Result<WriteOutcome> {
-    let out = patch_json(&p.claude_json, |obj| {
-        obj.get_mut("mcpServers")
+    let out = patch_json_keys(&p.claude_json, NEW_FILE_MODE, &[SERVERS_KEY], |obj| {
+        obj.get_mut(SERVERS_KEY)
             .and_then(Value::as_object_mut)
             .and_then(|s| s.shift_remove(MCP_SERVER_NAME))
             .is_some()

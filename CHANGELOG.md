@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Profile sync no longer loads a connected profile's whole `.claude.json` into memory. It parses
+  only the two keys pooltime owns there (`mcpServers` and `additionalModelOptionsCache`) and
+  writes every other value back as its exact original bytes, so the idle memory of a pool with a
+  connected profile no longer grows with the size of that file, and nothing pooltime does not own
+  is ever reformatted. The settings `env` checks read only `env` from `settings.json`.
+
 ## 1.1.1 - 2026-11-13
 
 ### Fixed

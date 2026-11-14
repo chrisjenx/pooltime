@@ -37,6 +37,33 @@ cargo run -p harness -- bench --bro <bro-cli checkout> --pooltime target/release
 - bro has no equivalent of a connected profile, so it gets only the accounts and polling.
 - The cold starts use the same 3-account, polling-on setup (no profile).
 
+## Key-scoped `.claude.json` patching (2026-11-14)
+
+Profile sync used to parse a connected profile's whole `.claude.json` into a `serde_json::Value`
+and re-serialize all of it. It now parses only the two keys pooltime owns (`mcpServers`,
+`additionalModelOptionsCache`) and copies every other top-level value through as its raw bytes
+(`perf/claude-json-rawvalue`, on top of `e22d29d`). Two `--realistic --only pooltime` runs, back to
+back on the same machine as below (macOS 26.7.3), same harness build, release binaries of
+`e22d29d` (before) and of the change (after):
+
+```sh
+cargo run -p harness -- bench --bro <bro-cli checkout> --pooltime <binary> --realistic --only pooltime
+```
+
+| Metric | before (`e22d29d`) | after |
+|---|---|---|
+| RSS right after boot | 19.5 MiB | 19.4 MiB |
+| Idle RSS at 60 s (after connect + first sync) | 52.1 MiB | **30.8 MiB** |
+| Idle RSS at 120–360 s | 46.8–46.9 MiB | **25.4–25.5 MiB** |
+| Peak idle RSS (5 s samples) | 52.3 MiB | **31.0 MiB** |
+| RSS under 50 concurrent streams (peak) | 53.8 MiB | **34.0 MiB** |
+
+The connected 5.5 MiB profile used to cost about 27 MiB of steady idle RSS. It now costs about
+6 MiB. That remainder is most likely allocator retention from the transient read and write buffers (one copy
+of the file each) and the three accounts' polling. It does not scale with the parsed tree any more.
+The cold-start and TTFB rows of these two runs are left out: they moved with machine load between
+the runs, and the change does not touch those paths.
+
 ## v1.0.0 results
 
 Measured on 2026-11-08 with the v1.0.0 release build: commit `243fa5c` plus the version bump in the

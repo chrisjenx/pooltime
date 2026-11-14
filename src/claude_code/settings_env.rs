@@ -14,6 +14,7 @@ use std::path::Path;
 use anyhow::{anyhow, Context};
 use serde_json::{Map, Value};
 
+use super::safe_write::read_top_key;
 use super::scrub::{
     context_is_managed, is_pin_value, own_pin_keys, AUTO_COMPACT_KEY, BRO_MARKER_KEY, CONTEXT_KEY,
     MARKER_KEY,
@@ -343,12 +344,8 @@ pub fn is_connected(p: &Profile, snaps: &Paths) -> bool {
     if !managed {
         return false;
     }
-    let Ok(bytes) = std::fs::read(&p.settings_json) else {
-        return false;
-    };
-    serde_json::from_slice::<Value>(&bytes)
-        .ok()
-        .and_then(|v| v.get("env")?.get(BASE_URL_KEY).cloned())
+    read_top_key(&p.settings_json, "env")
+        .and_then(|env| env.get(BASE_URL_KEY).cloned())
         .is_some_and(|v| !v.is_null())
 }
 
