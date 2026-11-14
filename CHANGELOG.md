@@ -27,6 +27,20 @@
 - The Routing view's help for **Minimum headroom** now says 5-hour headroom (it said 7-day; the
   setting has always applied to the 5-hour window).
 
+### Fixed
+
+- Linux: `pooltime service restart` and `systemctl --user reload pooltime` no longer need
+  `/bin/kill` (missing on NixOS): the unit's `ExecReload` runs pooltime itself
+  (hidden `<bin> service signal-reload $MAINPID`). A unit written by 1.1.x is updated in place on
+  the next `service restart`, without restarting the service (a hand-edited, symlinked or
+  read-only unit is left as it is, with a warning, and the reload still goes ahead). CI now runs
+  install, restart under load and uninstall against a real systemd user manager.
+- A seamless restart no longer waits for blocking work a request started (a profile sync from
+  `connect`, a model refresh): the old generation waits only for its own background tasks' work.
+- A seamless restart can no longer leave stale account state behind: if the old generation's
+  release runs out of time while its database queue is still flushing, the account-state rows
+  still queued are dropped instead of landing after the new generation has loaded its state.
+
 ## 1.1.1 - 2026-11-13
 
 ### Fixed

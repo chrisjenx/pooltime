@@ -39,6 +39,16 @@ process, which launchd kills (process group) and systemd kills (cgroup). Rejecte
 
 ## Design
 
+- **Linux reload.** The unit's `ExecReload` is `<bin> service signal-reload $MAINPID` (a hidden
+  subcommand that sends `SIGHUP`), not `/bin/kill -HUP $MAINPID`: NixOS and other systems
+  without a merged `/usr` have no `/bin/kill`, and a bare `kill` would need a shell on `PATH`;
+  the pooltime binary is always at the path the unit already names. `service restart` still
+  goes through `systemctl --user reload`, so systemd sees the reload, and plain `systemctl
+  --user reload pooltime` works the same. A unit from 1.1.x gets the new line on its next
+  `service restart` (rewritten in place plus `daemon-reload`; the service keeps running), but
+  only if its one `ExecReload=` line is exactly the 1.1.x one and the unit is a regular file:
+  a hand-edited or symlinked unit is left alone, and a failed rewrite (read-only unit dir) is
+  a warning, never a failed reload.
 - **Control channel.** Each worker gets a `socketpair` end (fd inherited, `FD_CLOEXEC` set again
   in the worker) and the listener fd (hidden `serve --listen-fd N --control-fd M`). Line protocol:
   worker → `ready <version>`, `released`; supervisor → `active`, `handoff`, `stop`, `force`.
@@ -50,8 +60,9 @@ process, which launchd kills (process group) and systemd kills (cgroup). Rejecte
   catalog, profile sync, health tick, alerts, status cache, sampler, session and retention prune)
   only on `active`. On `handoff` the old worker aborts them, waits for the blocking work they
   started (profile writes, status-cache write, sampling round, notifications), stops the status
-  cache *without* deleting it, stops persisting `account_state` rows (its in-flight requests keep
-  updating its memory only) and flushes its queued database writes; then it answers `released`
+  cache *without* deleting it, flushes its queued database writes and stops persisting
+  `account_state` rows (its in-flight requests keep updating its memory only; rows still queued
+  then are dropped, see known limits); then it answers `released`
   (all of this bounded by 5 s). Only then does the supervisor send `active` to the new one (after
   at most 10 s, even if the old one never answers); the new one first reloads account state from
   the database, so it sees the rate limits, dead-token markers and billing blocks the old one
@@ -87,11 +98,16 @@ process, which launchd kills (process group) and systemd kills (cgroup). Rejecte
 no providers, no HTTP) so it rarely needs to change. Picking up a new supervisor needs a full
 restart: `pooltime service install`. The worker protocol must stay backward compatible.
 
-**Known limits.** The wait for background blocking work counts every tracked blocking job in
-the process, so a profile sync started by a request (`connect`) also delays `released`; the
-whole release is bounded at 5 s either way. If that bound runs out while the old generation is
-still flushing its queue, a few `account_state` rows it queued may land after the new generation
-reloaded; the new one overwrites them on its next change of those accounts. If the supervisor is
+**Known limits.** The release waits only for the blocking work its own background tasks
+started: they run in a scope (`background::Work`) that their blocking jobs count against, so a
+profile sync or model refresh started by a request is not waited for (it may still write its
+profile files during the overlap, as any request could before). The whole release is bounded at
+5 s. If that bound runs out while the old generation is still flushing its queue, the
+`account_state` rows still queued are dropped: every row write takes SQLite's write lock, then
+checks the book's `persisting` flag and holds that flag's lock through its commit, so once
+`stop_persisting()` returns a row is either committed (before `released`, so before the new
+generation's reload) or never will be. What the old generation learned in those rows is lost to
+the new one, which learns it again from the next upstream answer. If the supervisor is
 killed, an orphaned worker counts `SIGTERM`s from the moment it notices: the first changes
 nothing (it already drains), the second forces exit. Service-manager commands (`launchctl`,
 `systemctl`) run in their own process group, so a Ctrl-C during the one-time reinstall reaches

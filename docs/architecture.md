@@ -91,12 +91,15 @@ anonymous `socketpair` (no filesystem path, nothing another user can connect to)
 line each: worker `ready <version>` / `released`, supervisor `active` / `handoff` / `stop` /
 `force`. Workers ignore OS signals while the socket is open.
 
-1. `service restart` sends the supervisor `SIGHUP` (`launchctl kill SIGHUP`, `systemctl reload`).
+1. `service restart` sends the supervisor `SIGHUP` (`launchctl kill SIGHUP`; `systemctl reload`,
+   whose `ExecReload` runs the binary itself: `<bin> service signal-reload $MAINPID`, a hidden
+   subcommand).
 2. It starts a new worker from the configured binary path (the Homebrew symlink, so upgrades take
    effect). The worker skips the "already running" preflight and serves at once.
 3. On `ready`, the old worker gets `handoff`: it stops accepting, closes its copy of the socket
    (queued connections stay in the shared backlog), stops its background tasks and waits for
-   their blocking work, stops persisting account state, flushes its database queue, answers
+   their blocking work (not a request's), flushes its database queue, stops persisting account
+   state (rows still queued then are dropped, never committed later), answers
    `released`, serves its open connections for a 2 s grace and drains.
 4. On `released` (or after 10 s) the new worker gets `active`: it reloads account state from the
    database and starts the background tasks.

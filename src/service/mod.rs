@@ -404,6 +404,21 @@ impl Backend {
     }
 }
 
+/// Send the supervisor `pid` its restart signal (`SIGHUP`). systemd's `ExecReload` runs this
+/// with `$MAINPID` (`pooltime service signal-reload`), so a reload needs no `/bin/kill`.
+pub fn signal_reload(pid: u32) -> anyhow::Result<()> {
+    let pid = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|p| *p > 1)
+        .ok_or_else(|| anyhow!("not a supervisor pid: {pid}"))?;
+    // SAFETY: kill has no memory preconditions; `pid` is a single positive process id.
+    if unsafe { libc::kill(pid, libc::SIGHUP) } != 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("signalling the pooltime supervisor (pid {pid})"));
+    }
+    Ok(())
+}
+
 /// A definition written before seamless restarts runs plain `serve`.
 pub fn definition_is_supervised(definition: &str) -> bool {
     definition.contains("--supervise")

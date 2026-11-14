@@ -176,7 +176,7 @@ pub fn spawn_sampler(
     state: Arc<StateBook>,
     store: Arc<Store>,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::background::spawn(async move {
         let mut changes = state.changes();
         let mut sampler = seeded(&store).await;
         loop {

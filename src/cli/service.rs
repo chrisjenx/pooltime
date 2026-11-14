@@ -22,9 +22,19 @@ pub enum ServiceCmd {
     /// Restart the daemon without closing the port: a new worker (the installed binary) takes
     /// new requests while the old one finishes its in-flight ones.
     Restart,
+    /// systemd's `ExecReload`: send the supervisor (`$MAINPID`) its restart signal.
+    #[command(hide = true)]
+    SignalReload {
+        /// The supervisor's pid.
+        pid: u32,
+    },
 }
 
 pub fn run(paths: &Paths, cmd: ServiceCmd) -> anyhow::Result<i32> {
+    if let ServiceCmd::SignalReload { pid } = cmd {
+        crate::service::signal_reload(pid)?;
+        return Ok(0);
+    }
     let backend = Backend::native()?;
     let env = Env::from_process(paths)?;
     run_with(backend, &env, &SystemRunner, cmd)
@@ -37,6 +47,10 @@ pub fn run_with(
     cmd: ServiceCmd,
 ) -> anyhow::Result<i32> {
     match cmd {
+        ServiceCmd::SignalReload { pid } => {
+            crate::service::signal_reload(pid)?;
+            Ok(0)
+        }
         ServiceCmd::Install => {
             backend.install(env, r)?;
             println!(

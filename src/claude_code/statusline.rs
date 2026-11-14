@@ -177,7 +177,7 @@ impl StatusCache {
 /// failed read is warned about once per failure streak (with its cause), the recovery logged.
 pub fn spawn_status_cache(app: Arc<AppState>) -> StatusCache {
     let (stop, mut stopped) = watch::channel(Stop::Running);
-    let task = tokio::spawn(async move {
+    let task = crate::background::spawn(async move {
         let path = cache_path(&app.paths);
         let mut changes = Some(app.state.changes());
         let mut beat = tokio::time::interval(HEARTBEAT);

@@ -261,7 +261,7 @@ pub fn dashboard_url(app: &AppState) -> String {
 
 /// Run alert evaluation for the daemon's lifetime (abort the handle to stop it).
 pub fn spawn_alerts(app: Arc<AppState>, notifier: Arc<dyn Notifier>) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::background::spawn(async move {
         let mut alerts = Alerts::new(
             app.store.clone(),
             notifier,

@@ -1107,3 +1107,50 @@ async fn a_handed_off_book_stops_persisting_and_the_next_one_reloads() {
     assert_eq!(fresh.status(&b, true, t(4)), AccountStatus::Ready);
     assert_eq!(f.book.status(&b, true, t(4)), AccountStatus::Billing);
 }
+
+/// The old generation's release ran out of time while its writer was still busy: a state row it
+/// queued before `stop_persisting` must not commit after the new generation reloaded, or the
+/// database would hold a row the active generation never saw.
+#[tokio::test]
+async fn writes_queued_before_stop_persisting_never_land_after_it() {
+    let f = fixture();
+    let a = id("a");
+    // The new generation is another process: its own store on the same database.
+    let new_store = Arc::new(Store::open(&f._dir.path().join("pooltime.db")).unwrap());
+    let new = StateBook::load_at(new_store, t(0)).unwrap();
+
+    // The old generation's writer is stuck (a slow flush).
+    let (unblock, blocked) = std::sync::mpsc::channel::<()>();
+    let (started_tx, started) = std::sync::mpsc::channel::<()>();
+    f.store
+        .submit(move |_| {
+            let _ = started_tx.send(());
+            let _ = blocked.recv();
+            Ok(())
+        })
+        .unwrap();
+    started.recv().unwrap();
+    // It learns a rate limit; the row is queued behind the stuck job.
+    f.book
+        .mark_rate_limited(&a, t(3600), Some("5h".into()), t(1));
+
+    // The release bound runs out: it stops persisting, the new generation reloads.
+    f.book.stop_persisting();
+    new.reload(t(2)).unwrap();
+    assert_eq!(new.status(&a, true, t(2)), AccountStatus::Ready);
+
+    // The old writer gets going again: the queued row must be dropped, not committed.
+    unblock.send(()).unwrap();
+    f.book.flush().await.unwrap();
+    let fresh = StateBook::load_at(f.store.clone(), t(3)).unwrap();
+    assert_eq!(
+        fresh.status(&a, true, t(3)),
+        AccountStatus::Ready,
+        "a row queued before stop_persisting landed after the new generation reloaded"
+    );
+    // The old generation still remembers it in memory.
+    assert!(matches!(
+        f.book.status(&a, true, t(3)),
+        AccountStatus::RateLimited { .. }
+    ));
+}

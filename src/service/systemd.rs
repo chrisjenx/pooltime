@@ -44,15 +44,16 @@ fn word(s: &str, exec: bool) -> String {
 
 /// The user unit for `bin serve --supervise`. `KillMode=mixed`: a stop sends `SIGTERM` to the
 /// supervisor only (it forwards it to its workers once, so they drain instead of reading a
-/// second signal as "force"); anything left at `TimeoutStopSec` is killed. `ExecReload` is the
-/// supervisor's restart signal. A Homebrew Cellar path is replaced by the stable
-/// `<prefix>/bin/pooltime` symlink.
+/// second signal as "force"); anything left at `TimeoutStopSec` is killed. `ExecReload` sends the
+/// supervisor its restart signal through pooltime itself ([`exec_reload`]). A Homebrew Cellar
+/// path is replaced by the stable `<prefix>/bin/pooltime` symlink.
 pub fn render_systemd_unit(bin: &Path, paths: &Paths) -> String {
     let bin = word(&stable_bin(bin).to_string_lossy(), true);
     let home = word(
         &format!("POOLTIME_HOME={}", paths.home.to_string_lossy()),
         false,
     );
+    let reload = exec_reload(&bin);
     format!(
         "[Unit]
 Description=pooltime: pooled Claude and Codex accounts behind one local endpoint
@@ -61,7 +62,7 @@ After=network.target
 [Service]
 Type=simple
 ExecStart={bin} serve --supervise
-ExecReload=/bin/kill -HUP $MAINPID
+{reload}
 KillMode=mixed
 Environment={home}
 Restart=on-failure
@@ -72,6 +73,102 @@ TimeoutStopSec=600
 WantedBy=default.target
 "
     )
+}
+
+/// The `ExecReload=` line for the unit-file word `bin` (as in `ExecStart=`): the hidden
+/// `pooltime service signal-reload $MAINPID`, which sends the supervisor `SIGHUP`. Not
+/// `/bin/kill -HUP $MAINPID`: there is no `/bin/kill` on NixOS and other distributions without
+/// a merged `/usr`, and `kill` on `PATH` would need a shell; the pooltime binary is always at
+/// the path the unit already names.
+fn exec_reload(bin: &str) -> String {
+    format!("ExecReload={bin} service signal-reload $MAINPID")
+}
+
+/// The `ExecReload=` line pooltime 1.1.x wrote.
+const OLD_EXEC_RELOAD: &str = "ExecReload=/bin/kill -HUP $MAINPID";
+
+/// What [`upgrade_exec_reload`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecReloadUpgrade {
+    /// Nothing to do: the line is current, or this is not a supervised unit pooltime wrote
+    /// (`service restart` reinstalls those).
+    Keep,
+    /// A 1.1.x unit: the same unit with the current `ExecReload=` line.
+    Rewrite(String),
+    /// `ExecReload=` was changed by hand (another command, or several lines): left alone.
+    Custom,
+}
+
+/// A unit from 1.1.x reloads with `/bin/kill`: give it the current `ExecReload=` line (derived
+/// from its own `ExecStart=`). Only a unit whose one `ExecReload=` line is exactly the 1.1.x one
+/// is rewritten.
+pub fn upgrade_exec_reload(unit: &str) -> ExecReloadUpgrade {
+    let Some(bin) = unit
+        .lines()
+        .find_map(|l| l.strip_prefix("ExecStart="))
+        .and_then(|s| s.strip_suffix(" serve --supervise"))
+    else {
+        return ExecReloadUpgrade::Keep;
+    };
+    let want = exec_reload(bin);
+    let reloads: Vec<&str> = unit
+        .lines()
+        .filter(|l| l.starts_with("ExecReload="))
+        .collect();
+    match reloads.as_slice() {
+        [one] if *one == want => ExecReloadUpgrade::Keep,
+        [one] if *one == OLD_EXEC_RELOAD => {
+            let mut out = String::with_capacity(unit.len() + want.len());
+            for line in unit.lines() {
+                out.push_str(if line == OLD_EXEC_RELOAD { &want } else { line });
+                out.push('\n');
+            }
+            ExecReloadUpgrade::Rewrite(out)
+        }
+        _ => ExecReloadUpgrade::Custom,
+    }
+}
+
+/// Give a 1.1.x unit the portable `ExecReload=` (see [`upgrade_exec_reload`]) and
+/// `daemon-reload`. Best effort: anything in the way (a symlinked or read-only unit, a hand-edited
+/// `ExecReload=`, a failed write) is a warning, and the reload goes ahead with the unit as it is.
+fn upgrade_unit_exec_reload(env: &Env, r: &dyn Runner) {
+    let path = unit_path(env);
+    let Ok(meta) = fs::symlink_metadata(&path) else {
+        return;
+    };
+    let Ok(unit) = fs::read_to_string(&path) else {
+        return;
+    };
+    let new = match upgrade_exec_reload(&unit) {
+        ExecReloadUpgrade::Keep => return,
+        ExecReloadUpgrade::Custom => {
+            eprintln!(
+                "warning: {} has a custom ExecReload= setting; left as it is (pooltime's own is \
+                 `<pooltime> service signal-reload $MAINPID`)",
+                path.display()
+            );
+            return;
+        }
+        ExecReloadUpgrade::Rewrite(new) => new,
+    };
+    if meta.file_type().is_symlink() {
+        eprintln!(
+            "warning: {} is a symlink (managed elsewhere?); not updating its ExecReload=, which \
+             needs /bin/kill. `pooltime service install` writes a current unit",
+            path.display()
+        );
+        return;
+    }
+    let done = atomic_write(&path, new.as_bytes(), 0o644)
+        .with_context(|| format!("writing {}", path.display()))
+        .and_then(|()| systemctl(r, &["daemon-reload"]));
+    if let Err(e) = done {
+        eprintln!(
+            "warning: could not update the unit's ExecReload= (it needs /bin/kill): {e:#}; \
+             reloading with the unit as it is"
+        );
+    }
 }
 
 fn systemctl(r: &dyn Runner, args: &[&str]) -> anyhow::Result<()> {
@@ -173,8 +270,12 @@ pub fn status(env: &Env, r: &dyn Runner) -> anyhow::Result<Status> {
     })
 }
 
-/// Ask the running supervisor for a new worker generation (`ExecReload`: `SIGHUP`).
-pub fn reload(_env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
+/// Ask the running supervisor for a new worker generation (`ExecReload`: `SIGHUP`). A unit
+/// still reloading through `/bin/kill` gets the portable `ExecReload=` first (the running
+/// service is not restarted for that: `daemon-reload` is enough). If that update cannot be made,
+/// the reload still goes ahead with the unit as it is (a warning says why).
+pub fn reload(env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
+    upgrade_unit_exec_reload(env, r);
     systemctl(r, &["reload", UNIT])
 }
 

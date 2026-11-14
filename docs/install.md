@@ -101,7 +101,7 @@ meanwhile). `pooltime service status` shows the supervisor and the worker genera
   `dev.pooltime.daemon`), loaded into your GUI session. It restarts the daemon if it exits.
 - **Linux**: a systemd user unit at `~/.config/systemd/user/pooltime.service` (honours
   `XDG_CONFIG_HOME`), `Restart=on-failure`, `TimeoutStopSec=600`, `KillMode=mixed` (a stop
-  reaches the supervisor, which stops its workers), `ExecReload` = the restart signal. A user unit stops when you log
+  reaches the supervisor, which stops its workers), `ExecReload` = the restart signal (sent by `pooltime` itself, so no `/bin/kill` is needed). A user unit stops when you log
   out; to keep it running (servers, SSH-only machines):
 
   ```sh

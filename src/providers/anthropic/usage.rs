@@ -334,7 +334,7 @@ impl AnthropicProvider {
 /// Accounts in `NeedsLogin` are skipped (nothing to poll with). Failures are recorded and logged
 /// by [`AnthropicProvider::poll_usage`]. Returns immediately if `usage_refresh` is off.
 pub fn spawn_usage_sweeper(provider: Arc<AnthropicProvider>, every: Duration) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::background::spawn(async move {
         if !provider.cfg.usage_refresh {
             return;
         }

@@ -442,8 +442,12 @@ pub struct StateBook {
     access_denied_cooldown: Duration,
     usage_window: Duration,
     /// Cleared by [`stop_persisting`](Self::stop_persisting) (a daemon generation that handed
-    /// off): memory still changes, `account_state` rows no longer do.
-    persisting: AtomicBool,
+    /// off): memory still changes, `account_state` rows no longer do. Checked again by every
+    /// queued row write at commit time, under this lock (see [`write_rows`](Self::write_rows)).
+    persisting: Arc<Mutex<bool>>,
+    /// The same flag without the lock, for the early-out on the request path (set under the
+    /// lock by [`stop_persisting`](Self::stop_persisting); the commit-time check is the lock's).
+    persisting_hint: AtomicBool,
 }
 
 /// Persisted rows as states; unreadable ones fail closed (`unverified`) and are returned with
@@ -510,7 +514,8 @@ impl StateBook {
             changed: watch::channel(0).0,
             access_denied_cooldown: DEFAULT_ACCESS_DENIED_COOLDOWN,
             usage_window: DEFAULT_USAGE_WINDOW,
-            persisting: AtomicBool::new(true),
+            persisting: Arc::new(Mutex::new(true)),
+            persisting_hint: AtomicBool::new(true),
         };
         for (id, raw) in quarantined {
             book.quarantine(&id, raw, now);
@@ -520,6 +525,8 @@ impl StateBook {
 
     /// Copy the unreadable raw row aside and overwrite it with the account's `unverified` state
     /// (one transaction on the writer thread), so a restart neither re-quarantines nor forgets.
+    /// Through the same `persisting` gate as every other `account_state` write. (It runs at load,
+    /// before anything could stop persisting, so the gate never drops it in practice.)
     fn quarantine(&self, id: &AccountId, raw: Option<String>, now: OffsetDateTime) {
         let state = AccountState {
             unverified: true,
@@ -530,8 +537,7 @@ impl StateBook {
             return;
         };
         let (account, ts) = (id.to_string(), now.unix_timestamp());
-        let queued = self.store.submit(move |c| {
-            let tx = c.transaction()?;
+        self.write_rows("quarantine", id, move |tx| {
             tx.execute(
                 "INSERT INTO account_state_quarantine(account, ts, json) VALUES (?1, ?2, ?3)",
                 rusqlite::params![account, ts, raw],
@@ -540,17 +546,53 @@ impl StateBook {
                 "UPDATE account_state SET json = ?2 WHERE account = ?1",
                 rusqlite::params![account, json],
             )?;
-            Ok(tx.commit()?)
+            Ok(())
         });
-        if let Err(err) = queued {
-            tracing::error!(account = %id, error = %err, "could not queue account state quarantine");
-        }
     }
 
     /// Stop writing `account_state` rows (memory keeps changing). For a daemon generation that
     /// handed off to a newer one: only the active generation persists account state.
+    ///
+    /// Rows queued earlier but not yet committed are dropped too: when this returns, a row
+    /// write is either already committed or never will be, so nothing this book queued can land
+    /// after the next generation's [`reload`](Self::reload). May wait for one row write that is
+    /// committing right now (it already holds SQLite's write lock, so that is short).
     pub fn stop_persisting(&self) {
-        self.persisting.store(false, Ordering::SeqCst);
+        let mut on = self.persisting.lock().unwrap_or_else(|e| e.into_inner());
+        *on = false;
+        self.persisting_hint.store(false, Ordering::SeqCst);
+    }
+
+    /// Lock-free early-out: not worth queueing a row write. Only a hint; the writer job checks
+    /// again under the lock.
+    fn is_persisting(&self) -> bool {
+        self.persisting_hint.load(Ordering::SeqCst)
+    }
+
+    /// Queue an `account_state` write. On the writer thread it first takes SQLite's write lock
+    /// (`BEGIN IMMEDIATE`), then checks `persisting` and holds that lock through the commit:
+    /// [`stop_persisting`](Self::stop_persisting) therefore either waits for this commit or
+    /// makes the job roll back without writing.
+    fn write_rows<F>(&self, what: &'static str, id: &AccountId, f: F)
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<()> + Send + 'static,
+    {
+        let gate = self.persisting.clone();
+        let queued = self.store.submit(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let on = gate.lock().unwrap_or_else(|e| e.into_inner());
+            if !*on {
+                // Handed off meanwhile: the next generation owns these rows now.
+                return Ok(());
+            }
+            f(&tx)?;
+            tx.commit()?;
+            drop(on);
+            Ok(())
+        });
+        if let Err(err) = queued {
+            tracing::error!(account = %id, error = %err, "could not queue account state {what}");
+        }
     }
 
     /// Replace the persisted part of every account's state with what is in the database now
@@ -699,17 +741,14 @@ impl StateBook {
     pub fn forget(&self, id: &AccountId) {
         self.lock().remove(id);
         self.notify_changed();
-        if !self.persisting.load(Ordering::SeqCst) {
+        if !self.is_persisting() {
             return;
         }
         let account = id.to_string();
-        let queued = self.store.submit(move |c| {
+        self.write_rows("delete", id, move |c| {
             c.execute("DELETE FROM account_state WHERE account = ?1", [account])?;
             Ok(())
         });
-        if let Err(err) = queued {
-            tracing::error!(account = %id, error = %err, "could not queue account state delete");
-        }
     }
 
     /// Sideline until `until` (explicit 429 cooldown). `window` names the binding window if known.
@@ -1022,7 +1061,7 @@ impl StateBook {
     }
 
     fn persist(&self, id: &AccountId, state: &AccountState) {
-        if !self.persisting.load(Ordering::SeqCst) {
+        if !self.is_persisting() {
             return;
         }
         let json = match serde_json::to_string(state) {
@@ -1033,7 +1072,7 @@ impl StateBook {
             }
         };
         let account = id.to_string();
-        let queued = self.store.submit(move |c| {
+        self.write_rows("write", id, move |c| {
             c.execute(
                 "INSERT INTO account_state(account, json) VALUES (?1, ?2)
                  ON CONFLICT(account) DO UPDATE SET json = excluded.json",
@@ -1041,9 +1080,6 @@ impl StateBook {
             )?;
             Ok(())
         });
-        if let Err(err) = queued {
-            tracing::error!(account = %id, error = %err, "could not queue account state write");
-        }
     }
 }
 

@@ -564,7 +564,7 @@ pub async fn sync_once(state: &AppState) -> anyhow::Result<Vec<(String, WriteOut
 /// profiles left pointing at an old port after a restart). Skipped while the
 /// pool drains. Abort the handle to stop it.
 pub fn spawn_profile_sync(state: Arc<AppState>) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::background::spawn(async move {
         let mut tick = tokio::time::interval(SYNC_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

@@ -14,8 +14,8 @@ use pooltime::claude_code::{apply, is_connected, profile_of, EnvBlock, Pins, Pro
 use pooltime::cli::service::{run_with, ServiceCmd};
 use pooltime::config::{Config, Paths, ProfileRef};
 use pooltime::service::{
-    launchd, render_launchd_plist, render_systemd_unit, restart, stable_bin, systemd, Backend,
-    CmdOutput, Env, Restarted, Runner, Timing,
+    launchd, render_launchd_plist, render_systemd_unit, restart, stable_bin, systemd,
+    systemd::ExecReloadUpgrade, Backend, CmdOutput, Env, Restarted, Runner, Timing,
 };
 use pooltime::supervisor::proto::{RestartResult, SupervisorState};
 use serde_json::{json, Value};
@@ -875,6 +875,139 @@ fn restart_signals_the_supervisor_and_reports_the_handover() {
         Restarted::HandedOver { joined: false, .. }
     ));
     assert_eq!(rec.calls(), ["systemctl --user reload pooltime.service"]);
+}
+
+/// A unit from 1.1.x reloads with `/bin/kill` (absent on NixOS): the next reload rewrites just
+/// that line to go through pooltime itself, `daemon-reload`s, then reloads.
+#[test]
+fn systemd_reload_upgrades_a_bin_kill_exec_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    systemd::install(&env, &Rec::default()).unwrap();
+    let path = systemd::unit_path(&env);
+    let current = std::fs::read_to_string(&path).unwrap();
+    let reload_line = current
+        .lines()
+        .find(|l| l.starts_with("ExecReload="))
+        .unwrap()
+        .to_string();
+    let start = current
+        .lines()
+        .find_map(|l| l.strip_prefix("ExecStart="))
+        .unwrap();
+    assert_eq!(
+        reload_line,
+        format!(
+            "ExecReload={} service signal-reload $MAINPID",
+            start.strip_suffix(" serve --supervise").unwrap()
+        )
+    );
+    assert!(!current.contains("/bin/kill"));
+    assert_eq!(
+        systemd::upgrade_exec_reload(&current),
+        ExecReloadUpgrade::Keep,
+        "already current"
+    );
+
+    let old = current.replace(&reload_line, "ExecReload=/bin/kill -HUP $MAINPID");
+    std::fs::write(&path, &old).unwrap();
+    let rec = Rec::default();
+    systemd::reload(&env, &rec).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), current);
+    assert_eq!(
+        rec.calls(),
+        [
+            "systemctl --user daemon-reload",
+            "systemctl --user reload pooltime.service"
+        ]
+    );
+    // A unit without the supervisor is left to `service restart`'s reinstall.
+    assert_eq!(
+        systemd::upgrade_exec_reload("ExecStart=/x/pooltime serve\nExecReload=/bin/kill\n"),
+        ExecReloadUpgrade::Keep
+    );
+    // Hand-edited ExecReload= lines are never touched.
+    let custom = current.replace(
+        &reload_line,
+        "ExecReload=/run/current-system/sw/bin/kill -HUP $MAINPID",
+    );
+    assert_eq!(
+        systemd::upgrade_exec_reload(&custom),
+        ExecReloadUpgrade::Custom
+    );
+    let two = current.replace(
+        &reload_line,
+        "ExecReload=/bin/kill -HUP $MAINPID\nExecReload=/usr/bin/true",
+    );
+    assert_eq!(
+        systemd::upgrade_exec_reload(&two),
+        ExecReloadUpgrade::Custom
+    );
+    std::fs::write(&path, &two).unwrap();
+    let rec = Rec::default();
+    systemd::reload(&env, &rec).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), two, "left alone");
+    assert_eq!(rec.calls(), ["systemctl --user reload pooltime.service"]);
+}
+
+/// Updating the unit is best effort: a unit that cannot be rewritten (a read-only unit dir, a
+/// symlink into a config manager's store) is left as it is and the reload still happens.
+#[test]
+fn systemd_reload_goes_ahead_when_the_unit_cannot_be_updated() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    systemd::install(&env, &Rec::default()).unwrap();
+    let path = systemd::unit_path(&env);
+    let current = std::fs::read_to_string(&path).unwrap();
+    let reload_line = current
+        .lines()
+        .find(|l| l.starts_with("ExecReload="))
+        .unwrap()
+        .to_string();
+    let old = current.replace(&reload_line, "ExecReload=/bin/kill -HUP $MAINPID");
+
+    // Read-only unit dir: the atomic write fails.
+    std::fs::write(&path, &old).unwrap();
+    let unit_dir = path.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&unit_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let rec = Rec::default();
+    let res = systemd::reload(&env, &rec);
+    std::fs::set_permissions(&unit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    res.unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), old, "unchanged");
+    assert_eq!(rec.calls(), ["systemctl --user reload pooltime.service"]);
+
+    // A symlinked unit: the link stays a link and its target is not rewritten.
+    let target = dir.path().join("managed-pooltime.service");
+    std::fs::write(&target, &old).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    let rec = Rec::default();
+    systemd::reload(&env, &rec).unwrap();
+    assert!(std::fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), old);
+    assert_eq!(rec.calls(), ["systemctl --user reload pooltime.service"]);
+}
+
+/// `ExecReload`'s target: `pooltime service signal-reload <pid>` sends that process `SIGHUP`.
+#[test]
+fn signal_reload_sends_sighup() {
+    use std::os::unix::process::ExitStatusExt;
+    let mut child = crate::support::procs::spawn(Command::new("sleep").arg("30"));
+    let out = crate::support::procs::output(Command::new(env!("CARGO_BIN_EXE_pooltime")).args([
+        "service",
+        "signal-reload",
+        &child.id().to_string(),
+    ]));
+    assert!(out.status.success(), "{out:?}");
+    let status = child.wait().unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGHUP));
+    assert!(pooltime::service::signal_reload(0).is_err());
+    assert!(pooltime::service::signal_reload(1).is_err());
 }
 
 #[test]

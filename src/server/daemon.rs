@@ -227,6 +227,8 @@ pub async fn run_daemon(paths: Paths, flags: ServeFlags) -> anyhow::Result<()> {
 struct Background {
     tasks: Tasks,
     cache: StatusCache,
+    /// The blocking work these tasks started (not the request path's).
+    work: crate::background::Work,
 }
 
 /// How long a handing-off worker waits for its background work to stop.
@@ -246,6 +248,18 @@ fn spawn_background(
     openai: Arc<OpenAiProvider>,
     sessions: Arc<Sessions>,
 ) -> Background {
+    // Every task below is started with `background::spawn`, so their blocking work counts here.
+    let work = crate::background::Work::new();
+    let (tasks, cache) = work.enter(|| spawn_tasks(app, anthropic, openai, sessions));
+    Background { tasks, cache, work }
+}
+
+fn spawn_tasks(
+    app: Arc<AppState>,
+    anthropic: Arc<AnthropicProvider>,
+    openai: Arc<OpenAiProvider>,
+    sessions: Arc<Sessions>,
+) -> (Tasks, StatusCache) {
     let store = app.store.clone();
     let retention_cfg = app.cfg.retention.clone();
     let tasks = Tasks(vec![
@@ -302,21 +316,23 @@ fn spawn_background(
     ]);
     // run/status-cache.json for `pooltime statusline` (spec §16).
     let cache = crate::claude_code::statusline::spawn_status_cache(app);
-    Background { tasks, cache }
+    (tasks, cache)
 }
 
 /// Handing off to a newer generation: stop the background tasks and wait for the blocking work
-/// they started, stop persisting account state, and get every queued write to disk, so that
-/// after `released` the next generation is the only writer (it reloads account state then).
-/// The status cache is left for it to update. Bounded by [`RELEASE_BOUND`].
+/// they started (only theirs: blocking work a request started is not waited for), get every
+/// queued write to disk, then stop persisting account state, so that after `released` the next
+/// generation is the only writer (it reloads account state then). The status cache is left for
+/// it to update. Bounded by [`RELEASE_BOUND`]: if the bound runs out mid-flush, the
+/// `account_state` rows still queued are dropped by `stop_persisting` (they never commit after
+/// it), so the next generation's reload cannot miss a row that lands later.
 async fn release(app: &AppState, bg: Option<Background>) {
     let work = async {
         if let Some(bg) = bg {
             bg.tasks.stop().await;
             bg.cache.release().await;
+            bg.work.idle().await;
         }
-        crate::background::idle().await;
-        app.state.stop_persisting();
         let _ = app.store.exec(|_| Ok(())).await;
     };
     if tokio::time::timeout(RELEASE_BOUND, work).await.is_err() {
@@ -485,7 +501,7 @@ where
     F: FnMut() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(async move {
+    crate::background::spawn(async move {
         let mut tick = tokio::time::interval(period);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

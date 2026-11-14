@@ -257,7 +257,7 @@ impl OpenAiProvider {
 /// not consulted (benched accounts need the ground truth most); the per-account TTL in
 /// [`OpenAiProvider::poll_usage`] bounds the request rate. Returns at once if polling is off.
 pub fn spawn_usage_sweeper(provider: Arc<OpenAiProvider>, every: Duration) -> JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::background::spawn(async move {
         if !provider.usage_refresh {
             return;
         }
