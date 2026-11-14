@@ -112,6 +112,20 @@ pub(crate) fn is_spent(w: &Window) -> bool {
     }
 }
 
+/// Model families whose model-scoped window in `snap` is spent with a future reset, sorted and
+/// deduplicated ([`StateBook::spent_families`] over a stored snapshot).
+pub fn spent_families_of(snap: &RateLimitSnapshot, now: OffsetDateTime) -> Vec<String> {
+    let mut fams: Vec<String> = snap
+        .windows
+        .iter()
+        .filter(|w| is_spent(w) && w.reset.is_some_and(|r| r > now))
+        .filter_map(|w| w.model.clone())
+        .collect();
+    fams.sort();
+    fams.dedup();
+    fams
+}
+
 /// Spent account-wide windows whose reset is still in the future, as `(reset, key)`.
 fn spent_account_windows(
     snap: &RateLimitSnapshot,
@@ -626,18 +640,9 @@ impl StateBook {
     /// change the account status; routing excludes the account for those families only.
     pub fn spent_families(&self, id: &AccountId, now: OffsetDateTime) -> Vec<String> {
         let map = self.lock();
-        let Some(snap) = map.get(id).and_then(|e| e.state.snapshot.as_ref()) else {
-            return Vec::new();
-        };
-        let mut fams: Vec<String> = snap
-            .windows
-            .iter()
-            .filter(|w| is_spent(w) && w.reset.is_some_and(|r| r > now))
-            .filter_map(|w| w.model.clone())
-            .collect();
-        fams.sort();
-        fams.dedup();
-        fams
+        map.get(id)
+            .and_then(|e| e.state.snapshot.as_ref())
+            .map_or_else(Vec::new, |snap| spent_families_of(snap, now))
     }
 
     /// Earliest future reset among the account-wide windows the stored snapshot reports spent,

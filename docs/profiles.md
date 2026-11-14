@@ -111,7 +111,8 @@ pooltime connect default --mcp
 Adds `mcpServers.pooltime` (`http://127.0.0.1:<port>/mcp`) to the profile's `.claude.json`, with its
 own MCP token (`~/.pooltime/run/mcp.key`), never the management key. Tools: `pool_usage`,
 `pool_health`, `start_relogin` (returns the sign-in link), `set_weight` (optionally until a time),
-`recent_errors`, `explain_request`. There is no tool to remove accounts, read tokens or change
+`recent_errors`, `explain_request`, `explain_routing` (which account the next request for a model
+goes to, and why). There is no tool to remove accounts, read tokens or change
 Claude Code connections. `disconnect` removes the entry.
 
 Related: [Install](install.md), [Debugging](debugging.md).

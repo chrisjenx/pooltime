@@ -133,22 +133,26 @@ async fn handle(app: &Arc<AppState>, req: InboundRequest) -> Response {
     served.response
 }
 
+/// The route for `model` and, when its family is mapped, the mapped OpenAI route (efforts from
+/// the request `json`).
+pub(super) fn resolve_routes(app: &AppState, model: &str, json: &Value) -> (Route, Option<Route>) {
+    let table = app.models.read().unwrap_or_else(|e| e.into_inner());
+    let tier = derive_effort_tier(json);
+    let mut route = table.resolve(model);
+    if route.def.provider == ProviderId::OpenAi {
+        route.effort = effective_effort(&route.def, None, tier);
+    }
+    // A mapping row's effort overrides replace the target route's own map (bro parity).
+    let mapped = table.mapped_route(model).map(|mut m| {
+        let row = family_of(model).and_then(|f| table.mapping_for(f));
+        m.effort = effective_effort(&m.def, row, tier);
+        m
+    });
+    (route, mapped)
+}
+
 async fn route_and_serve(app: &Arc<AppState>, mut req: InboundRequest) -> Served {
-    let (route, mapped) = {
-        let table = app.models.read().unwrap_or_else(|e| e.into_inner());
-        let tier = derive_effort_tier(&req.json);
-        let mut route = table.resolve(&req.model);
-        if route.def.provider == ProviderId::OpenAi {
-            route.effort = effective_effort(&route.def, None, tier);
-        }
-        // A mapping row's effort overrides replace the target route's own map (bro parity).
-        let mapped = table.mapped_route(&req.model).map(|mut m| {
-            let row = family_of(&req.model).and_then(|f| table.mapping_for(f));
-            m.effort = effective_effort(&m.def, row, tier);
-            m
-        });
-        (route, mapped)
-    };
+    let (route, mapped) = resolve_routes(app, &req.model, &req.json);
     // One slot-wait budget for the whole request, across retries and providers.
     let budget = WaitBudget::new(app.cfg.timeouts.inflight_wait);
     req.journal.set_provider(route.def.provider.as_str());
@@ -214,17 +218,18 @@ async fn route_and_serve(app: &Arc<AppState>, mut req: InboundRequest) -> Served
 
 /// View of one account at a point in time. `creds_ok` comes from the per-pass registry read;
 /// the state fields are re-read live by [`live_view`] on every pick.
-struct Acct {
-    meta: AccountMeta,
-    creds_ok: bool,
-    status: AccountStatus,
-    spent: Vec<String>,
-    snapshot: Option<RateLimitSnapshot>,
-    active: u32,
+/// The routing preview builds the same view (or one from fixture data) and runs the same picks.
+pub(super) struct Acct {
+    pub(super) meta: AccountMeta,
+    pub(super) creds_ok: bool,
+    pub(super) status: AccountStatus,
+    pub(super) spent: Vec<String>,
+    pub(super) snapshot: Option<RateLimitSnapshot>,
+    pub(super) active: u32,
 }
 
 /// Current state of `meta` from the StateBook and Sessions (cheap, in-memory; safe to call from
-/// a `Reservations::reserve` pick closure).
+/// a `Reservations::reserve` pick closure). Read-only.
 fn live_view(app: &AppState, meta: &AccountMeta, creds_ok: bool, now: OffsetDateTime) -> Acct {
     Acct {
         meta: meta.clone(),
@@ -237,8 +242,8 @@ fn live_view(app: &AppState, meta: &AccountMeta, creds_ok: bool, now: OffsetDate
 }
 
 /// Every registered account (all providers) with its state at `now`. The registry and
-/// credential files are read off the async runtime.
-async fn load_accounts(app: &Arc<AppState>, now: OffsetDateTime) -> Vec<Acct> {
+/// credential files are read off the async runtime. Read-only.
+pub(super) async fn load_accounts(app: &Arc<AppState>, now: OffsetDateTime) -> Vec<Acct> {
     let app = app.clone();
     let job = tokio::task::spawn_blocking(move || {
         app.registry
@@ -259,7 +264,7 @@ async fn load_accounts(app: &Arc<AppState>, now: OffsetDateTime) -> Vec<Acct> {
     }
 }
 
-fn candidate(a: &Acct) -> Candidate<'_> {
+pub(super) fn candidate(a: &Acct) -> Candidate<'_> {
     Candidate {
         meta: &a.meta,
         snapshot: a.snapshot.as_ref(),
@@ -291,52 +296,70 @@ pub fn pick_account<'a>(
     choose(cands, tuning, cursor, now, family)
 }
 
-fn family_for(provider: ProviderId, model: &str) -> Option<&'static str> {
-    match provider {
-        ProviderId::Anthropic => family_of(model),
-        // Codex accounts have no per-family windows.
-        ProviderId::OpenAi => None,
-    }
+/// One pick on provider `pid` among `live` (already narrowed to accounts with room): the
+/// [`usable`] filter, then [`pick_account`]. `serve_provider`'s reserve closure and the routing
+/// preview both pick through this.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pick_among<'a>(
+    live: impl IntoIterator<Item = &'a Acct>,
+    pid: ProviderId,
+    family: Option<&str>,
+    tried: &HashSet<AccountId>,
+    pin: Option<&AccountId>,
+    tuning: &Tuning,
+    cursor: &std::sync::atomic::AtomicUsize,
+    now: OffsetDateTime,
+) -> Option<AccountId> {
+    let cands = candidates(live, pid, family, tried);
+    pick_account(&cands, pin, tuning, cursor, now, family).cloned()
 }
 
-fn cap_for(app: &AppState, provider: ProviderId) -> u32 {
-    match provider {
-        ProviderId::Anthropic => app.cfg.routing.anthropic_max_inflight,
-        ProviderId::OpenAi => app.cfg.routing.codex_max_inflight,
-    }
+/// The [`usable`] accounts of `live` for provider `pid` / `family`, as scoring candidates.
+pub(super) fn candidates<'a>(
+    live: impl IntoIterator<Item = &'a Acct>,
+    pid: ProviderId,
+    family: Option<&str>,
+    tried: &HashSet<AccountId>,
+) -> Vec<Candidate<'a>> {
+    live.into_iter()
+        .filter(|a| usable(&a.meta, &a.status, pid, family, &a.spent, tried))
+        .map(candidate)
+        .collect()
 }
 
-/// Provider for a mapped request (bro `chooseMappedService`): Anthropic listed first so exact
-/// ties keep Claude primary; capacity is a preference, so a second pass ignores in-flight caps.
-async fn choose_mapped_provider(app: &Arc<AppState>, req: &InboundRequest) -> Option<ProviderId> {
-    let now = OffsetDateTime::now_utc();
-    let accts = load_accounts(app, now).await;
-    let tuning = app.tuning();
-    let user = req.session_user_id.as_deref();
+/// What a mapped-provider decision reads besides the accounts.
+pub(super) struct ProviderEnv<'a> {
+    /// Providers with a registered implementation.
+    pub(super) registered: &'a dyn Fn(ProviderId) -> bool,
+    /// Whether `account` of `provider` is under its in-flight cap.
+    pub(super) has_room: &'a dyn Fn(ProviderId, &AccountId) -> bool,
+    pub(super) tuning: &'a Tuning,
+    pub(super) cursor: &'a std::sync::atomic::AtomicUsize,
+    pub(super) now: OffsetDateTime,
+}
+
+/// The provider decision for a mapped request over `accts` (bro `chooseMappedService`):
+/// Anthropic listed first so exact ties keep Claude primary; capacity is a preference, so a
+/// second pass ignores in-flight caps. Pure over its inputs (the cursor is only read).
+pub(super) fn mapped_provider(
+    accts: &[Acct],
+    model: &str,
+    pins: &[(ProviderId, AccountId)],
+    most_recent: Option<ProviderId>,
+    env: &ProviderEnv<'_>,
+) -> Option<fallback::ProviderPick> {
     let order = [ProviderId::Anthropic, ProviderId::OpenAi];
-    let pins: Vec<(ProviderId, AccountId)> = user
-        .map(|u| {
-            order
-                .iter()
-                .filter_map(|p| app.sessions.pinned(*p, u, now).map(|a| (*p, a)))
-                .collect()
-        })
-        .unwrap_or_default();
-    let most_recent = user.and_then(|u| app.sessions.last_provider(u));
     let no_tried = HashSet::new();
     for respect_cap in [true, false] {
         let pools: Vec<ProviderPool<'_>> = order
             .iter()
-            .filter(|p| app.providers.contains_key(p))
+            .filter(|p| (env.registered)(**p))
             .map(|&p| {
-                let family = family_for(p, &req.model);
-                let cap = cap_for(app, p);
+                let family = family_for(p, model);
                 let cands = accts
                     .iter()
                     .filter(|a| usable(&a.meta, &a.status, p, family, &a.spent, &no_tried))
-                    .filter(|a| {
-                        !respect_cap || cap == 0 || app.reservations.in_flight(&a.meta.id) < cap
-                    })
+                    .filter(|a| !respect_cap || (env.has_room)(p, &a.meta.id))
                     .map(candidate)
                     .collect();
                 ProviderPool {
@@ -346,13 +369,64 @@ async fn choose_mapped_provider(app: &Arc<AppState>, req: &InboundRequest) -> Op
                 }
             })
             .collect();
-        if let Some(p) =
-            fallback::pick_provider(&pools, &pins, most_recent, &tuning, &app.cursor, now)
-        {
+        if let Some(p) = fallback::pick_provider_explained(
+            &pools,
+            pins,
+            most_recent,
+            env.tuning,
+            env.cursor,
+            env.now,
+        ) {
             return Some(p);
         }
     }
     None
+}
+
+pub(super) fn family_for(provider: ProviderId, model: &str) -> Option<&'static str> {
+    match provider {
+        ProviderId::Anthropic => family_of(model),
+        // Codex accounts have no per-family windows.
+        ProviderId::OpenAi => None,
+    }
+}
+
+pub(super) fn cap_for(app: &AppState, provider: ProviderId) -> u32 {
+    match provider {
+        ProviderId::Anthropic => app.cfg.routing.anthropic_max_inflight,
+        ProviderId::OpenAi => app.cfg.routing.codex_max_inflight,
+    }
+}
+
+/// Whether `id` of `provider` is under the provider's in-flight cap now.
+pub(super) fn has_room(app: &AppState, provider: ProviderId, id: &AccountId) -> bool {
+    let cap = cap_for(app, provider);
+    cap == 0 || app.reservations.in_flight(id) < cap
+}
+
+/// Provider for a mapped request ([`mapped_provider`] over the live state).
+async fn choose_mapped_provider(app: &Arc<AppState>, req: &InboundRequest) -> Option<ProviderId> {
+    let now = OffsetDateTime::now_utc();
+    let accts = load_accounts(app, now).await;
+    let tuning = app.tuning();
+    let user = req.session_user_id.as_deref();
+    let pins: Vec<(ProviderId, AccountId)> = user
+        .map(|u| {
+            [ProviderId::Anthropic, ProviderId::OpenAi]
+                .iter()
+                .filter_map(|p| app.sessions.pinned(*p, u, now).map(|a| (*p, a)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let most_recent = user.and_then(|u| app.sessions.last_provider(u));
+    let env = ProviderEnv {
+        registered: &|p| app.providers.contains_key(&p),
+        has_room: &|p, id| has_room(app, p, id),
+        tuning: &tuning,
+        cursor: &app.cursor,
+        now,
+    };
+    mapped_provider(&accts, &req.model, &pins, most_recent, &env).map(|p| p.provider)
 }
 
 /// Put the served attempt's token usage on the journal entry: at once when known (buffered
@@ -441,13 +515,17 @@ pub(super) async fn serve_provider(
                 .filter(|a| has_room(&a.meta.id))
                 .map(|a| live_view(app, &a.meta, a.creds_ok, now))
                 .collect();
-            let cands: Vec<Candidate<'_>> = live
-                .iter()
-                .filter(|a| usable(&a.meta, &a.status, pid, family, &a.spent, &tried))
-                .map(candidate)
-                .collect();
             let pin = user.and_then(|u| app.sessions.pinned(pid, u, now));
-            pick_account(&cands, pin.as_ref(), &tuning, &app.cursor, now, family).cloned()
+            pick_among(
+                &live,
+                pid,
+                family,
+                &tried,
+                pin.as_ref(),
+                &tuning,
+                &app.cursor,
+                now,
+            )
         };
         let Some(reservation) = app.reservations.reserve(pick, pid, budget).await else {
             break;

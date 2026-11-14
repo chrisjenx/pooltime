@@ -27,6 +27,7 @@ mod models_route;
 mod proxy_anthropic;
 mod proxy_openai;
 mod routing;
+mod routing_preview;
 mod service;
 mod setup_doctor;
 mod supervisor;

@@ -90,7 +90,7 @@
       "until": "2026-11-09T06:00:00Z",
       "class": null,
       "count": null,
-      "priority": 100,
+      "priority": 10,
       "weight": 1.0,
       "weight_override": null,
       "effective_weight": 1.0,

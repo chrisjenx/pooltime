@@ -10,6 +10,23 @@
   connected profile no longer grows with the size of that file, and nothing pooltime does not own
   is ever reformatted. The settings `env` checks read only `env` from `settings.json`.
 
+### Routing explained
+
+- The dashboard's Routing view has a **Next request** panel: pick a model (it starts on your most
+  requested Claude model this week) and it says which account the next request goes to and why,
+  in one line ("Next request for claude-opus-4-5 goes to personal: highest score (3.75, ahead of
+  team-1 at 2.50), 7-day 37% used, resets in 4d 21h."). Below it, one row per account: eligible or
+  the reason it is out (signed out, rate-limited until, billing, reserve tier, over the 5-hour
+  limit, at its in-flight cap, ...), 5-hour and 7-day used, 7-day reset, expiry share, taper,
+  priority, weight and any timed override, pinned sessions, the score with a bar, and a Next
+  marker. It refreshes with the page.
+- New `GET /api/v1/routing/preview?model=<id>` (management key) behind it, and the MCP tool
+  `explain_routing`. The preview runs the router's own code (the scorer now exposes its
+  per-account breakdown as `routing::rank`, which `choose` decides on) and changes nothing: no
+  tie-break turn is used, no session is pinned, nothing is journaled.
+- The Routing view's help for **Minimum headroom** now says 5-hour headroom (it said 7-day; the
+  setting has always applied to the 5-hour window).
+
 ## 1.1.1 - 2026-11-13
 
 ### Fixed

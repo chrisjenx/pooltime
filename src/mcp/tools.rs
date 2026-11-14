@@ -1,4 +1,4 @@
-//! The six MCP tools. Each one calls the `/api/v1` handler the dashboard and CLI use (in
+//! The seven MCP tools. Each one calls the `/api/v1` handler the dashboard and CLI use (in
 //! process, no auth layer: the MCP token already admitted the call) and reshapes its answer.
 //! Outputs are JSON text and never carry tokens, refresh details, emails or keys; accounts
 //! appear by id.
@@ -11,6 +11,7 @@
 //! | `set_weight {account, weight?, priority?, until?}` | `POST /api/v1/accounts/{id}/routing` |
 //! | `recent_errors {limit?}` | `GET /api/v1/requests?errors_only=true` |
 //! | `explain_request {id}` | `GET /api/v1/requests/{id}` |
+//! | `explain_routing {model?}` | `GET /api/v1/routing/preview?model=` |
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,7 +26,7 @@ use time::OffsetDateTime;
 
 use super::INVALID_PARAMS;
 use crate::accounts::AccountId;
-use crate::server::{analytics_api, journal_api, mgmt, AppState};
+use crate::server::{analytics_api, journal_api, mgmt, routing_preview, AppState};
 
 /// `recent_errors` page size: default and cap.
 const ERRORS_DEFAULT: u64 = 10;
@@ -105,6 +106,21 @@ pub(super) fn list() -> Value {
                 "required": ["id"],
             },
         },
+        {
+            "name": "explain_routing",
+            "description": "Which account the next request for a model would go to, and why: a \
+                one-line summary, then per account whether it is eligible (or why not: signed \
+                out, rate-limited until, reserve tier, over the 5-hour limit, ...) and the \
+                factors behind its score (5-hour and 7-day usage as the share used, 7-day reset \
+                and expiry share, taper, priority, weight and any timed override, pinned \
+                sessions). Read-only; for a new session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"model": {"type": "string",
+                    "description": "Model id, e.g. claude-opus-5; default: the most requested \
+                        Claude model of the past week"}},
+            },
+        },
     ]})
 }
 
@@ -126,6 +142,7 @@ pub(super) async fn call(app: &Arc<AppState>, params: &Value) -> Result<Value, (
         "set_weight" => set_weight(app, &args).await,
         "recent_errors" => recent_errors(app, &args).await,
         "explain_request" => explain_request(app, &args).await,
+        "explain_routing" => explain_routing(app, &args).await,
         other => return Err((INVALID_PARAMS, format!("Unknown tool: {other}"))),
     };
     Ok(match out {
@@ -413,6 +430,22 @@ async fn explain_request(app: &Arc<AppState>, args: &Map<String, Value>) -> Resu
     answer(journal_api::request(State(app.clone()), Path(id.to_string())).await).await
 }
 
+async fn explain_routing(app: &Arc<AppState>, args: &Map<String, Value>) -> Result<Value, String> {
+    let model = match args.get("model") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(m)) => Some(m.clone()),
+        Some(_) => return Err("model must be a string".into()),
+    };
+    let q = model.map(|m| vec![("model", m)]).unwrap_or_default();
+    let mut v =
+        answer(routing_preview::preview_handler(State(app.clone()), query(&q)).await).await?;
+    // The picker list is for the dashboard.
+    if let Value::Object(o) = &mut v {
+        o.remove("models");
+    }
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_list_is_exactly_the_scoped_six() {
+    fn tool_list_is_exactly_the_scoped_seven() {
         let v = list();
         let names: Vec<&str> = v["tools"]
             .as_array()
@@ -476,7 +509,8 @@ mod tests {
                 "start_relogin",
                 "set_weight",
                 "recent_errors",
-                "explain_request"
+                "explain_request",
+                "explain_routing"
             ]
         );
     }

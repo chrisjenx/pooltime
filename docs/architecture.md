@@ -10,6 +10,7 @@ One Rust binary. `pooltime serve` is a tokio/axum daemon on `127.0.0.1:3460` tha
 | `GET`/`HEAD /api/hello` | Claude Code's connectivity probe: an empty 200, not logged or journaled as an unknown endpoint |
 | `GET /health` | identity check (so nobody trusts or kills a foreign listener) |
 | `/api/v1/*` | management API: the one layer the dashboard, CLI and MCP all call |
+| `GET /api/v1/routing/preview?model=<id>` | read-only routing preview (management key): which account the next request for a model goes to and why, per-account eligibility and score factors (see [below](#routing-preview)) |
 | `GET /` | embedded dashboard (`web/`, compiled in) |
 | `POST /mcp` | MCP server (Streamable HTTP, its own token) |
 
@@ -23,7 +24,7 @@ runs).
 |---|---|
 | `main.rs`, `cli/` | clap entry point; one file per command (`setup`, `doctor`, `accounts`, ...); `cli/client.rs` finds the daemon and talks to it |
 | `config.rs` | `config.toml`, `POOLTIME_*` overlay, defaults, data-dir `Paths` |
-| `server/` | `daemon` (boot), `router` (routes + middleware), `auth`, `inference` (`/v1/messages` and the failover loop), `count_tokens`, `fallback` (cross-provider), `classifier`, `models_route`, `health`, `shutdown` (drain, handoff), `handoff` (a supervised worker's side), `mgmt` (management API), `journal_api`, `analytics_api`, `dashboard` |
+| `server/` | `daemon` (boot), `router` (routes + middleware), `auth`, `inference` (`/v1/messages` and the failover loop), `count_tokens`, `fallback` (cross-provider), `classifier`, `models_route`, `health`, `shutdown` (drain, handoff), `handoff` (a supervised worker's side), `mgmt` (management API), `journal_api`, `analytics_api`, `routing_preview`, `dashboard` |
 | `providers/` | the `Provider` trait; `anthropic/` (passthrough proxy, OAuth refresh, rate-limit headers, usage poll, catalog) and `openai/` (Codex: request/stream translation, OAuth, usage, catalog); `stream_guard` (shared stream pump) |
 | `signin/` | OAuth PKCE sign-in flows (`claude`, `openai`), the localhost `callback` listener, paste-code mode |
 | `accounts/` | account ids, `account.toml` registry, credentials (0600), identity verification, the runtime `StateBook` (availability per account) |
@@ -33,7 +34,7 @@ runs).
 | `claude_code/` | Claude Code profiles: discover, connect/disconnect, guarded JSON writes, pins, snapshots, status line wrapper, MCP registration |
 | `store/` | SQLite (one writer thread): migrations, request journal, account timeline, usage history, retention |
 | `analytics/` | usage sampler and weekly burn report |
-| `mcp/` | MCP JSON-RPC transport and the six tools |
+| `mcp/` | MCP JSON-RPC transport and the seven tools |
 | `service/` | launchd and systemd unit rendering and control; `service restart` |
 | `supervisor/` | `serve --supervise`: owns the port, runs worker generations, hands over on `SIGHUP`, respawns crashed workers; `proto` (control messages, `run/supervisor.json`) |
 | `import/` | `bro.rs`: plan and apply a bro-cli import |
@@ -136,3 +137,40 @@ inference:
 - **Journal**: the request gets a row (`path`, model, status, outcome, `provider`) so failures are
   visible, but no attempt rows, so per-account attempt counts and error rates stay about real
   inference.
+
+## Routing preview
+
+`GET /api/v1/routing/preview?model=<id>` (management key or dashboard session; the dashboard's
+Routing view and the MCP `explain_routing` tool) answers "where would the next request for this
+model go, and why?" for a **new** session. It runs the live router's own steps, not a copy of the
+formula (`server/routing_preview.rs`):
+
+- the route from `inference::resolve_routes`; for a family mapped to Codex, the provider from
+  `inference::mapped_provider` (`fallback::pick_provider_explained`, the decision
+  `pick_provider` returns);
+- the account from `inference::candidates` + `inference::pick_account` (so `routing::choose`), in
+  `serve_provider`'s order: accounts under their in-flight cap first, all of them when every one is
+  busy (the request would wait for a slot);
+- the per-account factors from `routing::rank`, the ranking `choose` itself decides on (expiry
+  rank and share, 5-hour headroom and taper, effective weight, pinned sessions, score, viability);
+  `choose` only adds the round-robin tie-break.
+
+It changes nothing: account state, sessions and in-flight counts are only read, the tie cursor is
+copied (never advanced), no pin is set and nothing is journaled. Without `model` it previews the
+most requested Claude model of the past week; the picker fields (`default_model`, `models`) are
+only returned then or with `models=true`, and the model usage behind them is read from the journal
+at most once a minute. The answer has `summary` (one plain-English line),
+`next` (`account`, `score`, `reason`: `highest_score | tie_break | only_candidate | best_effort`,
+`runner_up`, `tied_with`, `waits_for_slot`), `provider` / `mapped_to` / `provider_choice` for mapped
+families, `sticky.pinned_sessions` and one row per account: `eligible` or
+`excluded` (`reason`: `needs_login | rate_limited | billing | access_denied | family_limit |
+provider_mismatch | provider_unavailable | at_capacity | reserve_tier | below_min_headroom |
+fallback_provider`, a `detail` sentence and `until` when known), `factors`
+(`five_hour_used`, `seven_day_used`, `expiry`, `expiry_reset`, `expiry_share`, `taper`, `viable`,
+`priority`, `weight`, `weight_override`, `effective_weight`, `sessions`, `in_flight`, `cap`),
+`score`, `tied` and `next`. Two picks are snapshots, not promises: on a `tie_break` the
+round-robin cursor is shared by all traffic, so any request in between moves whose turn it is; with
+`waits_for_slot` the live request waits for a free slot and then picks again, so it may go to
+whichever account frees up. Unit tests in `routing_preview.rs` check that its pick equals the live
+pick (`Reservations::reserve` over `serve_provider`'s pick closure) across ties, exclusions,
+overrides, caps, sticky load and mapped families.

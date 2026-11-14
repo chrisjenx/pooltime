@@ -2,7 +2,7 @@
 //! bro `pickProvider` / `weightedProviderRanking` and `serveWithCrossProviderFallback`).
 
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 
 use axum::response::Response;
 use time::OffsetDateTime;
@@ -11,7 +11,7 @@ use crate::accounts::AccountId;
 use crate::errors::FailReason;
 use crate::providers::anthropic::{RETRYABLE_TRANSPORT_HEADER, UPSTREAM_REJECTED_HEADER};
 use crate::providers::ProviderId;
-use crate::routing::{choose, score, Candidate, Tuning};
+use crate::routing::{factors, peek, score, Candidate, Factors, Tuning};
 
 /// Statuses that mean "this provider's pool is exhausted or overloaded" (bro
 /// `CROSS_PROVIDER_RETRY_STATUSES`).
@@ -154,10 +154,46 @@ pub fn pick_provider(
     cursor: &AtomicUsize,
     now: OffsetDateTime,
 ) -> Option<ProviderId> {
+    pick_provider_explained(pools, pins, most_recent, tuning, cursor, now).map(|p| p.provider)
+}
+
+/// Why [`pick_provider_explained`] chose its provider.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderWhy {
+    /// The only provider with a usable account.
+    Only,
+    /// The session is pinned to an account of this provider.
+    Sticky,
+    /// Each provider's contender, scored on one expiry scale: `(provider, account, score,
+    /// viable)` in `pools` order; the best (viable first, then score) won.
+    Score(Vec<(ProviderId, AccountId, f64, bool)>),
+}
+
+/// [`pick_provider`]'s decision and the reason for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderPick {
+    pub provider: ProviderId,
+    pub why: ProviderWhy,
+}
+
+/// [`pick_provider`] with its reason (the routing preview's view of the same decision).
+pub fn pick_provider_explained(
+    pools: &[ProviderPool<'_>],
+    pins: &[(ProviderId, AccountId)],
+    most_recent: Option<ProviderId>,
+    tuning: &Tuning,
+    cursor: &AtomicUsize,
+    now: OffsetDateTime,
+) -> Option<ProviderPick> {
     let usable: Vec<&ProviderPool<'_>> = pools.iter().filter(|p| !p.cands.is_empty()).collect();
     match usable.len() {
         0 => return None,
-        1 => return Some(usable[0].provider),
+        1 => {
+            return Some(ProviderPick {
+                provider: usable[0].provider,
+                why: ProviderWhy::Only,
+            })
+        }
         _ => {}
     }
 
@@ -172,19 +208,16 @@ pub fn pick_provider(
         .map(|p| p.provider)
         .collect();
     if let Some(first) = pinned.first() {
-        return Some(match most_recent {
-            Some(m) if pinned.contains(&m) => m,
-            _ => *first,
+        return Some(ProviderPick {
+            provider: match most_recent {
+                Some(m) if pinned.contains(&m) => m,
+                _ => *first,
+            },
+            why: ProviderWhy::Sticky,
         });
     }
 
     // Global rows: every active-tier account of every pool, ranked together.
-    struct Row<'a> {
-        pool: usize,
-        id: &'a AccountId,
-        score: f64,
-        viable: bool,
-    }
     let tiers: Vec<Vec<&Candidate<'_>>> = usable.iter().map(|p| active_tier(&p.cands)).collect();
     let ranks: Vec<score::ExpiryRank> = usable
         .iter()
@@ -195,43 +228,45 @@ pub fn pick_provider(
         })
         .collect();
     let shares = score::expiry_shares(&ranks);
-    let mut rows: Vec<Row<'_>> = Vec::with_capacity(ranks.len());
+    let mut rows: Vec<(usize, Factors<'_>)> = Vec::with_capacity(ranks.len());
     let mut i = 0;
     for (pool, (p, tier)) in usable.iter().zip(&tiers).enumerate() {
         for c in tier {
-            let headroom = score::gate_headroom(c.snapshot, p.family, now);
-            rows.push(Row {
-                pool,
-                id: &c.meta.id,
-                score: score::score(
-                    score::effective_weight(c.meta, now),
-                    shares[i],
-                    headroom,
-                    c.active_sessions,
-                    tuning,
-                ),
-                viable: headroom >= tuning.min_headroom,
-            });
+            rows.push((pool, factors(c, ranks[i], shares[i], tuning, now, p.family)));
             i += 1;
         }
     }
 
     // Each provider's contender: the account its own `choose` would serve (cursor not advanced).
-    let contenders: Vec<&Row<'_>> = usable
+    let contenders: Vec<(usize, &Factors<'_>)> = usable
         .iter()
         .enumerate()
         .filter_map(|(pool, p)| {
-            let preview = AtomicUsize::new(cursor.load(Ordering::SeqCst));
-            let winner = choose(&p.cands, tuning, &preview, now, p.family)?;
-            rows.iter().find(|r| r.pool == pool && r.id == winner)
+            let winner = peek(&p.cands, tuning, cursor, now, p.family)?;
+            rows.iter()
+                .find(|(rp, r)| *rp == pool && r.id == winner)
+                .map(|(rp, r)| (*rp, r))
         })
         .collect();
-    let any_viable = contenders.iter().any(|r| r.viable);
-    let mut best: Option<&Row<'_>> = None;
-    for r in contenders.into_iter().filter(|r| r.viable || !any_viable) {
-        if best.is_none_or(|b| r.score > b.score) {
-            best = Some(r);
+    let any_viable = contenders.iter().any(|(_, r)| r.viable);
+    let mut best: Option<(usize, &Factors<'_>)> = None;
+    for (pool, r) in contenders
+        .iter()
+        .copied()
+        .filter(|(_, r)| r.viable || !any_viable)
+    {
+        if best.is_none_or(|(_, b)| r.score > b.score) {
+            best = Some((pool, r));
         }
     }
-    best.map(|r| usable[r.pool].provider)
+    let (pool, _) = best?;
+    Some(ProviderPick {
+        provider: usable[pool].provider,
+        why: ProviderWhy::Score(
+            contenders
+                .iter()
+                .map(|(p, r)| (usable[*p].provider, r.id.clone(), r.score, r.viable))
+                .collect(),
+        ),
+    })
 }

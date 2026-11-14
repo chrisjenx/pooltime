@@ -231,6 +231,11 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/api/v1/timeline", write(get(journal_api::timeline), "GET"))
         .route("/api/v1/stats", write(get(journal_api::stats), "GET"))
+        // Routing preview: which account the next request would use, and why (key required).
+        .route(
+            "/api/v1/routing/preview",
+            write(get(super::routing_preview::preview_handler), "GET"),
+        )
         // Weekly burn (spec §5): key or session required, like the debugging views.
         .route(
             "/api/v1/analytics/burn",

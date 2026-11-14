@@ -56,7 +56,7 @@ account and for the pool, against pooltime's **Overview** and **Accounts** views
 | Recheck billing | button | button | same |
 | Priority / weight edit | form in the drawer | Routing view | same (Routing view) |
 | Login command | `bun run … accounts login` | Re-login button (key holders) | same, plus `pooltime accounts login <name>` on dead accounts in the read-only view |
-| Routing factors (expiry share, 5h headroom, 5h factor, viability, score, route reason, next pick) | drawer + Routing view | missing | **deferred**: needs a routing-preview API over the scorer; it belongs to the Routing view, not the account summary |
+| Routing factors (expiry share, 5h headroom, 5h factor, viability, score, route reason, next pick) | drawer + Routing view | missing | **ported** to the Routing view's **Next request** panel: a model picker, the next pick in one plain-English line, and per account eligibility (or the reason it is out), 5-hour and 7-day used, 7-day reset, expiry share, taper, priority, weight and override, pinned sessions, score with a bar, and a Next marker. Served by `GET /api/v1/routing/preview`, which runs the live router's own ranking without side effects; also the MCP `explain_routing` tool. Not in the account summary |
 
 ## Dropped or deferred in the parity inventory
 

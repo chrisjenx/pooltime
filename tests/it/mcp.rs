@@ -75,13 +75,14 @@ fn account<'a>(v: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no account {name} in {v}"))
 }
 
-const TOOLS: [&str; 6] = [
+const TOOLS: [&str; 7] = [
     "pool_usage",
     "pool_health",
     "start_relogin",
     "set_weight",
     "recent_errors",
     "explain_request",
+    "explain_routing",
 ];
 
 #[tokio::test]
@@ -173,6 +174,25 @@ async fn mcp_tools_listed() {
     assert!(v["attempts"].is_array());
     let (err, text) = call_tool(&srv, "explain_request", json!({"id": "nope"})).await;
     assert!(err && text.contains("nope"), "{text}");
+
+    // Routing explanation (this daemon runs no provider, so nothing can be picked).
+    let v = tool_json(&srv, "explain_routing", json!({"model": "claude-opus-5"})).await;
+    assert_eq!(v["model"], "claude-opus-5");
+    assert_eq!(
+        v["summary"],
+        "No anthropic provider is running, so a claude-opus-5 request cannot be served."
+    );
+    assert_eq!(
+        account(&v, "work")["excluded"]["reason"],
+        "provider_unavailable"
+    );
+    assert!(account(&v, "work")["factors"].is_object(), "{v}");
+    assert!(
+        v.get("models").is_none(),
+        "the picker list is dashboard-only"
+    );
+    let (err, _) = call_tool(&srv, "explain_routing", json!({"model": 5})).await;
+    assert!(err);
 
     // Protocol edges: ping, unknown method, unknown tool, malformed JSON, GET.
     assert_eq!(rpc(&srv, "ping", json!({})).await, json!({}));

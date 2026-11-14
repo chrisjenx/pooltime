@@ -61,6 +61,12 @@
     journal: { requests: null, stats: null, events: null, errorsOnly: false, open: {}, details: {}, error: null },
     // Weekly burn (Overview, key holders only): refetched at most every BURN_MS.
     burn: null, burnAt: 0, burnError: null,
+    // Routing preview (Routing view, key holders only): refetched on every poll while shown.
+    // `model` is the picker's choice; null follows the server's default (most requested model).
+    // `models` is the picker list, asked for only on the first load and then every MODELS_MS.
+    // `select` is the picker element, kept across repaints; `pickingUntil` holds repaints off
+    // while its dropdown may be open.
+    routing: { doc: null, model: null, error: null, models: null, modelsAt: 0, select: null, optionsKey: "", pickingUntil: 0 },
     // Account order (Overview, Accounts, Routing), remembered in localStorage; filters are not.
     sort: { key: "reset7", reversed: false },
     filter: { q: "", state: "all", provider: "all" },
@@ -335,6 +341,103 @@
     return h("div", { class: cls }, fill);
   }
 
+  // A score bar: the share of the best score in the table (no usage tone).
+  function scoreBar(score, best) {
+    if (typeof score !== "number" || !(best > 0)) return h("div", { class: "bar none", title: "not scored" });
+    const fill = h("span");
+    fill.style.width = (clamp01(score / best) * 100).toFixed(1) + "%";
+    return h("div", { class: "bar score" }, fill);
+  }
+
+  // The model picker: one element for the page's life, its options rebuilt only when the list
+  // changes, so a poll never swaps it out from under an open dropdown.
+  function modelPicker(d) {
+    const r = ui.routing;
+    const done = () => { r.pickingUntil = 0; };
+    if (!r.select) {
+      r.select = h("select", {
+        "aria-label": "model",
+        // Safari does not focus a select on click, so hold repaints from the press instead.
+        onmousedown: () => { r.pickingUntil = Date.now() + 15000; },
+        onfocus: () => { r.pickingUntil = Date.now() + 15000; },
+        onblur: done,
+        onkeydown: (ev) => { if (ev.key === "Escape") done(); },
+        onchange: (ev) => { done(); r.model = ev.target.value; ev.target.blur(); loadRouting().then(render); },
+      });
+    }
+    const list = (r.models || []).slice();
+    if (!list.some((m) => m.id === d.model)) list.push({ id: d.model, requests: 0 });
+    const key = JSON.stringify(list);
+    if (key !== r.optionsKey) {
+      r.optionsKey = key;
+      r.select.replaceChildren(...list.map((m) => h("option", {
+        value: m.id,
+        text: m.id + (m.requests ? " · " + m.requests + (m.requests === 1 ? " request" : " requests") + " this week" : ""),
+      })));
+    }
+    if (r.select.value !== d.model) r.select.value = d.model;
+    return r.select;
+  }
+  function routingPicking() {
+    return ui.view === "routing" && ui.routing.pickingUntil > Date.now();
+  }
+
+  // Routing view: which account the next request for a model goes to, and why
+  // (GET /api/v1/routing/preview, the live router's own ranking; key holders only).
+  function routingPreview() {
+    if (!manage) return lockedPanel("Next request");
+    const r = ui.routing;
+    const d = r.doc;
+    const title = h("h2", { text: "Next request" });
+    if (!d) {
+      return h("div", { class: "panel" }, title,
+        r.error ? h("p", { class: "msg err", text: "Could not load the routing preview: " + r.error }) : h("p", { class: "empty", text: "Loading…" }));
+    }
+    const picker = h("label", { class: "inline" }, "Model", modelPicker(d));
+    const rows = d.accounts || [];
+    const best = Math.max(0, ...rows.map((a) => (typeof a.score === "number" ? a.score : 0)));
+    const fix = (x) => (typeof x === "number" ? x.toFixed(2) : "—");
+    const resets = (f) => f.expiry === "at" ? rel(f.expiry_reset) : f.expiry === "spent" ? "used up" : "not known";
+    const body = rows.map((a) => {
+      const f = a.factors || {};
+      const ov = f.weight_override;
+      const ex = a.excluded;
+      // Like everywhere else: an account that cannot be used shows no (stale) usage.
+      const unusable = ["needs_login", "billing", "access_denied"].includes(a.status);
+      const usage = (x) => (typeof x === "number" && !unusable ? pct(x) : "—");
+      return h("tr", { class: a.eligible ? (a.next ? "next" : "") : "excluded" },
+        h("td", { class: "nowrap" }, h("strong", { text: a.id }), " ", h("span", { class: "dim small", text: a.provider })),
+        h("td", null, a.eligible
+          ? h("span", { class: "pill ready", text: "Eligible" })
+          : h("span", { class: "small", title: ex ? ex.reason : null, text: ex ? ex.detail : "—" })),
+        h("td", { class: "num", text: usage(f.five_hour_used) }),
+        h("td", { class: "num", text: usage(f.seven_day_used) }),
+        h("td", { class: "num", text: resets(f) }),
+        h("td", { class: "num", text: fix(f.expiry_share) }),
+        h("td", { class: "num", title: "1.00 = no taper", text: fix(f.taper) }),
+        h("td", { class: "num", text: String(f.priority) }),
+        h("td", { class: "num" }, String(f.effective_weight),
+          ov ? h("span", { class: "chip", title: "base weight " + f.weight, text: "until " + clock(ov.until) }) : null),
+        h("td", { class: "num", title: f.in_flight ? f.in_flight + " in flight" : null, text: String(f.sessions) }),
+        h("td", { class: "num" }, h("strong", { text: fix(a.score) })),
+        h("td", { class: "scorecell" }, scoreBar(a.score, best)),
+        h("td", { class: "nowrap" }, a.next ? h("span", { class: "pill ready", text: "Next" }) : a.tied ? h("span", { class: "chip", text: "tied" }) : null));
+    });
+    const heads = ["Account", "Eligible", "5h used", "7d used", "7d resets", "Expiry share", "Taper", "Priority", "Weight", "Sessions", "Score", "", "Next"];
+    return h("div", { class: "panel" },
+      h("div", { class: "panel-head" }, title, picker),
+      h("p", { class: "route-summary", text: d.summary }),
+      r.error ? h("p", { class: "msg err", text: "Stale: the last refresh failed (" + r.error + ")" }) : null,
+      h("p", { class: "section-note", text:
+        "Score = weight × expiry share × taper ÷ (pinned sessions + 1). Only the lowest priority number with an eligible account competes. " +
+        "The expiry share favours the account whose 7-day window resets soonest (5, 3, 2, 1, then halving); the taper lowers accounts with little 5-hour room left, " +
+        "and accounts over the 5-hour limit sit out while others have room. Exact ties take turns. " + ((d.sticky && d.sticky.note) || "") }),
+      h("div", { class: "table-wrap" },
+        h("table", { class: "routing" },
+          h("thead", null, h("tr", null, heads.map((t) => h("th", { text: t })))),
+          h("tbody", null, body))));
+  }
+
   // ---- weekly burn chart (plain SVG via createElementNS; no inline style, CSP-safe) ----------
   const SVG_NS = "http://www.w3.org/2000/svg";
   function s(tag, attrs) {
@@ -487,6 +590,26 @@
     ui.burnAt = Date.now();
   }
 
+  const MODELS_MS = 300000;
+  async function loadRouting() {
+    if (!manage || ui.view !== "routing") return;
+    const r = ui.routing;
+    // Polls of a chosen model skip the picker list (it costs a journal query).
+    const wantModels = !r.models || Date.now() - r.modelsAt > MODELS_MS;
+    const q = r.model
+      ? "?model=" + encodeURIComponent(r.model) + (wantModels ? "&models=true" : "")
+      : "";
+    try {
+      const doc = await api("GET", "/api/v1/routing/preview" + q);
+      if (doc && doc.models) { r.models = doc.models; r.modelsAt = Date.now(); }
+      if (doc && !r.model) r.model = doc.model;
+      r.doc = doc;
+      r.error = null;
+    } catch (e) {
+      r.error = e.message;
+    }
+  }
+
   async function toggleRequest(id) {
     const j = ui.journal;
     if (j.open[id]) { delete j.open[id]; render(); return; }
@@ -515,6 +638,7 @@
       if (data && data.now) ui.skew = Date.parse(data.now) - Date.now();
       await loadJournal();
       await loadBurn();
+      await loadRouting();
       render();
     } catch (e) {
       ui.error = e.message;
@@ -540,7 +664,7 @@
     }
     renderBanner();
     // Leave the view alone while the user is typing in it; drafts survive the next render.
-    if (editing()) return;
+    if (editing() || routingPicking()) return;
     paintView();
   }
 
@@ -742,11 +866,11 @@
         h("h2", { text: "Tuning" }),
         h("div", { class: "form-grid" },
           field("five_hour_exp", "5-hour exponent", "How strongly 5-hour usage lowers an account's score."),
-          field("min_headroom", "Minimum headroom", "Accounts with less 7-day headroom than this are skipped while others have room (0.1 = skipped above 90% used)."),
+          field("min_headroom", "Minimum headroom", "Accounts with less 5-hour headroom than this are skipped while others have room (0.1 = skipped above 90% used)."),
           field("headroom_taper_start", "Headroom taper start", "Below this headroom an account's share tapers off (0.2 = from 80% 5-hour used).")),
         h("div", { class: "inline card-actions" },
           manage ? h("button", { type: "button", onclick: saveTuning }, "Save tuning") : null, msgEl(tk)));
-      return [table, tuning];
+      return [routingPreview(), table, tuning];
     },
 
     mappings(d) {
@@ -1261,6 +1385,7 @@
     ui.view = VIEWS[v] ? v : "overview";
     render();
     loadJournal().then(render);
+    loadRouting().then(render);
   }
 
   function init() {

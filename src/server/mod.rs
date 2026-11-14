@@ -20,6 +20,7 @@ pub mod journal_api;
 pub mod mgmt;
 pub mod models_route;
 pub mod router;
+pub mod routing_preview;
 pub mod shutdown;
 
 use std::collections::HashMap;
@@ -80,6 +81,8 @@ pub struct AppState {
     /// Dev/test hook: when set, `GET /api/v1/status` serves this document instead of the live
     /// state (`POOLTIME_FIXTURE_STATE`, see [`daemon`]). `None` in normal operation.
     pub fixture_state: Option<serde_json::Value>,
+    /// The routing preview's model-usage cache (picker list; short TTL).
+    pub(crate) model_usage: routing_preview::ModelUsageCache,
 }
 
 impl AppState {
@@ -121,6 +124,7 @@ impl AppState {
             config_write: tokio::sync::Mutex::new(()),
             signins: mgmt::SignIns::default(),
             fixture_state: None,
+            model_usage: Default::default(),
         }
     }
 

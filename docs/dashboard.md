@@ -21,13 +21,40 @@ refused.
 |---|---|
 | **Overview** | Alert banner ("2 accounts need login · 1 login expires within 3 days", **Re-login all**); the 7-day picture (subscriptions' worth of usage this week, "1.79 of 7 subscriptions used", with a bar that fills as it grows; accounts ready, in-flight requests, active sessions, failing usage checks, accounts by state); **Needs attention** (every account that is not ready, has a login expiring soon or a failing usage check, most severe first, with why and since when); the accounts table (plan, non-default routing, 5-hour and 7-day usage, 7-day reset, activity), sortable and filterable; weekly burn (subscriptions used per week, this week's forecast) |
 | **Accounts** | One card per account, same sort and filters as the Overview: state, since when and why, plan and rate tier, 7-day usage and reset, login and access-token expiry, routing, in-flight requests and sessions, last used, requests and tokens (current window and all time), last error, usage per window with when it was last checked; **Re-login** (and **Recheck billing** for `billing`) |
-| **Routing** | Priority, weight and temporary weight overrides ("until"); routing tuning (`min_headroom`, `five_hour_exp`, `headroom_taper_start`) |
+| **Routing** | **Next request**: pick a model (defaults to the most requested Claude model this week) to see which account its next request goes to and why, in one line ("Next request for claude-opus-4-5 goes to personal: highest score (3.75, ahead of team-1 at 2.50), 7-day 37% used, resets in 4d 21h."), then one row per account: eligible or why not, 5-hour and 7-day used, 7-day reset, expiry share, taper, priority, weight (with any override), pinned sessions, score with a bar, and the **Next** marker. Below: priority, weight and temporary weight overrides ("until"); routing tuning (`min_headroom`, `five_hour_exp`, `headroom_taper_start`) |
 | **Mappings** | Map a Claude model family (e.g. `opus`) to a Codex route; on/off switch |
 | **Requests** | Recent requests (filter to errors), click one for its attempt chain; per-account error rate and p50/p95 latency over 24 h; storage used |
 | **Events** | Every account state change, newest first, with the reason |
 | **Settings** | Connected Claude Code profiles (connect / disconnect); about: version, data dir, theme |
 
-Requests, Events and the weekly burn need the key (they are not in the read-only view).
+Requests, Events, the weekly burn and the routing preview need the key (they are not in the
+read-only view).
+
+## Reading the Routing view
+
+![Routing](img/dashboard-routing.png)
+
+The **Next request** panel asks the daemon (`GET /api/v1/routing/preview`) what its router would
+do with a new session's request for the chosen model right now, using the same code path as a real
+request, without changing anything. It refreshes with the rest of the page.
+
+- **Score** = weight × expiry share × taper ÷ (pinned sessions + 1). The highest score among the
+  eligible accounts wins; exact ties take turns (the row is marked **tied**). The turn is shared
+  by all traffic, so for tied accounts the **Next** marker is a snapshot: any request in between
+  moves it. Likewise, when every account is at its in-flight cap the request waits and picks
+  again, so it may go to whichever account frees up first.
+- **Expiry share** favours the account whose 7-day window resets soonest: 5 for the soonest reset,
+  then 3, 2, 1 and halving. An account with no known reset yet ranks first (it gets probed).
+- **Taper** is 1.00 until the 5-hour window is 80% used (`headroom_taper_start` 0.2), then falls
+  towards 0. Above 90% used (`min_headroom` 0.1) the account sits out while others have room.
+- **Priority**: only the lowest priority number that has an eligible account competes; the others
+  show "priority 100 is a reserve".
+- **Sessions** are the conversations pinned to the account. They lower its score for new sessions,
+  and a pinned conversation keeps its account while that account can serve and is in the active
+  tier.
+- **Eligible** shows why an account is out: signed out, rate-limited until a time, billing, access
+  denied, the model family's limit used up, at its in-flight cap, a reserve tier, over the 5-hour
+  limit, or (for a family mapped to Codex) the other provider serving first.
 
 ![Requests](img/dashboard-requests.png)
 

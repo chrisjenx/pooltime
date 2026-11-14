@@ -335,6 +335,24 @@ fn percentile(v: &[i64], p: usize) -> Option<i64> {
     v.get(rank - 1).copied()
 }
 
+/// The most requested models since `since` (unix seconds), most requests first (ties by id),
+/// at most `limit`, with their request counts.
+pub fn top_models(conn: &Connection, since: i64, limit: u32) -> anyhow::Result<Vec<(String, u64)>> {
+    let mut st = conn.prepare(
+        "SELECT model, count(*) AS n FROM journal_requests
+         WHERE ts >= ?1 AND model IS NOT NULL AND model != ''
+         GROUP BY model ORDER BY n DESC, model LIMIT ?2",
+    )?;
+    let rows = st.query_map(rusqlite::params![since, limit], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    rows.map(|r| {
+        r.map(|(m, n)| (m, u64::try_from(n).unwrap_or(0)))
+            .map_err(Into::into)
+    })
+    .collect()
+}
+
 /// Number of journal requests.
 pub fn count(conn: &Connection) -> anyhow::Result<i64> {
     Ok(conn.query_row("SELECT count(*) FROM journal_requests", [], |r| r.get(0))?)

@@ -1,0 +1,245 @@
+---
+source: tests/it/routing_preview.rs
+expression: "serde_json::to_string_pretty(&shown).unwrap()"
+---
+{
+  "model": "claude-opus-4-5",
+  "family": "opus",
+  "now": "2026-11-07T12:00:00Z",
+  "provider": "anthropic",
+  "mapped_to": null,
+  "provider_choice": null,
+  "active_tier": 10,
+  "tuning": {
+    "five_hour_exp": 1.0,
+    "min_headroom": 0.1,
+    "headroom_taper_start": 0.2
+  },
+  "next": {
+    "account": "personal",
+    "provider": "anthropic",
+    "score": 3.75,
+    "reason": "highest_score",
+    "tied_with": [],
+    "runner_up": {
+      "account": "team-1",
+      "score": 2.5
+    },
+    "waits_for_slot": false,
+    "seven_day_used": 0.37,
+    "expiry_reset": "2026-11-12T09:00:00Z"
+  },
+  "summary": "Next request for claude-opus-4-5 goes to personal: highest score (3.75, ahead of team-1 at 2.50), 7-day 37% used, resets in 4d 21h.",
+  "sticky": {
+    "pinned_sessions": 4,
+    "note": "A request from an existing session stays on the account it is pinned to while that account can serve and is in the active tier. This preview is for a new session."
+  },
+  "accounts": [
+    {
+      "id": "personal",
+      "provider": "anthropic",
+      "status": "ready",
+      "eligible": true,
+      "excluded": null,
+      "factors": {
+        "five_hour_used": 0.25,
+        "seven_day_used": 0.37,
+        "expiry": "at",
+        "expiry_reset": "2026-11-12T09:00:00Z",
+        "expiry_share": 3.0,
+        "taper": 1.0,
+        "viable": true,
+        "priority": 10,
+        "weight": 2.0,
+        "weight_override": {
+          "weight": 5.0,
+          "until": "2026-11-08T00:00:00Z"
+        },
+        "effective_weight": 5.0,
+        "sessions": 3,
+        "in_flight": 2,
+        "cap": 0
+      },
+      "score": 3.75,
+      "tied": false,
+      "next": true
+    },
+    {
+      "id": "team-1",
+      "provider": "anthropic",
+      "status": "ready",
+      "eligible": true,
+      "excluded": null,
+      "factors": {
+        "five_hour_used": 0.05,
+        "seven_day_used": 0.12,
+        "expiry": "at",
+        "expiry_reset": "2026-11-10T21:00:00Z",
+        "expiry_share": 5.0,
+        "taper": 1.0,
+        "viable": true,
+        "priority": 10,
+        "weight": 1.0,
+        "weight_override": null,
+        "effective_weight": 1.0,
+        "sessions": 1,
+        "in_flight": 0,
+        "cap": 0
+      },
+      "score": 2.5,
+      "tied": false,
+      "next": false
+    },
+    {
+      "id": "lapsed",
+      "provider": "anthropic",
+      "status": "billing",
+      "eligible": false,
+      "excluded": {
+        "reason": "billing",
+        "detail": "billing problem on the subscription",
+        "until": null
+      },
+      "factors": {
+        "five_hour_used": null,
+        "seven_day_used": null,
+        "expiry": "unknown",
+        "expiry_reset": null,
+        "expiry_share": null,
+        "taper": 1.0,
+        "viable": true,
+        "priority": 100,
+        "weight": 1.0,
+        "weight_override": null,
+        "effective_weight": 1.0,
+        "sessions": 0,
+        "in_flight": 0,
+        "cap": 0
+      },
+      "score": null,
+      "tied": false,
+      "next": false
+    },
+    {
+      "id": "old-laptop",
+      "provider": "anthropic",
+      "status": "needs_login",
+      "eligible": false,
+      "excluded": {
+        "reason": "needs_login",
+        "detail": "signed out: needs a re-login",
+        "until": null
+      },
+      "factors": {
+        "five_hour_used": 0.0,
+        "seven_day_used": null,
+        "expiry": "unknown",
+        "expiry_reset": null,
+        "expiry_share": null,
+        "taper": 1.0,
+        "viable": true,
+        "priority": 100,
+        "weight": 1.0,
+        "weight_override": null,
+        "effective_weight": 1.0,
+        "sessions": 0,
+        "in_flight": 0,
+        "cap": 0
+      },
+      "score": null,
+      "tied": false,
+      "next": false
+    },
+    {
+      "id": "org-seat",
+      "provider": "anthropic",
+      "status": "access_denied",
+      "eligible": false,
+      "excluded": {
+        "reason": "access_denied",
+        "detail": "access denied; rechecked at 2026-11-07 13:00 UTC",
+        "until": "2026-11-07T13:00:00Z"
+      },
+      "factors": {
+        "five_hour_used": 0.0,
+        "seven_day_used": 0.4,
+        "expiry": "at",
+        "expiry_reset": "2026-11-11T00:00:00Z",
+        "expiry_share": null,
+        "taper": 1.0,
+        "viable": true,
+        "priority": 200,
+        "weight": 0.5,
+        "weight_override": null,
+        "effective_weight": 0.5,
+        "sessions": 0,
+        "in_flight": 0,
+        "cap": 0
+      },
+      "score": null,
+      "tied": false,
+      "next": false
+    },
+    {
+      "id": "spare",
+      "provider": "anthropic",
+      "status": "needs_login",
+      "eligible": false,
+      "excluded": {
+        "reason": "needs_login",
+        "detail": "signed out: needs a re-login",
+        "until": null
+      },
+      "factors": {
+        "five_hour_used": null,
+        "seven_day_used": null,
+        "expiry": "unknown",
+        "expiry_reset": null,
+        "expiry_share": null,
+        "taper": 1.0,
+        "viable": true,
+        "priority": 100,
+        "weight": 1.0,
+        "weight_override": null,
+        "effective_weight": 1.0,
+        "sessions": 0,
+        "in_flight": 0,
+        "cap": 0
+      },
+      "score": null,
+      "tied": false,
+      "next": false
+    },
+    {
+      "id": "team-2",
+      "provider": "anthropic",
+      "status": "rate_limited",
+      "eligible": false,
+      "excluded": {
+        "reason": "rate_limited",
+        "detail": "rate-limited until 2026-11-07 15:00 UTC",
+        "until": "2026-11-07T15:00:00Z"
+      },
+      "factors": {
+        "five_hour_used": 1.0,
+        "seven_day_used": 0.9,
+        "expiry": "at",
+        "expiry_reset": "2026-11-12T09:00:00Z",
+        "expiry_share": null,
+        "taper": 0.0,
+        "viable": false,
+        "priority": 100,
+        "weight": 1.0,
+        "weight_override": null,
+        "effective_weight": 1.0,
+        "sessions": 0,
+        "in_flight": 0,
+        "cap": 0
+      },
+      "score": null,
+      "tied": false,
+      "next": false
+    }
+  ],
+  "default_model": "claude-opus-4-5"
+}

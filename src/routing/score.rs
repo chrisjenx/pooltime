@@ -57,6 +57,19 @@ pub fn gate_headroom(
     }
 }
 
+/// Highest utilization (0-1) among the live binding 7d windows for `family`, or `None` with no
+/// such window. Display only (the routing preview): the score uses the 7d *reset*, not this.
+pub fn seven_day_used(
+    snap: Option<&RateLimitSnapshot>,
+    family: Option<&str>,
+    now: OffsetDateTime,
+) -> Option<f64> {
+    binding_windows(snap?, family, now)
+        .filter(|w| window_duration(&w.key) == Some(Duration::days(7)))
+        .map(|w| w.utilization)
+        .fold(None, |m: Option<f64>, u| Some(m.map_or(u, |m| m.max(u))))
+}
+
 /// Expiry ordering key from the longest-duration live binding window(s) (normally
 /// `7d`, or `7d-<family>` when that is the longest): the soonest future reset among those not spent; else `Spent` if any of them is
 /// spent; else `Unknown` (no data, or only already-passed resets).

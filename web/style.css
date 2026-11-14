@@ -310,6 +310,17 @@ table.accounts tr.sev-needs_login td:first-child, table.accounts tr.sev-billing 
 .form-grid { display: grid; grid-template-columns: 200px 120px 1fr; gap: 8px 12px; align-items: center; }
 .form-grid .help { color: var(--muted); font-size: 12.5px; }
 
+/* ---- routing preview ---- */
+
+.panel-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; margin-bottom: 6px; }
+.panel-head h2 { margin-bottom: 0; }
+.route-summary { font-size: 15px; font-weight: 500; margin: 4px 0 6px; }
+table.routing td, table.routing th { padding-right: 12px; }
+table.routing tr.excluded td { color: var(--muted); }
+table.routing tr.next td:first-child { box-shadow: inset 3px 0 0 var(--ok); padding-left: 8px; }
+td.scorecell { width: 14%; min-width: 90px; }
+.bar.score > span { background: var(--ok); }
+
 /* ---- requests / events ---- */
 
 tr.clickable { cursor: pointer; }
