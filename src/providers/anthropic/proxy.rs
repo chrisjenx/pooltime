@@ -15,6 +15,8 @@
 //! | 401 | refresh (forced unless someone already rotated the token) and retry once; a second 401 is "other" |
 //! | other non-2xx | record `Status(code)`, `Terminal` replay |
 //! | transport failure | record, `Retry(Transport)` with a 502 `api_error` + `x-pool-retryable-transport: 1` |
+//! | API host DNS lookup failed | nothing recorded, `Retry(Network(Dns))`: the provider's other accounts (same host) are skipped (see [`network_unavailable`]) |
+//! | token host DNS lookup failed (expired token) | nothing recorded, `Retry(Refresh(Network(Dns)))` (see [`refresh_failure_outcome`]) |
 //! | refresh failure | `Retry(Refresh)` with a 401 `authentication_error` (see [`refresh_failure_outcome`]) |
 //!
 //! Session pins are not owned here: the caller evicts the account's pins when an attempt returns
@@ -536,6 +538,10 @@ impl Provider for AnthropicProvider {
         ProviderId::Anthropic
     }
 
+    fn api_host(&self) -> Option<String> {
+        crate::dnswatch::host_of(&self.cfg.api_base)
+    }
+
     async fn access_token(
         &self,
         acct: &AccountMeta,
@@ -586,8 +592,17 @@ impl Provider for AnthropicProvider {
 }
 
 /// Outcome when no usable access token could be obtained for an account: 401
-/// `authentication_error`, fail over. The refresh path has already recorded the error.
+/// `authentication_error`, fail over. The refresh path has already recorded the error. A refresh
+/// whose token host did not resolve (nothing recorded) fails over too, with the
+/// [`network_unavailable_response`] as the fallback: an account with a fresh token may still be
+/// served.
 pub fn refresh_failure_outcome(kind: RefreshErrorKind) -> AttemptOutcome {
+    if kind.is_dns() {
+        return AttemptOutcome::Retry {
+            reason: FailReason::Refresh(kind),
+            fallback_response: network_unavailable_response(),
+        };
+    }
     AttemptOutcome::Retry {
         reason: FailReason::Refresh(kind),
         fallback_response: anthropic_error(
@@ -596,6 +611,37 @@ pub fn refresh_failure_outcome(kind: RefreshErrorKind) -> AttemptOutcome {
             "Could not refresh the account's access token",
         ),
     }
+}
+
+/// Message of the [`network_unavailable_response`].
+pub const NETWORK_UNAVAILABLE_MESSAGE: &str = "pooltime: network unavailable (DNS lookup failed)";
+
+/// The provider's API host did not resolve (`kind` is [`TransportKind::is_dns`]): not the
+/// account's fault, so nothing is recorded against it. `Retry(Network(kind))`: the failover loop
+/// skips the provider's other accounts (same host); another provider (another host) may serve.
+pub fn network_unavailable(kind: TransportKind) -> AttemptOutcome {
+    AttemptOutcome::Retry {
+        reason: FailReason::Network(kind),
+        fallback_response: network_unavailable_response(),
+    }
+}
+
+/// The response when every remaining account sits behind a host that does not resolve: a 502
+/// `api_error` with `x-should-retry: true` (Claude Code retries a 5xx with backoff and honours
+/// that header) and `x-pool-retryable-transport: 1` (a mapped request may still hop to the other
+/// provider, another host). Not 503/529 `overloaded_error`: Claude Code reads overload as a
+/// capacity problem (repeated overloads can switch it to its fallback model).
+pub fn network_unavailable_response() -> Response {
+    let mut r = anthropic_error(502, "api_error", NETWORK_UNAVAILABLE_MESSAGE);
+    r.headers_mut().insert(
+        HeaderName::from_static("x-should-retry"),
+        HeaderValue::from_static("true"),
+    );
+    r.headers_mut().insert(
+        HeaderName::from_static(RETRYABLE_TRANSPORT_HEADER),
+        HeaderValue::from_static("1"),
+    );
+    r
 }
 
 /// Anthropic-shaped JSON error response `{"type":"error","error":{"type","message"}}`.
@@ -714,12 +760,22 @@ fn surface_overload(
     AttemptOutcome::Terminal(r, FailReason::Overloaded)
 }
 
-/// Transport failure (send, or a 2xx body that died): record, 502 `api_error`, fail over.
+/// Transport failure (send, or a 2xx body that died): record, 502 `api_error`, fail over. A
+/// failed DNS lookup is [`network_unavailable`]: not recorded.
 fn transport_outcome(
     call: &Call<'_>,
     kind: TransportKind,
     upstream_request_id: Option<String>,
 ) -> AttemptOutcome {
+    if kind.is_dns() {
+        tracing::debug!(
+            account = %call.acct,
+            request_id = %call.req.request_id,
+            transport = kind.as_str(),
+            "anthropic request failed: network unavailable"
+        );
+        return network_unavailable(kind);
+    }
     tracing::warn!(
         account = %call.acct,
         request_id = %call.req.request_id,

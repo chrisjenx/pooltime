@@ -31,11 +31,12 @@ use super::fallback::{self, ProviderPool, Served, Verdict};
 use super::router::{read_json, BodyReadAborted};
 use super::AppState;
 use crate::accounts::{AccountId, AccountMeta, AccountStatus, RateLimitSnapshot};
-use crate::errors::{FailReason, RefreshErrorKind};
+use crate::errors::{FailReason, RefreshErrorKind, TransportKind};
 use crate::logging::new_request_id;
 use crate::models::{effective_effort, family_of, Route};
 use crate::providers::anthropic::{
-    anthropic_error, refresh_failure_outcome, POOL_ACCOUNT_HEADER, RETRYABLE_TRANSPORT_HEADER,
+    anthropic_error, network_unavailable_response, refresh_failure_outcome, POOL_ACCOUNT_HEADER,
+    RETRYABLE_TRANSPORT_HEADER,
 };
 use crate::providers::openai::derive_effort_tier;
 use crate::providers::{AttemptCtx, AttemptOutcome, InboundRequest, ProviderId, TokenUsageFuture};
@@ -496,6 +497,19 @@ pub(super) async fn serve_provider(
         ProviderId::Anthropic => app.cfg.timeouts.anthropic_idle,
         ProviderId::OpenAi => app.cfg.timeouts.codex_idle,
     };
+    // The provider's API host failed its DNS lookup moments ago: every account here sends to it,
+    // so none is tried (another provider, another host, may still serve a mapped request).
+    if let Some(host) = provider
+        .api_host()
+        .filter(|h| app.upstream.dns().is_down(h))
+    {
+        tracing::info!(request_id = rid, provider = %pid, host, "API host does not resolve; provider skipped");
+        return Served {
+            response: network_unavailable_response(),
+            verdict: Verdict::Failed(FailReason::Network(TransportKind::Dns)),
+            provider: pid,
+        };
+    }
     let mut tried: HashSet<AccountId> = HashSet::new();
     let mut last: Option<(FailReason, Response)> = None;
     let mut total_accounts;
@@ -610,14 +624,27 @@ pub(super) async fn serve_provider(
                 fallback_response,
             } => {
                 journal.end_attempt(FAILOVER, Some(reason.detail()));
-                tracing::warn!(
-                    request_id = rid,
-                    account = %acct_id,
-                    provider = %pid,
-                    outcome = "retry",
-                    reason = %reason.detail(),
-                    "attempt failed; trying another account"
-                );
+                if reason.is_dns() {
+                    // Not the account's fault (nothing recorded); the host's outage is logged
+                    // once by the DNS watch.
+                    tracing::info!(
+                        request_id = rid,
+                        account = %acct_id,
+                        provider = %pid,
+                        outcome = "retry",
+                        reason = %reason.detail(),
+                        "attempt failed: host did not resolve"
+                    );
+                } else {
+                    tracing::warn!(
+                        request_id = rid,
+                        account = %acct_id,
+                        provider = %pid,
+                        outcome = "retry",
+                        reason = %reason.detail(),
+                        "attempt failed; trying another account"
+                    );
+                }
                 if matches!(
                     reason,
                     FailReason::Quota { .. } | FailReason::AccessDenied | FailReason::Billing
@@ -625,7 +652,12 @@ pub(super) async fn serve_provider(
                     app.sessions.evict_account(&acct_id);
                 }
                 tried.insert(acct_id);
+                let api_host_down = matches!(reason, FailReason::Network(_));
                 last = Some((reason, fallback_response));
+                if api_host_down {
+                    // Every other account of this provider sends to the same API host.
+                    break;
+                }
             }
         }
     }

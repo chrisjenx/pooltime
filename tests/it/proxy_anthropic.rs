@@ -1877,6 +1877,361 @@ mod inference {
         assert_eq!(retries, 2);
     }
 
+    /// The journal entry of `rid` (written asynchronously, so polled).
+    async fn journal_entry(addr: std::net::SocketAddr, rid: &str) -> serde_json::Value {
+        for _ in 0..200 {
+            let r = http_get(
+                addr,
+                &format!("/api/v1/requests/{rid}"),
+                &[("authorization", "Bearer mgmt-test-key")],
+            )
+            .await;
+            if r.status == 200 {
+                return r.json();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no journal entry for {rid}");
+    }
+
+    /// Nothing recorded against `id`: no error, no erroring streak, status unchanged.
+    fn untouched(pool: &Pool, id: &str) {
+        let (id, now) = (id.parse().unwrap(), OffsetDateTime::now_utc());
+        let st = pool.state.state(&id, now);
+        assert!(st.last_error.is_none(), "{id}: {:?}", st.last_error);
+        assert_eq!(st.lifetime.errors, 0, "{id}");
+        assert!(pool.state.erroring(&id, now).is_none(), "{id}");
+        assert_eq!(pool.state.status(&id, true, now), AccountStatus::Ready);
+    }
+
+    /// An Anthropic provider sending inference to `api_base` and refreshes to `token_url`.
+    fn anthropic_at(pool: &Pool, api_base: &str, token_url: &str) -> AnthropicProvider {
+        let (policy, _) = fast_policy();
+        let cfg = pooltime::config::AnthropicCfg {
+            api_base: api_base.into(),
+            token_url: token_url.into(),
+            ..Default::default()
+        };
+        AnthropicProvider::new(cfg, pool.reg.clone(), pool.state.clone(), pool.up.clone())
+            .with_overload_policy(policy)
+    }
+
+    /// `(provider, account, reason)` of each attempt of a journal entry.
+    fn chain(j: &serde_json::Value) -> Vec<(String, String, String)> {
+        j["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                let s = |k: &str| a[k].as_str().unwrap_or("-").to_string();
+                (s("provider"), s("account"), s("reason"))
+            })
+            .collect()
+    }
+
+    /// Captured log lines of `rid` saying a host's DNS lookups started failing.
+    fn dns_warnings(rid: &str) -> usize {
+        lines_for(rid)
+            .iter()
+            .filter(|l| l.contains("DNS lookup failed") && l.contains(UNRESOLVABLE_HOST))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn api_host_dns_failure_skips_its_accounts_and_hops_provider() {
+        // The Anthropic API host does not resolve (simulated: no real resolver); Codex is another
+        // host and answers.
+        let fake = FakeAnthropic::start().await;
+        let pool = Pool::new().with_dns_down();
+        pool.add_account("second", ProviderId::Anthropic, 100, "tok-second");
+        pool.add_account("codex1", ProviderId::OpenAi, 100, "tok-codex");
+        let codex = FakeProvider::new(ProviderId::OpenAi, |_, _| done(json!({"from": "codex"})));
+        let p = anthropic_at(&pool, UNRESOLVABLE, &format!("{}{}", fake.url(), TOKEN));
+        let booted = pool
+            .boot(Boot {
+                models: Some(mapped_models()),
+                ..Boot::default()
+                    .provider(Arc::new(p))
+                    .provider(codex.clone())
+            })
+            .await;
+
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 200, "{}", resp.text());
+        assert_eq!(resp.json()["from"], "codex");
+        let rid1 = resp.header(REQUEST_ID_HEADER).unwrap().to_string();
+        let j = journal_entry(booted.addr, &rid1).await;
+        let c = chain(&j);
+        // One Anthropic attempt (the other account is behind the same host), then the hop.
+        assert_eq!(c.len(), 2, "{j}");
+        assert_eq!(
+            (c[0].0.as_str(), c[0].2.as_str()),
+            ("anthropic", "network:dns")
+        );
+        assert_eq!((c[1].0.as_str(), c[1].1.as_str()), ("openai", "codex1"));
+
+        // Within the fail-fast window the Anthropic accounts are not tried at all.
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 200, "{}", resp.text());
+        let rid2 = resp.header(REQUEST_ID_HEADER).unwrap().to_string();
+        let c = chain(&journal_entry(booted.addr, &rid2).await);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert_eq!(c[0].0, "openai");
+        assert_eq!(codex.calls().len(), 2);
+        for id in ["work", "second"] {
+            untouched(&pool, id);
+        }
+        // One warning for the host, when its lookups started failing.
+        assert_eq!(dns_warnings(&rid1), 1, "{:#?}", lines_for(&rid1));
+        assert_eq!(dns_warnings(&rid2), 0, "{:#?}", lines_for(&rid2));
+    }
+
+    #[tokio::test]
+    async fn api_host_dns_failure_alone_is_a_retryable_502() {
+        use pooltime::providers::anthropic::NETWORK_UNAVAILABLE_MESSAGE;
+        let fake = FakeAnthropic::start().await;
+        let pool = Pool::new().with_dns_down();
+        pool.add_account("second", ProviderId::Anthropic, 100, "tok-second");
+        let p = anthropic_at(&pool, UNRESOLVABLE, &format!("{}{}", fake.url(), TOKEN));
+        let booted = pool.boot(Boot::default().provider(Arc::new(p))).await;
+        for n in 0..2 {
+            let resp = post(booted.addr, &simple_body()).await;
+            // A 5xx Claude Code backs off on and retries, with a clear message.
+            assert_eq!(resp.status, 502, "{}", resp.text());
+            let body = resp.json();
+            assert_eq!(body["error"]["type"], "api_error");
+            assert_eq!(body["error"]["message"], NETWORK_UNAVAILABLE_MESSAGE);
+            assert_eq!(
+                NETWORK_UNAVAILABLE_MESSAGE,
+                "pooltime: network unavailable (DNS lookup failed)"
+            );
+            assert_eq!(resp.header("x-should-retry"), Some("true"));
+            let rid = resp.header(REQUEST_ID_HEADER).unwrap().to_string();
+            let j = journal_entry(booted.addr, &rid).await;
+            assert_eq!(j["request"]["reason"], "network:dns", "{j}");
+            assert_eq!(j["request"]["status"], 502, "{j}");
+            // First: one attempt, never the second account (same host). Then: none at all.
+            assert_eq!(chain(&j).len(), 1 - n, "{j}");
+        }
+        for id in ["work", "second"] {
+            untouched(&pool, id);
+        }
+        let st = http_get(
+            booted.addr,
+            "/api/v1/stats",
+            &[("authorization", "Bearer mgmt-test-key")],
+        )
+        .await
+        .json();
+        for a in st["accounts"].as_array().unwrap() {
+            assert_eq!(a["rated_errors"], 0, "{st}");
+        }
+    }
+
+    #[tokio::test]
+    async fn token_host_dns_failure_fails_over_to_an_account_with_a_fresh_token() {
+        // The API answers (IP literal); the token host does not resolve. `work`'s token has
+        // expired, `second`'s is fresh.
+        let fake = FakeAnthropic::start().await;
+        fake.script(MESSAGES, vec![Reply::json(200, &ok_message(1, 1))]);
+        let pool = Pool::new().with_dns_down();
+        pool.reg
+            .write_creds(&pool.meta.id, &creds(ACCESS, -60))
+            .unwrap();
+        // A lower tier, so `work` (expired token) is tried first.
+        pool.add_account("second", ProviderId::Anthropic, 200, "tok-second");
+        let p = Arc::new(anthropic_at(
+            &pool,
+            &fake.url(),
+            &format!("{UNRESOLVABLE}{TOKEN}"),
+        ));
+        let booted = pool.boot(Boot::default().provider(p.clone())).await;
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 200, "{}", resp.text());
+        assert_eq!(resp.header("x-pool-account"), Some("second"));
+        let rid = resp.header(REQUEST_ID_HEADER).unwrap().to_string();
+        let c = chain(&journal_entry(booted.addr, &rid).await);
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert_eq!(
+            (c[0].1.as_str(), c[0].2.as_str()),
+            ("work", "refresh:network:dns")
+        );
+        assert_eq!(c[1].1, "second");
+        untouched(&pool, "work");
+
+        // Every token expired: each account fails over unrecorded, then the 502.
+        let second: pooltime::accounts::AccountId = "second".parse().unwrap();
+        pool.reg
+            .write_creds(&second, &creds("tok-second", -60))
+            .unwrap();
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 502, "{}", resp.text());
+        assert_eq!(resp.json()["error"]["type"], "api_error");
+        let rid = resp.header(REQUEST_ID_HEADER).unwrap().to_string();
+        let j = journal_entry(booted.addr, &rid).await;
+        assert_eq!(chain(&j).len(), 2, "{j}");
+        assert_eq!(j["request"]["reason"], "refresh:network:dns", "{j}");
+        assert_eq!(fake.requests_to(MESSAGES).len(), 1);
+        // More DNS refresh failures than the erroring threshold: none counts.
+        for _ in 0..3 {
+            assert_eq!(
+                p.access_token(&pool.meta, false).await.unwrap_err(),
+                RefreshErrorKind::Network(TransportKind::Dns)
+            );
+        }
+        untouched(&pool, "work");
+        untouched(&pool, "second");
+
+        // Contrast: a refresh that cannot connect does count.
+        let closed = support::procs::free_addr();
+        let p = anthropic_at(&pool, &fake.url(), &format!("http://{closed}{TOKEN}"));
+        for _ in 0..3 {
+            assert_eq!(
+                p.access_token(&pool.meta, false).await.unwrap_err(),
+                RefreshErrorKind::Network(TransportKind::Connect)
+            );
+        }
+        let now = OffsetDateTime::now_utc();
+        assert!(pool.state.erroring(&pool.meta.id, now).is_some());
+    }
+
+    #[tokio::test]
+    async fn token_host_dns_failure_keeps_a_still_valid_token() {
+        // Inside the refresh skew (expires in 60 s, skew 5 min) but not expired.
+        let fake = FakeAnthropic::start().await;
+        fake.script(MESSAGES, vec![Reply::json(200, &ok_message(1, 1))]);
+        let pool = Pool::new().with_dns_down();
+        pool.reg
+            .write_creds(&pool.meta.id, &creds(ACCESS, 60))
+            .unwrap();
+        let p = Arc::new(anthropic_at(
+            &pool,
+            &fake.url(),
+            &format!("{UNRESOLVABLE}{TOKEN}"),
+        ));
+        assert_eq!(p.access_token(&pool.meta, false).await.unwrap(), ACCESS);
+        // A forced refresh (the token was rejected) has no such fallback.
+        assert_eq!(
+            p.access_token(&pool.meta, true).await.unwrap_err(),
+            RefreshErrorKind::Network(TransportKind::Dns)
+        );
+        let booted = pool.boot(Boot::default().provider(p.clone())).await;
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 200, "{}", resp.text());
+        assert_eq!(resp.header("x-pool-account"), Some("work"));
+        let sent = fake.requests_to(MESSAGES);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].headers.get("authorization").unwrap(),
+            &format!("Bearer {ACCESS}")
+        );
+        let st = pool.state.state(&pool.meta.id, OffsetDateTime::now_utc());
+        assert!(st.last_error.is_none(), "{:?}", st.last_error);
+        assert_eq!(st.lifetime.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn lasting_dns_outage_shows_in_status() {
+        use pooltime::dnswatch::{DnsWatch, DNS_PROBE_EVERY, DNS_SKIP_CAP};
+        // Shown at once here (persistence threshold 0; the default is 10 minutes).
+        let fake = FakeAnthropic::start().await;
+        let pool = Pool::new().with_dns_watch(DnsWatch::new(
+            DNS_PROBE_EVERY,
+            DNS_SKIP_CAP,
+            Duration::ZERO,
+        ));
+        let p = anthropic_at(&pool, UNRESOLVABLE, &format!("{}{}", fake.url(), TOKEN));
+        let booted = pool.boot(Boot::default().provider(Arc::new(p))).await;
+        let status = || async { http_get(booted.addr, "/api/v1/status", &[]).await.json() };
+        assert_eq!(status().await["network"]["dns_down"], json!([]));
+        assert_eq!(post(booted.addr, &simple_body()).await.status, 502);
+        let v = status().await;
+        let down = v["network"]["dns_down"].as_array().unwrap();
+        assert_eq!(down.len(), 1, "{v}");
+        assert_eq!(down[0]["host"], UNRESOLVABLE_HOST);
+        assert!(down[0]["since"].is_string(), "{v}");
+        // No account is blamed for it.
+        assert_eq!(v["accounts"][0]["status"], "ready", "{v}");
+    }
+
+    #[tokio::test]
+    async fn dns_state_is_per_host_so_other_hosts_never_flap_it() {
+        use pooltime::dnswatch::DnsWatch;
+        capture_logs();
+        // Fail fast off (probe every send): every send to the dead host really tries it.
+        let up = dns_down_upstream().with_dns_watch(DnsWatch::new(
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_secs(600),
+        ));
+        let fake = FakeAnthropic::start().await;
+        let get = |url: String| reqwest::Client::new().get(url).build().unwrap();
+        let dead = "http://flap-test.invalid/x";
+        for _ in 0..3 {
+            assert_eq!(
+                up.send(get(dead.into()), &limits()).await.err(),
+                Some(TransportKind::Dns)
+            );
+            assert!(up
+                .send(get(format!("{}/x", fake.url())), &limits())
+                .await
+                .is_ok());
+        }
+        let logs = captured_logs();
+        let lines = |msg: &str| {
+            logs.lines()
+                .filter(|l| l.contains("flap-test.invalid") && l.contains(msg))
+                .count()
+        };
+        assert_eq!(lines("DNS lookup failed"), 1, "{logs}");
+        assert_eq!(lines("DNS lookups work again"), 0, "{logs}");
+    }
+
+    #[tokio::test]
+    async fn dns_blip_recovers_on_the_next_probe() {
+        use pooltime::dnswatch::DNS_PROBE_EVERY;
+        use std::sync::atomic::Ordering;
+        // The resolver is down for a moment (wake from sleep, a Wi-Fi change), with the default
+        // half-open timing: one real lookup per 2 s while the host is down.
+        let fake = FakeAnthropic::start().await;
+        let ok = || Reply::json(200, &ok_message(1, 1));
+        fake.script(MESSAGES, vec![ok(), ok(), ok()]);
+        let port = fake.url().rsplit(':').next().unwrap().to_string();
+        let dns = Arc::new(FlakyDns::default());
+        let mut pool = Pool::new();
+        pool.up = Arc::new(pooltime::upstream::Upstream::new().with_dns_resolver(dns.clone()));
+        let api = format!("http://flaky-api.test:{port}");
+        let p = anthropic_at(&pool, &api, &format!("{}{}", fake.url(), TOKEN));
+        let booted = pool.boot(Boot::default().provider(Arc::new(p))).await;
+
+        dns.down.store(true, Ordering::SeqCst);
+        assert_eq!(post(booted.addr, &simple_body()).await.status, 502);
+        assert_eq!(dns.lookups.load(Ordering::SeqCst), 1);
+        // Back seconds later. Until the next probe is due, requests fail fast, without a lookup.
+        dns.down.store(false, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let body = simple_body();
+        let burst = futures_util::future::join_all((0..3).map(|_| post(booted.addr, &body))).await;
+        assert!(started.elapsed() < DNS_PROBE_EVERY);
+        assert!(burst.iter().all(|r| r.status == 502));
+        assert_eq!(
+            dns.lookups.load(Ordering::SeqCst),
+            1,
+            "no lookup while failing fast"
+        );
+        assert!(fake.requests_to(MESSAGES).is_empty());
+        // About 2 s after the failure, the next request does a real lookup and is served.
+        tokio::time::sleep(DNS_PROBE_EVERY + Duration::from_millis(200)).await;
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 200, "{}", resp.text());
+        assert_eq!(dns.lookups.load(Ordering::SeqCst), 2);
+        // Cleared at once: the next one goes straight out.
+        assert_eq!(post(booted.addr, &simple_body()).await.status, 200);
+        assert_eq!(fake.requests_to(MESSAGES).len(), 2);
+        assert!(booted.app.upstream.dns().outages().is_empty());
+        untouched(&pool, "work");
+    }
+
     #[tokio::test]
     async fn classifier_starts_on_anthropic_no_affinity() {
         let fake = FakeAnthropic::start().await;

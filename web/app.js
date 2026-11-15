@@ -752,6 +752,9 @@
     if (later > 0) parts.push(later + (later === 1 ? " login expires" : " logins expire") + " soon");
     if (blocked.length) parts.push(blocked.length + " blocked (billing / access)");
     if (erroring.length) parts.push(erroring.length + " erroring");
+    // Upstream hosts whose DNS lookups keep failing (no account is to blame).
+    const dnsDown = ((ui.data.network || {}).dns_down || []).map((o) => o.host);
+    if (dnsDown.length) parts.push("DNS lookups failing for " + dnsDown.join(", "));
     if (!parts.length) { b.hidden = true; return; }
     b.hidden = false;
     b.className = dead.length || blocked.length || erroring.length ? "banner" : "banner warn";

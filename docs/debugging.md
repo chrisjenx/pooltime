@@ -54,9 +54,21 @@ carrying that id instead.
 account), `upstream_truncated`, `idle_timeout`, `reset` or `error`.
 
 **Attempt outcome**: the same words for the attempt that served, or `failover` for one that handed
-over to the next account. **Reasons** are classified: `quota`, `status:<code>`, `transport:dns`,
-`transport:tls`, `transport:connect`, `transport:reset`, `transport:idle_timeout`, `no_account`,
-`unknown_path`, `invalid_request`, and so on.
+over to the next account. **Reasons** are classified: `quota`, `status:<code>`, `transport:tls`,
+`transport:connect`, `transport:reset`, `transport:idle_timeout`, `network:dns`,
+`refresh:network:dns`, `no_account`, `unknown_path`, `invalid_request`, and so on.
+
+`network:dns` means the provider's API host did not resolve (this machine's DNS, or a DNS filter
+blocking that host); `refresh:network:dns` means its token host did not, for an account whose
+token had expired. Neither is the account's fault: nothing is recorded against it and `doctor`
+leaves them out of the error rate. When the API host fails, that provider's other accounts are
+skipped (they send to the same host) and so is the provider until its next check (one real
+lookup at most every 2 seconds, at most 5 seconds of skipping after the last failed lookup; any
+answer clears it at once); a mapped request still goes to the other provider. With nowhere left to go, the request gets a retryable 502
+`pooltime: network unavailable (DNS lookup failed)`. An account whose token is due for refresh
+but not yet expired keeps using it while its token host does not resolve. The log has one
+warning per host when its lookups start failing and one when it answers again; a host failing for
+10 minutes shows in `pooltime doctor` (`dns <host>`) and the dashboard banner.
 
 Response headers worth knowing:
 

@@ -75,8 +75,8 @@ Per-account priority and weight live with the account (`pooltime accounts set`),
 
 | Key | Default | Meaning |
 |---|---|---|
-| `logs_days` | `7` | delete log files older than this |
-| `logs_max_mb` | `50` | then delete oldest files until under this |
+| `logs_days` | `7` | delete log files older than this (0 = no age limit) |
+| `logs_max_mb` | `50` | then delete oldest files until under this (at start and hourly; the file being written is kept; 0 = no size cap) |
 | `journal_days` | `30` | journal, account timeline and alert records older than this are pruned |
 | `journal_max_mb` | `200` | prune oldest journal rows while the database holds more than this |
 | `journal_max_requests` | `100000` | ...or the journal holds more requests than this (0 = no row cap) |

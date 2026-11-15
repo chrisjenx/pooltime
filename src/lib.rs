@@ -4,6 +4,7 @@ pub mod background;
 pub mod claude_code;
 pub mod cli;
 pub mod config;
+pub mod dnswatch;
 pub mod errors;
 pub mod fsutil;
 pub mod health;

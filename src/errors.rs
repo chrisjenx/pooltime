@@ -45,6 +45,10 @@ pub enum FailReason {
     Transport(TransportKind),
     Refresh(RefreshErrorKind),
     Status(u16),
+    /// The DNS lookup of the provider's API host failed: a fault of this machine's network (or
+    /// of that one host), not of the account. Never recorded against an account; the provider's
+    /// other accounts (same host) are skipped, the other provider (another host) may still serve.
+    Network(TransportKind),
 }
 
 impl TransportKind {
@@ -60,6 +64,12 @@ impl TransportKind {
             TransportKind::Other => "other",
         }
     }
+
+    /// A failed DNS lookup: it fails the same way for every request to that host, whichever
+    /// account sends it, so it says nothing about the account.
+    pub fn is_dns(self) -> bool {
+        matches!(self, TransportKind::Dns)
+    }
 }
 
 impl RefreshErrorKind {
@@ -73,6 +83,11 @@ impl RefreshErrorKind {
             RefreshErrorKind::Server(code) => format!("server:{code}"),
             RefreshErrorKind::Other => "other".into(),
         }
+    }
+
+    /// A refresh whose token-endpoint host did not resolve ([`TransportKind::is_dns`]).
+    pub fn is_dns(self) -> bool {
+        matches!(self, RefreshErrorKind::Network(k) if k.is_dns())
     }
 }
 
@@ -90,28 +105,42 @@ impl FailReason {
             FailReason::Transport(_) => "transport",
             FailReason::Refresh(_) => "refresh",
             FailReason::Status(_) => "status",
+            FailReason::Network(_) => "network",
         }
     }
 
     /// `label()` plus the dynamic part: `transport:<kind>`, `refresh:<kind>`,
-    /// `status:<code>`. Never includes a quota reset time or upstream text.
+    /// `status:<code>`, `network:<kind>`. Never includes a quota reset time or upstream text.
     pub fn detail(&self) -> String {
         match self {
             FailReason::Transport(k) => format!("transport:{}", k.as_str()),
             FailReason::Refresh(k) => format!("refresh:{}", k.detail()),
             FailReason::Status(code) => format!("status:{code}"),
+            FailReason::Network(k) => format!("network:{}", k.as_str()),
             other => other.label().to_string(),
+        }
+    }
+
+    /// A failed DNS lookup, of the API host (`Network`, `Transport`) or of the token endpoint
+    /// (`Refresh`): not the account's fault.
+    pub fn is_dns(&self) -> bool {
+        match self {
+            FailReason::Network(k) | FailReason::Transport(k) => k.is_dns(),
+            FailReason::Refresh(k) => k.is_dns(),
+            _ => false,
         }
     }
 
     /// Whether failing over to the *other* provider is sensible (INV §5): quota,
     /// surfaced overload, and transport failures yes; `UpstreamRejected` never
-    /// (the request itself is bad, the other provider would reject it too).
+    /// (the request itself is bad, the other provider would reject it too). A failed DNS lookup
+    /// is (the other provider is another host).
     pub fn cross_provider_retryable(&self) -> bool {
-        matches!(
-            self,
-            FailReason::Quota { .. } | FailReason::Overloaded | FailReason::Transport(_)
-        )
+        self.is_dns()
+            || matches!(
+                self,
+                FailReason::Quota { .. } | FailReason::Overloaded | FailReason::Transport(_)
+            )
     }
 }
 
@@ -133,6 +162,7 @@ mod tests {
             FailReason::Refresh(RefreshErrorKind::Server(503)),
             FailReason::Refresh(RefreshErrorKind::InvalidGrant),
             FailReason::Status(418),
+            FailReason::Network(TransportKind::Dns),
         ];
         let rendered: Vec<String> = all
             .iter()
@@ -149,6 +179,7 @@ mod tests {
         refresh | refresh:server:503
         refresh | refresh:invalid_grant
         status | status:418
+        network | network:dns
         ");
         let transports = [
             TransportKind::Dns,
@@ -224,6 +255,28 @@ mod tests {
         ] {
             assert!(!r.cross_provider_retryable(), "{r:?}");
         }
+        // Another provider is another host.
+        assert!(FailReason::Network(TransportKind::Dns).cross_provider_retryable());
+        assert!(
+            FailReason::Refresh(RefreshErrorKind::Network(TransportKind::Dns))
+                .cross_provider_retryable()
+        );
+    }
+
+    #[test]
+    fn dns_failures_are_recognised() {
+        use TransportKind::*;
+        for k in [Connect, Tls, Reset, IdleTimeout, Deadline, Other] {
+            assert!(!k.is_dns(), "{k:?}");
+            assert!(!RefreshErrorKind::Network(k).is_dns(), "{k:?}");
+            assert!(!FailReason::Transport(k).is_dns(), "{k:?}");
+        }
+        assert!(Dns.is_dns());
+        assert!(RefreshErrorKind::Network(Dns).is_dns());
+        assert!(!RefreshErrorKind::Server(503).is_dns());
+        assert!(FailReason::Network(Dns).is_dns());
+        assert!(FailReason::Refresh(RefreshErrorKind::Network(Dns)).is_dns());
+        assert!(!FailReason::Quota { reset: None }.is_dns());
     }
 
     #[test]
@@ -239,6 +292,10 @@ mod tests {
                 r#"{"refresh":{"server":503}}"#,
             ),
             (FailReason::Status(418), r#"{"status":418}"#),
+            (
+                FailReason::Network(TransportKind::Dns),
+                r#"{"network":"dns"}"#,
+            ),
             (
                 FailReason::Quota {
                     reset: Some(datetime!(2026-11-07 12:00 UTC)),

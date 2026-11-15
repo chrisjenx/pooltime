@@ -696,6 +696,48 @@ async fn eof_before_terminal_pre_commit_fails_over() {
 }
 
 #[tokio::test]
+async fn api_host_dns_failure_is_not_recorded() {
+    // The Responses host does not resolve (simulated: no real resolver).
+    let fake = FakeOpenAi::start().await;
+    let pool = Pool::new().without_default_account().with_dns_down();
+    let meta = add_codex_account(&pool, "cx", 1, CODEX_ACCESS);
+    let (policy, _) = fast_policy();
+    let cfg = pooltime::config::OpenAiCfg {
+        api_base: UNRESOLVABLE.into(),
+        token_url: format!("{}{}", fake.url(), OAUTH_TOKEN),
+        usage_url: format!("{}{}", fake.url(), USAGE),
+        ..Default::default()
+    };
+    let p = OpenAiProvider::new(cfg, pool.reg.clone(), pool.state.clone(), pool.up.clone())
+        .with_overload_policy(policy)
+        .with_keepalive(KEEPALIVE);
+    for stream in [true, false] {
+        let out = run(&p, &pool, &meta, &codex_req(stream, "req_dns"), None).await;
+        // Fails over (the loop skips the rest of this host's accounts; another provider may
+        // serve), and is flagged for that hop.
+        assert_eq!(kind(&out), "retry 502 network:dns");
+        let AttemptOutcome::Retry { reason, .. } = &out else {
+            unreachable!()
+        };
+        assert_eq!(*reason, FailReason::Network(TransportKind::Dns));
+        let resp = response(out);
+        assert_eq!(resp.headers()["x-pool-retryable-transport"], "1");
+        assert_eq!(resp.headers()["x-should-retry"], "true");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let j: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(j["error"]["type"], "api_error");
+        assert_eq!(
+            j["error"]["message"],
+            "pooltime: network unavailable (DNS lookup failed)"
+        );
+    }
+    let st = state(&pool, &meta);
+    assert!(st.last_error.is_none(), "{:?}", st.last_error);
+    assert_eq!(st.lifetime.errors, 0);
+    assert!(fake.requests().is_empty());
+}
+
+#[tokio::test]
 async fn oversized_response_created_forces_message_start() {
     let big = "x".repeat(100_000);
     let created_big = event(json!({

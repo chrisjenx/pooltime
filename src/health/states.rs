@@ -56,9 +56,11 @@ pub fn severity(s: &AccountStatus) -> u8 {
 
 /// The class a failure counts under for `erroring`, `None` if it does not count. Counted: refresh
 /// network / 5xx failures, a 401 that persisted after a refresh, access denied. Quota, overload,
-/// a dead refresh token (that is `needs_login`) and per-request rejections do not.
+/// a dead refresh token (that is `needs_login`), per-request rejections and a token host that
+/// did not resolve (a DNS failure is no fault of the account; `doctor` shows a lasting one) do not.
 pub fn erroring_class(reason: &FailReason) -> Option<String> {
     match reason {
+        FailReason::Refresh(k) if k.is_dns() => None,
         FailReason::Refresh(RefreshErrorKind::Network(_) | RefreshErrorKind::Server(_))
         | FailReason::Status(401)
         | FailReason::AccessDenied => Some(reason.detail()),
@@ -299,7 +301,8 @@ mod tests {
 
         let counted = [
             FailReason::Refresh(RefreshErrorKind::Server(503)),
-            FailReason::Refresh(RefreshErrorKind::Network(TransportKind::Dns)),
+            FailReason::Refresh(RefreshErrorKind::Network(TransportKind::Reset)),
+            FailReason::Refresh(RefreshErrorKind::Network(TransportKind::Connect)),
             FailReason::Status(401),
             FailReason::AccessDenied,
         ];
@@ -313,6 +316,10 @@ mod tests {
             FailReason::Billing,
             FailReason::Refresh(RefreshErrorKind::InvalidGrant),
             FailReason::Status(404),
+            // The machine's DNS is down: no account is to blame.
+            FailReason::Refresh(RefreshErrorKind::Network(TransportKind::Dns)),
+            FailReason::Network(TransportKind::Dns),
+            FailReason::Transport(TransportKind::Dns),
         ];
         for r in ignored {
             assert_eq!(erroring_class(&r), None, "{r:?}");

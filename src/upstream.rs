@@ -7,6 +7,7 @@
 
 use std::error::Error as StdError;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -14,6 +15,7 @@ use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, StatusCode};
 use tokio::time::{timeout_at, Instant};
 
+use crate::dnswatch::DnsWatch;
 use crate::errors::TransportKind;
 use crate::logging::{debug_headers, redact_uri, DebugMode};
 
@@ -36,6 +38,9 @@ pub struct Upstream {
     client: reqwest::Client,
     /// While active, request/response headers of every send are logged (redacted).
     debug: DebugMode,
+    /// Per-host DNS health: hosts whose lookups fail are failed fast for a while and logged once
+    /// per outage ([`crate::dnswatch`]).
+    dns: Arc<DnsWatch>,
 }
 
 impl Default for Upstream {
@@ -46,17 +51,29 @@ impl Default for Upstream {
 
 impl Upstream {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .pool_idle_timeout(Duration::from_secs(90))
-            // Never follow redirects: auth headers must not travel cross-origin and the caller
-            // (failover logic) decides what a 3xx means.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("static reqwest client configuration is valid");
         Self {
-            client,
+            client: client(None),
             debug: DebugMode::default(),
+            dns: Arc::default(),
         }
+    }
+
+    /// Resolve host names with `resolver` instead of the system's (tests simulate a DNS outage
+    /// with it; IP-literal URLs never consult it).
+    pub fn with_dns_resolver(mut self, resolver: Arc<dyn reqwest::dns::Resolve>) -> Self {
+        self.client = client(Some(resolver));
+        self
+    }
+
+    /// Replace the DNS watch (tests: shorter fail-fast TTL or persistence threshold).
+    pub fn with_dns_watch(mut self, watch: DnsWatch) -> Self {
+        self.dns = Arc::new(watch);
+        self
+    }
+
+    /// Per-host DNS health seen by this client's sends.
+    pub fn dns(&self) -> &DnsWatch {
+        &self.dns
     }
 
     /// Share `debug` (the daemon hands the same switch to the management API).
@@ -72,12 +89,19 @@ impl Upstream {
     /// Send `req` and wait for the response headers.
     ///
     /// Header-wait expiry is classified [`TransportKind::IdleTimeout`]; the attempt deadline
-    /// expiring first is [`TransportKind::Deadline`].
+    /// expiring first is [`TransportKind::Deadline`]. A host whose DNS lookup just failed is
+    /// [`TransportKind::Dns`] at once, without a network call, unless this send is its periodic
+    /// probe ([`DnsWatch::admit`]).
     pub async fn send(
         &self,
         req: reqwest::Request,
         lim: &Limits,
     ) -> Result<UpstreamResponse, TransportKind> {
+        let host = req.url().host_str().map(str::to_ascii_lowercase);
+        if host.as_deref().is_some_and(|h| !self.dns.admit(h)) {
+            tracing::debug!(host = host.as_deref().unwrap_or("-"), "DNS down: not sent");
+            return Err(TransportKind::Dns);
+        }
         let (until, expiry) = bound(lim.header_wait, lim.deadline);
         if self.debug.active() {
             // Inside the request span, so the line carries the request id.
@@ -91,9 +115,18 @@ impl Upstream {
         }
         let resp = match timeout_at(until, self.client.execute(req)).await {
             Err(_) => return Err(expiry),
-            Ok(Err(e)) => return Err(classify_reqwest(&e)),
+            Ok(Err(e)) => {
+                let k = classify_reqwest(&e);
+                if let (true, Some(h)) = (k.is_dns(), host.as_deref()) {
+                    self.dns.failed(h);
+                }
+                return Err(k);
+            }
             Ok(Ok(r)) => r,
         };
+        if let Some(h) = host.as_deref() {
+            self.dns.resolved(h);
+        }
         let status = resp.status();
         let headers = resp.headers().clone();
         if self.debug.active() {
@@ -114,6 +147,20 @@ impl Upstream {
             },
         })
     }
+}
+
+/// The shared client: rustls, no decompression, no total timeout, pool idle 90 s, no redirects.
+fn client(resolver: Option<Arc<dyn reqwest::dns::Resolve>>) -> reqwest::Client {
+    let mut b = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(90))
+        // Never follow redirects: auth headers must not travel cross-origin and the caller
+        // (failover logic) decides what a 3xx means.
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(r) = resolver {
+        b = b.dns_resolver(r);
+    }
+    b.build()
+        .expect("static reqwest client configuration is valid")
 }
 
 /// `now + wait` capped by `deadline`, and which [`TransportKind`] its expiry means.

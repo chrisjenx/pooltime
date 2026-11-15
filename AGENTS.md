@@ -55,7 +55,8 @@ See [docs/architecture.md](docs/architecture.md) for the module map and request 
 - `src/supervisor/`: `serve --supervise`, worker generations and seamless restarts (the
   service's main process); `src/server/handoff.rs` is a worker's side.
 - `src/mcp/`, `src/service/`, `src/import/`, `src/analytics/`.
-- `src/config.rs`, `src/fsutil.rs`, `src/upstream.rs`, `src/sse.rs`, `src/logging.rs`, `src/errors.rs`.
+- `src/config.rs`, `src/fsutil.rs`, `src/upstream.rs`, `src/dnswatch.rs`, `src/sse.rs`,
+  `src/logging.rs`, `src/errors.rs`.
 - `web/` dashboard (vanilla JS, embedded); `tests/it/` integration tests, one module per file,
   linked into a single test binary (`tests/it/main.rs`), with fake upstreams in `tests/support/`;
   `harness/` differential harness.
