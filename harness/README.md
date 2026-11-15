@@ -23,7 +23,8 @@ tests (SSE reduction, comparison, allowlist validation) do run under `cargo test
 - `bun` (on `PATH`, else `/opt/homebrew/bin/bun`).
 - A bro-cli checkout that honors the Codex URL overrides (`CODEX_API_BASE_URL`,
   `OPENAI_OAUTH_TOKEN_URL`; branch `feat/codex-env-overrides` of `chrisjenx/bro-cli`). bro already
-  honors `ANTHROPIC_API_BASE_URL`, `CLAUDE_OAUTH_TOKEN_URL` and `CODEX_USAGE_URL`.
+  honors `ANTHROPIC_API_BASE_URL`, `CLAUDE_OAUTH_TOKEN_URL` and `CODEX_USAGE_URL`. The fork was deleted on 2026-11-14, so the bro side of the harness can only be run from a private copy of that branch.
+  Scenarios and benches that need bro can't run without it; `bench --only pooltime` can.
 - `bun install` run once in `<bro>/pool` (the harness checks for `pool/node_modules`; nothing is
   installed into this repo).
 

@@ -10,10 +10,10 @@ Claude Max and ChatGPT/Codex accounts behind one local Anthropic-compatible endp
 4. `docs/plans/2026-11-07-pooltime.md` — the task-by-task plan. Execute with superpowers:subagent-driven-development.
 
 ## Rules
-- Repo `github.com/chrisjenx/pooltime` (public). Never open PRs against `JustSuperHuman/bro-cli`; bro-fork PRs use
-  `--repo chrisjenx/bro-cli`.
-- Never print, log, or commit tokens/credentials. Never modify bro's `~/.claude-max-pool`, `~/.bro`, its Keychain
-  items, or the `~/.claude-work` profile. Ask before changing the live `~/.claude` / `~/.claude-personal` profiles.
+- Repo `github.com/chrisjenx/pooltime` (public). Never open PRs against `JustSuperHuman/bro-cli`. bro has been
+  retired on this machine (its data dirs and the `chrisjenx/bro-cli` fork were deleted on 2026-11-14).
+- Never print, log, or commit tokens/credentials, account names, emails or token fingerprints (use placeholders such
+  as `acct-a`, `user@example.com`). Never modify the `~/.claude-work` profile. Ask before changing the live `~/.claude` / `~/.claude-personal` profiles.
 - Tests: `cargo test`; no network in tests. Gates before every commit: `cargo fmt --check`,
   `cargo clippy --all-targets -- -D warnings`, `cargo test`.
 - The plan's Global Constraints apply to every task.
