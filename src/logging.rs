@@ -83,7 +83,8 @@ pub async fn catch_panic<F: std::future::Future>(task: &'static str, fut: F) -> 
 /// - `foreground_tty`: also human-readable output to stderr; services (non-TTY) log to the file only.
 /// - Filter: `POOLTIME_LOG` (EnvFilter syntax) or `info`.
 ///
-/// Old files are pruned once at startup. Safe to call more than once: a second
+/// Old files are pruned here, at startup; the daemon's active generation also prunes them
+/// hourly while it runs. Safe to call more than once: a second
 /// global subscriber is ignored (the first stays installed).
 ///
 /// Spans should carry `request_id`, `account` and `provider` fields where known.
@@ -142,8 +143,12 @@ fn build_subscriber(
 }
 
 /// Delete `pooltime.log*` files in `dir` older than `days`, then oldest-first until the
-/// total size is at most `max_mb` MiB. The newest file (the current day's) is never deleted.
-/// A missing directory is not an error. Other files are left alone.
+/// total size of the `pooltime.log*` files (the current one included) is at most `max_mb` MiB.
+/// The newest file (the one being written: the current day's, or yesterday's until the first
+/// line after midnight) is never deleted, so when it alone is over the cap every other log file
+/// goes and it stays. A missing directory is not an error. Other files (the service manager's
+/// `daemon.out` / `daemon.err`) are neither counted nor touched: they are held open by the
+/// service manager.
 pub fn prune_logs(dir: &Path, days: u32, max_mb: u64, now: SystemTime) -> io::Result<PruneStats> {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -462,6 +467,44 @@ mod tests {
         assert_eq!(s.deleted_files, 2);
         assert!(dir.path().join("pooltime.log.2026-11-07").exists());
         assert!(!dir.path().join("pooltime.log.2026-11-05").exists());
+    }
+
+    #[test]
+    fn current_file_over_the_cap_alone_is_kept_and_everything_else_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        const MB: usize = 1024 * 1024;
+        let mk = |name: &str, bytes: usize, age_secs: u64| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, vec![b'x'; bytes]).unwrap();
+            set_file_mtime(
+                &p,
+                FileTime::from_system_time(now - Duration::from_secs(age_secs)),
+            )
+            .unwrap();
+        };
+        mk("pooltime.log.2026-11-13", 10, 2 * 86_400);
+        mk("pooltime.log.2026-11-14", 10, 86_400);
+        // Being written: newest mtime, and alone larger than the 1 MiB cap.
+        mk("pooltime.log.2026-11-15", 2 * MB, 0);
+        // The service manager's output files are neither counted nor deleted.
+        mk("daemon.err", 3 * MB, 5 * 86_400);
+        let s = prune_logs(dir.path(), 7, 1, now).unwrap();
+        assert_eq!((s.deleted_files, s.deleted_bytes), (2, 20));
+        let left: HashSet<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            HashSet::from(["pooltime.log.2026-11-15".into(), "daemon.err".into()])
+        );
+        // Run again (the hourly prune): nothing left to delete, the current file stays.
+        assert_eq!(
+            prune_logs(dir.path(), 7, 1, now).unwrap(),
+            PruneStats::default()
+        );
+        assert!(dir.path().join("pooltime.log.2026-11-15").exists());
     }
 
     #[test]

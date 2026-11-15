@@ -51,6 +51,9 @@ const FORCED_REFRESH_DRAIN: Duration = Duration::from_secs(2);
 const STORE_FLUSH: Duration = Duration::from_secs(5);
 /// How often journal/usage-history retention runs.
 const RETENTION_EVERY: Duration = Duration::from_secs(60 * 60);
+/// How often old log files are pruned (also once at startup, by `logging::init`): a supervised
+/// worker runs for days, so pruning only at startup let the logs outgrow `logs_max_mb`.
+const LOG_PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
 
 /// Run the daemon until SIGTERM/SIGINT has drained (or a second signal forces exit).
 ///
@@ -262,7 +265,13 @@ fn spawn_tasks(
 ) -> (Tasks, StatusCache) {
     let store = app.store.clone();
     let retention_cfg = app.cfg.retention.clone();
+    let log_prune = spawn_log_prune(
+        app.paths.logs.clone(),
+        app.cfg.retention.clone(),
+        LOG_PRUNE_EVERY,
+    );
     let tasks = Tasks(vec![
+        log_prune,
         spawn_usage_sweeper(anthropic, SWEEP_INTERVAL),
         openai::spawn_usage_sweeper(openai, SWEEP_INTERVAL),
         // Codex catalog discovery: at boot (providers are registered by now), then hourly. New
@@ -494,6 +503,34 @@ impl Drop for Tasks {
     }
 }
 
+/// Prune the log files in `logs` (`retention.logs_days` / `logs_max_mb`, see
+/// [`crate::logging::prune_logs`]) at once and then every `period`, off the async workers. The
+/// file being written is never deleted.
+fn spawn_log_prune(
+    logs: std::path::PathBuf,
+    cfg: crate::config::RetentionCfg,
+    period: Duration,
+) -> JoinHandle<()> {
+    spawn_every("log prune", period, move || {
+        let (logs, days, max_mb) = (logs.clone(), cfg.logs_days, u64::from(cfg.logs_max_mb));
+        async move {
+            let job = crate::background::blocking(move || {
+                crate::logging::prune_logs(&logs, days, max_mb, std::time::SystemTime::now())
+            });
+            match job.await {
+                Ok(Ok(s)) if s.deleted_files > 0 => tracing::info!(
+                    deleted_files = s.deleted_files,
+                    deleted_bytes = s.deleted_bytes,
+                    "old log files pruned"
+                ),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(error_kind = ?e.kind(), "log pruning failed"),
+                Err(e) => tracing::warn!(error = %e, "log pruning task failed"),
+            }
+        }
+    })
+}
+
 /// Run `f` at once and then every `period` until aborted. A panicking iteration is logged
 /// (with `name`) and the next tick runs as usual.
 fn spawn_every<F, Fut>(name: &'static str, period: Duration, mut f: F) -> JoinHandle<()>
@@ -562,6 +599,52 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "stopped ticking");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn log_prune_runs_periodically_and_keeps_the_current_file() {
+        use filetime::{set_file_mtime, FileTime};
+        use std::time::SystemTime;
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().to_path_buf();
+        let mk = |name: &str, bytes: usize, age_days: u64| {
+            let p = logs.join(name);
+            std::fs::write(&p, vec![b'x'; bytes]).unwrap();
+            let t = SystemTime::now() - Duration::from_secs(age_days * 86_400 + 60);
+            set_file_mtime(&p, FileTime::from_system_time(t)).unwrap();
+            p
+        };
+        async fn gone(p: &std::path::Path) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while p.exists() {
+                assert!(tokio::time::Instant::now() < deadline, "{p:?} never pruned");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        const MB: usize = 1024 * 1024;
+        let current = mk("pooltime.log.2026-11-15", MB, 0);
+        let cfg = crate::config::RetentionCfg {
+            logs_days: 7,
+            logs_max_mb: 2,
+            ..Default::default()
+        };
+        let task = spawn_log_prune(logs.clone(), cfg, Duration::from_millis(20));
+
+        // Files that become prunable while the daemon runs go on a later tick: too old...
+        let old = mk("pooltime.log.2026-11-01", 10, 14);
+        gone(&old).await;
+        // ... or over the size cap (2 MiB with the 1 MiB current file: the oldest goes).
+        let a = mk("pooltime.log.2026-11-12", MB, 3);
+        let b = mk("pooltime.log.2026-11-13", MB / 2, 2);
+        gone(&a).await;
+        assert!(b.exists(), "within the cap with the current file");
+        // The current file grows past the cap alone: every other log goes, it stays.
+        std::fs::write(&current, vec![b'x'; 3 * MB]).unwrap();
+        gone(&b).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(current.exists(), "the file being written was deleted");
+        assert!(!task.is_finished());
         task.abort();
     }
 

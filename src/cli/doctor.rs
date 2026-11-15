@@ -48,7 +48,8 @@
 //!   offender is a `✗` line with its `chmod`.
 //! - **storage**: database against `retention.journal_max_mb` (at the cap is normal; `!` only
 //!   above 125 % of it, when pruning is not keeping up; with no cap, `!` above 1 GiB with the
-//!   logs), logs, and journal rows against `retention.journal_max_requests` (from the pool, when
+//!   logs), logs against `retention.logs_max_mb` (shown only: the pool prunes them hourly and the
+//!   file being written may exceed it alone), and journal rows against `retention.journal_max_requests` (from the pool, when
 //!   it runs). **retention**: the settings (`i`).
 //!
 //! Every call to the pool is bounded by 5 s, as is each upstream `HEAD`; the release check by
@@ -1384,6 +1385,11 @@ fn storage_check(paths: &Paths, ret: &RetentionCfg, journal_rows: Option<u64>) -
         detail.push_str(&format!(" of {} cap", mib(cap)));
     }
     detail.push_str(&format!(", logs {}", mib(logs)));
+    // The pool prunes the logs to this hourly; the file being written may exceed it alone.
+    if ret.logs_max_mb > 0 {
+        let logs_cap = u64::from(ret.logs_max_mb) * 1024 * 1024;
+        detail.push_str(&format!(" of {} cap", mib(logs_cap)));
+    }
     if let Some(n) = journal_rows {
         match ret.journal_max_requests {
             0 => detail.push_str(&format!(", journal {n} requests")),
@@ -1788,6 +1794,16 @@ mod tests {
         );
         let c = storage_check(&paths, &ret(2), Some(7));
         assert!(c.detail.contains("journal 7 of 100000 requests"), "{c}");
+        // The logs against `logs_max_mb` (default 50).
+        std::fs::create_dir_all(&paths.logs).unwrap();
+        std::fs::write(
+            paths.logs.join("pooltime.log.2026-11-15"),
+            vec![0u8; 512 * 1024],
+        )
+        .unwrap();
+        let c = storage_check(&paths, &ret(2), None);
+        assert!(c.detail.contains("logs 0.5 MiB of 50.0 MiB cap"), "{c}");
+        assert_eq!(c.level, Level::Ok, "{c}");
     }
 
     #[test]
