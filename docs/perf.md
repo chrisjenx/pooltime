@@ -11,7 +11,7 @@ cargo run -p harness -- bench --bro <bro-cli checkout> --pooltime target/release
 `<bro-cli checkout>` must be the `chrisjenx/bro-cli` fork on branch `feat/codex-env-overrides`
 (it adds the Codex URL overrides the sandbox needs), with `bun install` run once in its `pool/`.
 `bun` must be on `PATH` or passed with `--bun`. See [`harness/README.md`](../harness/README.md)
-("Requirements").
+("Requirements"). The fork was deleted on 2026-11-14, so the bro side of the bench can only be run from a private copy of that branch. `--only pooltime` still works without it.
 
 Leave out `--pooltime` and the bench runs `cargo build --release` itself. Defaults: 60 s idle,
 50 streams × 5 s, 15 timed boots of each kind, 300 TTFB requests per side at concurrency 4. A run
