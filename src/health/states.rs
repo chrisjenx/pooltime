@@ -56,11 +56,11 @@ pub fn severity(s: &AccountStatus) -> u8 {
 
 /// The class a failure counts under for `erroring`, `None` if it does not count. Counted: refresh
 /// network / 5xx failures, a 401 that persisted after a refresh, access denied. Quota, overload,
-/// a dead refresh token (that is `needs_login`), per-request rejections and a machine-wide
-/// network failure (a failed DNS lookup: no account is to blame) do not.
+/// a dead refresh token (that is `needs_login`), per-request rejections and a token host that
+/// did not resolve (a DNS failure is no fault of the account; `doctor` shows a lasting one) do not.
 pub fn erroring_class(reason: &FailReason) -> Option<String> {
     match reason {
-        FailReason::Refresh(k) if k.is_machine_wide() => None,
+        FailReason::Refresh(k) if k.is_dns() => None,
         FailReason::Refresh(RefreshErrorKind::Network(_) | RefreshErrorKind::Server(_))
         | FailReason::Status(401)
         | FailReason::AccessDenied => Some(reason.detail()),

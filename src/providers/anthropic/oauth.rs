@@ -106,8 +106,17 @@ impl AnthropicProvider {
         if let Some(r) = settled(&self.state, self.skew, id, &creds, force, None) {
             return r;
         }
-        // The token this caller saw; a different one later means someone else refreshed.
-        self.in_flight(id, force, creds.access_token).await
+        // Refreshing early (inside the skew): if the token host does not resolve, the current
+        // token still works until it actually expires, so the request is not failed for it.
+        let (current, expires_at) = (creds.access_token.clone(), creds.expires_at);
+        let still_valid = || !force && expires_at.is_some_and(|e| e > OffsetDateTime::now_utc());
+        match self.in_flight(id, force, creds.access_token).await {
+            Err(k) if k.is_dns() && still_valid() => {
+                tracing::debug!(account = %id, "token host did not resolve: using the still-valid token");
+                Ok(current)
+            }
+            r => r,
+        }
     }
 
     /// The shared refresh task for `(id, force)`, starting it if none is running.
@@ -200,18 +209,18 @@ fn load(
     }
 }
 
-/// Log the classified outcome, record it as the account's last error, return it. A machine-wide
-/// network failure (DNS) is not the account's: nothing is recorded and the account's state is
-/// left as it was (the next refresh retries on the usual schedule; [`crate::upstream::Upstream`]
-/// logs the outage once).
+/// Log the classified outcome, record it as the account's last error, return it. A token host
+/// that did not resolve (DNS) is not the account's fault: nothing is recorded and the account's
+/// state is left as it was (the next refresh retries on the usual schedule;
+/// [`crate::dnswatch`] logs the host's outage once).
 fn fail(
     state: &StateBook,
     id: &AccountId,
     kind: RefreshErrorKind,
     request_id: Option<String>,
 ) -> RefreshErrorKind {
-    if kind.is_machine_wide() {
-        tracing::debug!(account = %id, outcome = %kind.detail(), "oauth refresh failed: network unavailable");
+    if kind.is_dns() {
+        tracing::debug!(account = %id, outcome = %kind.detail(), "oauth refresh failed: token host did not resolve");
         return kind;
     }
     tracing::warn!(

@@ -101,17 +101,29 @@ impl Pool {
         self
     }
 
-    /// The machine's DNS is down: every host-name lookup of this pool's upstream client fails
-    /// (no real resolver is consulted). IP-literal URLs, like every fake's, still connect.
-    /// Build providers after calling this (they take `up` when made).
-    pub fn with_dns_down(mut self) -> Pool {
-        self.up = Arc::new(Upstream::new().with_dns_resolver(Arc::new(DnsDown)));
+    /// No host name resolves for this pool's upstream client (no real resolver is consulted);
+    /// IP-literal URLs, like every fake's, still connect. Build providers after calling this
+    /// (they take `up` when made).
+    pub fn with_dns_down(self) -> Pool {
+        self.with_dns_watch(pooltime::dnswatch::DnsWatch::default())
+    }
+
+    /// [`Pool::with_dns_down`] with the given DNS watch (fail-fast TTL, persistence threshold).
+    pub fn with_dns_watch(mut self, watch: pooltime::dnswatch::DnsWatch) -> Pool {
+        self.up = Arc::new(dns_down_upstream().with_dns_watch(watch));
         self
     }
 }
 
-/// A host name for upstream URLs that must fail their DNS lookup (with [`Pool::with_dns_down`];
+/// An upstream client for which no host name resolves (IP literals still connect).
+pub fn dns_down_upstream() -> Upstream {
+    Upstream::new().with_dns_resolver(Arc::new(DnsDown))
+}
+
+/// A host for upstream URLs that must fail its DNS lookup (with [`Pool::with_dns_down`];
 /// `.invalid` never resolves anyway).
+pub const UNRESOLVABLE_HOST: &str = "pooltime-test.invalid";
+/// [`UNRESOLVABLE_HOST`] as a base URL.
 pub const UNRESOLVABLE: &str = "http://pooltime-test.invalid";
 
 /// A resolver that fails every lookup, like a machine whose DNS is down.

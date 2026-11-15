@@ -115,6 +115,11 @@ impl UsageError {
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn id(&self) -> ProviderId;
+    /// The host every inference attempt of this provider goes to (the API base's), whatever the
+    /// account: when its DNS lookup fails, the failover loop skips the provider's other accounts.
+    fn api_host(&self) -> Option<String> {
+        None
+    }
     /// A usable access token for `acct`, refreshing when `force` or near expiry.
     async fn access_token(
         &self,

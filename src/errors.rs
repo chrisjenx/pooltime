@@ -45,8 +45,9 @@ pub enum FailReason {
     Transport(TransportKind),
     Refresh(RefreshErrorKind),
     Status(u16),
-    /// The machine's network is down ([`TransportKind::is_machine_wide`]): no account is to
-    /// blame, so it is never recorded against one and the request does not fail over.
+    /// The DNS lookup of the provider's API host failed: a fault of this machine's network (or
+    /// of that one host), not of the account. Never recorded against an account; the provider's
+    /// other accounts (same host) are skipped, the other provider (another host) may still serve.
     Network(TransportKind),
 }
 
@@ -64,9 +65,9 @@ impl TransportKind {
         }
     }
 
-    /// A failure of the machine's network, not of an account or one connection: a DNS lookup
-    /// that fails fails the same way for every account and provider.
-    pub fn is_machine_wide(self) -> bool {
+    /// A failed DNS lookup: it fails the same way for every request to that host, whichever
+    /// account sends it, so it says nothing about the account.
+    pub fn is_dns(self) -> bool {
         matches!(self, TransportKind::Dns)
     }
 }
@@ -84,9 +85,9 @@ impl RefreshErrorKind {
         }
     }
 
-    /// A refresh that failed on the machine's network ([`TransportKind::is_machine_wide`]).
-    pub fn is_machine_wide(self) -> bool {
-        matches!(self, RefreshErrorKind::Network(k) if k.is_machine_wide())
+    /// A refresh whose token-endpoint host did not resolve ([`TransportKind::is_dns`]).
+    pub fn is_dns(self) -> bool {
+        matches!(self, RefreshErrorKind::Network(k) if k.is_dns())
     }
 }
 
@@ -120,15 +121,26 @@ impl FailReason {
         }
     }
 
+    /// A failed DNS lookup, of the API host (`Network`, `Transport`) or of the token endpoint
+    /// (`Refresh`): not the account's fault.
+    pub fn is_dns(&self) -> bool {
+        match self {
+            FailReason::Network(k) | FailReason::Transport(k) => k.is_dns(),
+            FailReason::Refresh(k) => k.is_dns(),
+            _ => false,
+        }
+    }
+
     /// Whether failing over to the *other* provider is sensible (INV §5): quota,
     /// surfaced overload, and transport failures yes; `UpstreamRejected` never
-    /// (the request itself is bad, the other provider would reject it too), nor `Network` (the
-    /// other provider is behind the same broken network).
+    /// (the request itself is bad, the other provider would reject it too). A failed DNS lookup
+    /// is (the other provider is another host).
     pub fn cross_provider_retryable(&self) -> bool {
-        matches!(
-            self,
-            FailReason::Quota { .. } | FailReason::Overloaded | FailReason::Transport(_)
-        )
+        self.is_dns()
+            || matches!(
+                self,
+                FailReason::Quota { .. } | FailReason::Overloaded | FailReason::Transport(_)
+            )
     }
 }
 
@@ -240,22 +252,31 @@ mod tests {
             FailReason::Refresh(RefreshErrorKind::Other),
             FailReason::Status(400),
             FailReason::Status(529),
-            FailReason::Network(TransportKind::Dns),
         ] {
             assert!(!r.cross_provider_retryable(), "{r:?}");
         }
+        // Another provider is another host.
+        assert!(FailReason::Network(TransportKind::Dns).cross_provider_retryable());
+        assert!(
+            FailReason::Refresh(RefreshErrorKind::Network(TransportKind::Dns))
+                .cross_provider_retryable()
+        );
     }
 
     #[test]
-    fn only_dns_is_machine_wide() {
+    fn dns_failures_are_recognised() {
         use TransportKind::*;
         for k in [Connect, Tls, Reset, IdleTimeout, Deadline, Other] {
-            assert!(!k.is_machine_wide(), "{k:?}");
-            assert!(!RefreshErrorKind::Network(k).is_machine_wide(), "{k:?}");
+            assert!(!k.is_dns(), "{k:?}");
+            assert!(!RefreshErrorKind::Network(k).is_dns(), "{k:?}");
+            assert!(!FailReason::Transport(k).is_dns(), "{k:?}");
         }
-        assert!(Dns.is_machine_wide());
-        assert!(RefreshErrorKind::Network(Dns).is_machine_wide());
-        assert!(!RefreshErrorKind::Server(503).is_machine_wide());
+        assert!(Dns.is_dns());
+        assert!(RefreshErrorKind::Network(Dns).is_dns());
+        assert!(!RefreshErrorKind::Server(503).is_dns());
+        assert!(FailReason::Network(Dns).is_dns());
+        assert!(FailReason::Refresh(RefreshErrorKind::Network(Dns)).is_dns());
+        assert!(!FailReason::Quota { reset: None }.is_dns());
     }
 
     #[test]

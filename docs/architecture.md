@@ -39,6 +39,7 @@ runs).
 | `supervisor/` | `serve --supervise`: owns the port, runs worker generations, hands over on `SIGHUP`, respawns crashed workers; `proto` (control messages, `run/supervisor.json`) |
 | `import/` | `bro.rs`: plan and apply a bro-cli import |
 | `upstream.rs` | HTTP client with header-wait, per-read idle and per-attempt deadlines; no decompression |
+| `dnswatch.rs` | per-host DNS health of upstream sends: fail fast for 30 s after a host's lookup fails, one log line per host outage, lasting outages for `doctor` and the status API |
 | `sse.rs` | SSE parser (observer for Anthropic, parser for Codex translation) |
 | `fsutil.rs` | atomic writes, guarded read-modify-write, flock |
 | `logging.rs` | tracing setup, log pruning, request ids, header redaction, debug mode |

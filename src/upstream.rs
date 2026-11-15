@@ -7,7 +7,6 @@
 
 use std::error::Error as StdError;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +15,7 @@ use futures_util::{Stream, StreamExt};
 use http::{HeaderMap, StatusCode};
 use tokio::time::{timeout_at, Instant};
 
+use crate::dnswatch::DnsWatch;
 use crate::errors::TransportKind;
 use crate::logging::{debug_headers, redact_uri, DebugMode};
 
@@ -38,9 +38,9 @@ pub struct Upstream {
     client: reqwest::Client,
     /// While active, request/response headers of every send are logged (redacted).
     debug: DebugMode,
-    /// A send failed its DNS lookup and none has got an answer since: the machine's network is
-    /// down. Logged once when it goes down and once when it is back, not on every attempt.
-    network_down: Arc<AtomicBool>,
+    /// Per-host DNS health: hosts whose lookups fail are failed fast for a while and logged once
+    /// per outage ([`crate::dnswatch`]).
+    dns: Arc<DnsWatch>,
 }
 
 impl Default for Upstream {
@@ -54,7 +54,7 @@ impl Upstream {
         Self {
             client: client(None),
             debug: DebugMode::default(),
-            network_down: Arc::default(),
+            dns: Arc::default(),
         }
     }
 
@@ -65,31 +65,15 @@ impl Upstream {
         self
     }
 
-    /// Whether the network is down: a send failed its DNS lookup and none has got an answer since.
-    pub fn network_down(&self) -> bool {
-        self.network_down.load(Ordering::Relaxed)
+    /// Replace the DNS watch (tests: shorter fail-fast TTL or persistence threshold).
+    pub fn with_dns_watch(mut self, watch: DnsWatch) -> Self {
+        self.dns = Arc::new(watch);
+        self
     }
 
-    /// Track the machine's network from one send's result: warn when DNS lookups start failing
-    /// and when an upstream answers again.
-    fn note_network(&self, result: Result<(), TransportKind>) {
-        match result {
-            Err(k) if k.is_machine_wide() => {
-                if !self.network_down.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
-                        transport = k.as_str(),
-                        "network unavailable (DNS lookup failed): requests fail fast without \
-                         failover and no account is blamed until it is back"
-                    );
-                }
-            }
-            Ok(()) => {
-                if self.network_down.swap(false, Ordering::Relaxed) {
-                    tracing::warn!("network available again");
-                }
-            }
-            Err(_) => {}
-        }
+    /// Per-host DNS health seen by this client's sends.
+    pub fn dns(&self) -> &DnsWatch {
+        &self.dns
     }
 
     /// Share `debug` (the daemon hands the same switch to the management API).
@@ -105,12 +89,18 @@ impl Upstream {
     /// Send `req` and wait for the response headers.
     ///
     /// Header-wait expiry is classified [`TransportKind::IdleTimeout`]; the attempt deadline
-    /// expiring first is [`TransportKind::Deadline`].
+    /// expiring first is [`TransportKind::Deadline`]. A host whose DNS lookup failed within
+    /// [`crate::dnswatch::DNS_SKIP_TTL`] is [`TransportKind::Dns`] at once, without a network call.
     pub async fn send(
         &self,
         req: reqwest::Request,
         lim: &Limits,
     ) -> Result<UpstreamResponse, TransportKind> {
+        let host = req.url().host_str().map(str::to_ascii_lowercase);
+        if host.as_deref().is_some_and(|h| self.dns.is_down(h)) {
+            tracing::debug!(host = host.as_deref().unwrap_or("-"), "DNS down: not sent");
+            return Err(TransportKind::Dns);
+        }
         let (until, expiry) = bound(lim.header_wait, lim.deadline);
         if self.debug.active() {
             // Inside the request span, so the line carries the request id.
@@ -126,12 +116,16 @@ impl Upstream {
             Err(_) => return Err(expiry),
             Ok(Err(e)) => {
                 let k = classify_reqwest(&e);
-                self.note_network(Err(k));
+                if let (true, Some(h)) = (k.is_dns(), host.as_deref()) {
+                    self.dns.failed(h);
+                }
                 return Err(k);
             }
             Ok(Ok(r)) => r,
         };
-        self.note_network(Ok(()));
+        if let Some(h) = host.as_deref() {
+            self.dns.resolved(h);
+        }
         let status = resp.status();
         let headers = resp.headers().clone();
         if self.debug.active() {

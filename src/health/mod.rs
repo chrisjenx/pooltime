@@ -16,8 +16,8 @@
 //!   [`states::ERRORING_WINDOW`] (at most one token POST per 15 minutes per account while
 //!   unconfirmed), and the failure shows for [`states::PROBE_FAILURE_TTL`], so it stays visible
 //!   between retries but lapses if probing stops;
-//! - a failed DNS lookup (the machine's network is down): nothing is concluded or recorded, and
-//!   the probe runs again on the next tick.
+//! - the token host did not resolve (DNS): nothing is concluded or recorded (a lasting outage of
+//!   the host shows in `doctor` and the dashboard instead), and the probe runs again next tick.
 //!
 //! An unknown expiry is never probed. Accounts already `needs_login` are skipped.
 
@@ -49,7 +49,7 @@ pub enum ProbeOutcome {
     Billing,
     /// Unconfirmed failure (class, e.g. `refresh:server:503`): `erroring`, retried later.
     Erroring(String),
-    /// The machine's network is down (DNS): says nothing about the account; retried next tick.
+    /// The token host did not resolve (DNS): says nothing about the account; retried next tick.
     NetworkDown,
 }
 
@@ -143,7 +143,7 @@ fn outcome_of(kind: RefreshErrorKind) -> ProbeOutcome {
     match kind {
         RefreshErrorKind::InvalidGrant | RefreshErrorKind::TokenReused => ProbeOutcome::NeedsLogin,
         RefreshErrorKind::AccountOnHold => ProbeOutcome::Billing,
-        k if k.is_machine_wide() => ProbeOutcome::NetworkDown,
+        k if k.is_dns() => ProbeOutcome::NetworkDown,
         other => ProbeOutcome::Erroring(FailReason::Refresh(other).detail()),
     }
 }

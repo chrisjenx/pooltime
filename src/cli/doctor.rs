@@ -30,6 +30,8 @@
 //!   [`ERROR_MIN_ATTEMPTS`] attempts and an error rate of [`ERROR_RATE_WARN`] or more is `!`
 //!   (with its most frequent error class and latency), else one `✓` summary. Failover hand-overs
 //!   and `invalid_request` attempts are not counted. No pool: `i`.
+//! - **dns <host>**, per upstream host whose DNS lookups the running pool has seen failing for
+//!   10 minutes or more (`network.dns_down` of its status): `!`. No account is blamed for it.
 //! - **upstream <origin>**: `HEAD` to the Anthropic API and token origins, plus the OpenAI/Codex
 //!   API and token origins when an OpenAI account exists (all from config, so tests point them at
 //!   local fakes). Any HTTP answer is reachable; a timeout is `!` (slow or offline network); a
@@ -269,6 +271,11 @@ pub async fn checks(paths: &Paths, opts: &Options) -> Vec<Check> {
         None => None,
     };
     out.extend(error_checks(stats.as_ref()));
+    if let Some(c) = daemon {
+        out.extend(dns_checks(
+            get_within(c, "/api/v1/status").await.ok().as_ref(),
+        ));
+    }
 
     let (upstream, date) = upstream_checks(&cfg, openai).await;
     out.extend(upstream);
@@ -696,6 +703,31 @@ async fn get_stats(c: &Client) -> Result<Value, String> {
         Ok(Err(e)) => Err(format!("{e:#}")),
         Err(_) => Err(format!("no answer within {} s", POOL_TIMEOUT.as_secs())),
     }
+}
+
+/// One `!` per upstream host the pool has seen failing its DNS lookups for a while
+/// (`network.dns_down` of the pool's status). Requests to it fail over to accounts on other
+/// hosts and no account is blamed, so this is the one place a lasting outage shows.
+fn dns_checks(status: Option<&Value>) -> Vec<Check> {
+    let Some(rows) = status.and_then(|v| v["network"]["dns_down"].as_array()) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|r| {
+            let host = r["host"].as_str()?;
+            let since = r["since"].as_str().unwrap_or("?");
+            Some(
+                Check::new(
+                    Level::Warn,
+                    format!("dns {host}"),
+                    format!("DNS lookups failing since {since}; requests to it fail over"),
+                )
+                .hint(format!(
+                    "check this machine's network and DNS, or a DNS filter blocking {host}"
+                )),
+            )
+        })
+        .collect()
 }
 
 /// Error rates over the stats window. `None`: no pool.
@@ -1768,6 +1800,24 @@ mod tests {
         assert_eq!(c.level, Level::Warn, "{c}");
         assert!(c.detail.contains("(10 of 40, not counting"), "{c}");
         assert!(c.detail.contains("most common error quota"), "{c}");
+    }
+
+    #[test]
+    fn lasting_dns_outages_are_warnings_naming_the_host() {
+        assert!(dns_checks(None).is_empty());
+        assert!(dns_checks(Some(&serde_json::json!({"network": {"dns_down": []}}))).is_empty());
+        let v = serde_json::json!({"network": {"dns_down": [
+            {"host": "auth.example", "since": "2026-11-15T10:00:00Z"}
+        ]}});
+        let c = dns_checks(Some(&v));
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].level, Level::Warn);
+        assert_eq!(c[0].label, "dns auth.example");
+        assert!(
+            c[0].detail.contains("since 2026-11-15T10:00:00Z"),
+            "{}",
+            c[0]
+        );
     }
 
     #[test]

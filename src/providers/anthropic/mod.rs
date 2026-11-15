@@ -28,8 +28,9 @@ pub use catalog::{ANTHROPIC_OWNER, MODELS_CACHE_TTL};
 pub use oauth::expiry_after_refresh;
 pub use overload::{explicit_reset, retry_after_at, OverloadPolicy, Sleeper, TokioSleeper};
 pub use proxy::{
-    anthropic_error, network_unavailable, refresh_failure_outcome, NETWORK_UNAVAILABLE_MESSAGE,
-    POOL_ACCOUNT_HEADER, RETRYABLE_TRANSPORT_HEADER, UPSTREAM_REJECTED_HEADER,
+    anthropic_error, network_unavailable, network_unavailable_response, refresh_failure_outcome,
+    NETWORK_UNAVAILABLE_MESSAGE, POOL_ACCOUNT_HEADER, RETRYABLE_TRANSPORT_HEADER,
+    UPSTREAM_REJECTED_HEADER,
 };
 pub use ratelimit::{has_quota_signal, has_rate_limit_wording, parse_unified_headers};
 pub use stream::PREFIX_CAP;

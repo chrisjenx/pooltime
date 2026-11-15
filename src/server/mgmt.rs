@@ -23,7 +23,8 @@
 //! `expiry_warn_secs` the warn window behind them.
 //!
 //! [`build_status`] is a pure function of [`StatusInputs`] and a clock, which is what makes the
-//! status shape snapshot-testable; [`gather`] does the I/O. For authorized requests (bearer or session cookie) the HTTP
+//! status shape snapshot-testable; [`gather`] does the I/O. The HTTP handler adds `network`
+//! (`dns_down`: upstream hosts whose DNS lookups have failed for 10 minutes). For authorized requests (bearer or session cookie) the HTTP
 //! handler adds `profiles` (connected Claude Code profiles from `config.toml`; `null` if the file
 //! is unreadable) and `storage` (data dir, database and log bytes) for the Settings view. With `POOLTIME_FIXTURE_STATE` set (dev/screenshots
 //! only, see [`super::daemon`]) the handler serves that document verbatim instead.
@@ -753,6 +754,12 @@ pub(crate) async fn status(State(app): State<Arc<AppState>>, headers: HeaderMap)
         Err(r) => return r,
     };
     let mut v = build_status(&inputs, now);
+    if let Value::Object(o) = &mut v {
+        o.insert(
+            "network".into(),
+            network_json(&app.upstream.dns().outages()),
+        );
+    }
     // Local paths (data dir, profile dirs) are for the key holder only; the pool view stays open.
     if authorized(&headers, &app.mgmt_key) {
         let paths = app.paths.clone();
@@ -767,6 +774,17 @@ pub(crate) async fn status(State(app): State<Arc<AppState>>, headers: HeaderMap)
         }
     }
     ok(v)
+}
+
+/// `network.dns_down`: upstream hosts whose DNS lookups have failed for
+/// [`crate::dnswatch::DNS_PERSISTENT_AFTER`] or more (no account is blamed for them).
+fn network_json(outages: &[crate::dnswatch::DnsOutage]) -> Value {
+    json!({
+        "dns_down": outages
+            .iter()
+            .map(|o| json!({ "host": o.host, "since": ts(o.since) }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// The connected Claude Code profiles as recorded in `config.toml` (`connect` keeps it current;

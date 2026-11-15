@@ -20,7 +20,8 @@
 //! | 5xx | same-account backoff (like Anthropic), then `Terminal(Overloaded)` |
 //! | other non-2xx | `Terminal(Status(code))`, `api_error` with a legible message |
 //! | transport failure | `Retry(Transport)` with a 502 + `x-pool-retryable-transport: 1` |
-//! | DNS lookup failed (send or refresh) | nothing recorded, `Terminal(Network(Dns))` (see [`network_unavailable`]) |
+//! | API host DNS lookup failed | nothing recorded, `Retry(Network(Dns))`: the provider's other accounts (same host) are skipped (see [`network_unavailable`]) |
+//! | token host DNS lookup failed (expired token) | nothing recorded, `Retry(Refresh(Network(Dns)))` (see [`refresh_failure_outcome`]) |
 //! | refresh failure | `Retry(Refresh)` (see [`refresh_failure_outcome`]) |
 //!
 //! Decision (spec §16 "decide"): a Codex 5xx is terminal within the Codex pool after the
@@ -413,6 +414,10 @@ impl Provider for OpenAiProvider {
         ProviderId::OpenAi
     }
 
+    fn api_host(&self) -> Option<String> {
+        crate::dnswatch::host_of(&self.cfg.api_base)
+    }
+
     async fn access_token(
         &self,
         acct: &AccountMeta,
@@ -516,14 +521,13 @@ fn set_retry_after(
 }
 
 /// Transport failure (send, or a 2xx body that died before commit): record, 502 `api_error`
-/// flagged retryable, fail over. A failed DNS lookup is [`network_unavailable`]: not recorded, no
-/// failover.
+/// flagged retryable, fail over. A failed DNS lookup is [`network_unavailable`]: not recorded.
 pub(super) fn transport_outcome(
     call: &Call<'_>,
     kind: TransportKind,
     upstream_request_id: Option<String>,
 ) -> AttemptOutcome {
-    if kind.is_machine_wide() {
+    if kind.is_dns() {
         tracing::debug!(
             account = %call.acct,
             request_id = %call.req.request_id,

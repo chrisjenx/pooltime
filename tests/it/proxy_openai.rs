@@ -696,8 +696,8 @@ async fn eof_before_terminal_pre_commit_fails_over() {
 }
 
 #[tokio::test]
-async fn dns_outage_is_terminal_and_not_recorded() {
-    // The machine's DNS is down (simulated): the Responses host never resolves.
+async fn api_host_dns_failure_is_not_recorded() {
+    // The Responses host does not resolve (simulated: no real resolver).
     let fake = FakeOpenAi::start().await;
     let pool = Pool::new().without_default_account().with_dns_down();
     let meta = add_codex_account(&pool, "cx", 1, CODEX_ACCESS);
@@ -713,13 +713,16 @@ async fn dns_outage_is_terminal_and_not_recorded() {
         .with_keepalive(KEEPALIVE);
     for stream in [true, false] {
         let out = run(&p, &pool, &meta, &codex_req(stream, "req_dns"), None).await;
-        assert_eq!(kind(&out), "terminal 502 network:dns");
-        let AttemptOutcome::Terminal(_, reason) = &out else {
+        // Fails over (the loop skips the rest of this host's accounts; another provider may
+        // serve), and is flagged for that hop.
+        assert_eq!(kind(&out), "retry 502 network:dns");
+        let AttemptOutcome::Retry { reason, .. } = &out else {
             unreachable!()
         };
         assert_eq!(*reason, FailReason::Network(TransportKind::Dns));
         let resp = response(out);
-        assert!(resp.headers().get("x-pool-retryable-transport").is_none());
+        assert_eq!(resp.headers()["x-pool-retryable-transport"], "1");
+        assert_eq!(resp.headers()["x-should-retry"], "true");
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let j: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(j["error"]["type"], "api_error");

@@ -8,19 +8,28 @@
   pruned when the daemon started, and since 1.1.0 the service's worker runs for days, so
   `~/.pooltime/logs` kept growing past the cap until the next restart. The running pool now also
   prunes them every hour (files older than `logs_days`, then the oldest until the log files are
-  under the cap). The file being written is never deleted; if it alone is over the cap, every
-  other log file goes. `pooltime doctor`'s storage line shows the logs against the cap.
-- When this machine's DNS is down, pooltime no longer blames your accounts. Before, every request
-  tried each account in turn, failed each one with `transport:dns`, recorded it as that account's
-  error, and DNS failures of token refreshes could mark accounts `erroring`. Now a failed DNS
-  lookup ends the request at once, with no failover to other accounts or to the other provider,
-  with a retryable 502 `api_error` "pooltime: network unavailable (DNS lookup failed)" that
-  Claude Code backs off and retries on. Nothing is recorded against the account, its status and
-  health are unchanged, the journal shows the reason as `network:dns`, and `doctor` leaves these
-  requests out of the accounts' error rates. Token refreshes that fail their DNS lookup are
-  retried on the usual schedule. The log has one warning when lookups start failing and one when
-  the network is back, instead of one per attempt. Other transport failures (connection reset,
-  refused, TLS, timeouts) still fail over as before.
+  under the cap). The file being written (the newest date in its name) is never deleted; if it
+  alone is over the cap, every other log file goes. `logs_days = 0` or `logs_max_mb = 0` now
+  turns that limit off (it used to keep only the current file). `pooltime doctor`'s storage line
+  shows the logs against the cap.
+- A host that does not resolve (this machine's DNS is down, or a DNS filter blocks it) no longer
+  counts against your accounts. Before, every request tried each account in turn, failed each
+  with `transport:dns`, recorded it as that account's error, and DNS failures of token refreshes
+  could mark accounts `erroring`. Now:
+  - Nothing is recorded against the account: its status and health are unchanged, the journal
+    shows `network:dns` (API host) or `refresh:network:dns` (token host), and `doctor` leaves
+    these out of the accounts' error rates.
+  - When a provider's API host does not resolve, its other accounts are skipped (they send to the
+    same host), and for 30 seconds so is the provider. A mapped request still goes to the other
+    provider. With nowhere left to go, the request gets a retryable 502 `api_error` "pooltime:
+    network unavailable (DNS lookup failed)", which Claude Code backs off and retries on.
+  - When the token host does not resolve, an account whose token is due for refresh but not yet
+    expired keeps using it; one whose token has expired is skipped for this request, and another
+    account with a fresh token serves it.
+  - The log has one warning per host when its lookups start failing and one when it answers
+    again, instead of one per attempt. A host failing for 10 minutes shows in `pooltime doctor`
+    (`dns <host>`), the dashboard banner and the status API (`network.dns_down`).
+  - Other transport failures (connection reset, refused, TLS, timeouts) still fail over as before.
 
 ## 1.2.0 - 2026-11-14
 
