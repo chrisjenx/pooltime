@@ -142,57 +142,89 @@ fn build_subscriber(
     Ok((subscriber, LogGuard { _worker: worker }))
 }
 
-/// Delete `pooltime.log*` files in `dir` older than `days`, then oldest-first until the
-/// total size of the `pooltime.log*` files (the current one included) is at most `max_mb` MiB.
-/// The newest file (the one being written: the current day's, or yesterday's until the first
-/// line after midnight) is never deleted, so when it alone is over the cap every other log file
-/// goes and it stays. A missing directory is not an error. Other files (the service manager's
-/// `daemon.out` / `daemon.err`) are neither counted nor touched: they are held open by the
-/// service manager.
+/// Delete `pooltime.log*` files in `dir` older than `days`, then oldest first until the total
+/// size of the `pooltime.log*` files (the current one included) is at most `max_mb` MiB. `0`
+/// turns either limit off. The file being written (the newest date in its name,
+/// `pooltime.log.YYYY-MM-DD`; with no dated file, the newest by mtime) is never deleted, so when
+/// it alone is over the cap every other log file goes and it stays. A missing directory is not
+/// an error. Other files (the service manager's `daemon.out` / `daemon.err`) are neither counted
+/// nor touched: the service manager holds them open.
 pub fn prune_logs(dir: &Path, days: u32, max_mb: u64, now: SystemTime) -> io::Result<PruneStats> {
+    struct LogFile {
+        path: std::path::PathBuf,
+        /// `YYYY-MM-DD` from the name, when it has one.
+        date: Option<String>,
+        mtime: SystemTime,
+        size: u64,
+    }
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(PruneStats::default()),
         Err(e) => return Err(e),
     };
-    // (path, mtime, size)
     let mut files = Vec::new();
     for entry in rd {
         let entry = entry?;
-        if !entry.file_name().to_string_lossy().starts_with(LOG_PREFIX) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(LOG_PREFIX) {
             continue;
         }
         let md = entry.metadata()?;
         if !md.is_file() {
             continue;
         }
-        files.push((entry.path(), md.modified()?, md.len()));
+        files.push(LogFile {
+            path: entry.path(),
+            date: log_date(&name).map(str::to_string),
+            mtime: md.modified()?,
+            size: md.len(),
+        });
     }
-    // Oldest first; the last element is the current file and is protected.
-    files.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    // Oldest first: undated names, then by the date in the name (mtime breaks ties). The last is
+    // the file being written and is protected.
+    files.sort_by(|a, b| {
+        (a.date.is_some(), &a.date, a.mtime, &a.path).cmp(&(
+            b.date.is_some(),
+            &b.date,
+            b.mtime,
+            &b.path,
+        ))
+    });
     let protected = files.len().saturating_sub(1);
 
-    let max_age = Duration::from_secs(u64::from(days) * 86_400);
-    let cap = max_mb.saturating_mul(1024 * 1024);
-    let mut total: u64 = files.iter().map(|f| f.2).sum();
+    let max_age = (days > 0).then(|| Duration::from_secs(u64::from(days) * 86_400));
+    let cap = (max_mb > 0).then(|| max_mb.saturating_mul(1024 * 1024));
+    let mut total: u64 = files.iter().map(|f| f.size).sum();
     let mut stats = PruneStats::default();
 
-    for (path, mtime, size) in files.iter().take(protected) {
-        let too_old = now.duration_since(*mtime).is_ok_and(|age| age > max_age);
-        if !too_old && total <= cap {
-            // Sorted oldest-first: nothing later is older, and size is within cap.
-            break;
+    for f in files.iter().take(protected) {
+        let too_old =
+            max_age.is_some_and(|max| now.duration_since(f.mtime).is_ok_and(|age| age > max));
+        let over_cap = cap.is_some_and(|cap| total > cap);
+        if !too_old && !over_cap {
+            continue;
         }
-        match std::fs::remove_file(path) {
+        match std::fs::remove_file(&f.path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
-        total = total.saturating_sub(*size);
+        total = total.saturating_sub(f.size);
         stats.deleted_files += 1;
-        stats.deleted_bytes += size;
+        stats.deleted_bytes += f.size;
     }
     Ok(stats)
+}
+
+/// The `YYYY-MM-DD` of a daily log file's name (`pooltime.log.2026-11-15`).
+fn log_date(name: &str) -> Option<&str> {
+    let d = name.strip_prefix(LOG_PREFIX)?.strip_prefix('.')?;
+    let ok = d.len() == 10
+        && d.bytes().enumerate().all(|(i, c)| match i {
+            4 | 7 => c == b'-',
+            _ => c.is_ascii_digit(),
+        });
+    ok.then_some(d)
 }
 
 /// `req_` + 20 lowercase RFC 4648 base32 characters (a-z, 2-7).
@@ -462,11 +494,70 @@ mod tests {
         assert_eq!(s.deleted_files, 2);
         assert_eq!(s.deleted_bytes, 10 + MB as u64);
 
+        // 0 turns a limit off: nothing more goes with no cap and no age limit.
+        assert_eq!(
+            prune_logs(dir.path(), 0, 0, now).unwrap(),
+            PruneStats::default()
+        );
+        assert!(dir.path().join("pooltime.log.2026-11-03").exists());
+
         // Cap below the current file alone: current file is never deleted.
-        let s = prune_logs(dir.path(), 7, 0, now).unwrap();
+        let s = prune_logs(dir.path(), 7, 1, now).unwrap();
         assert_eq!(s.deleted_files, 2);
         assert!(dir.path().join("pooltime.log.2026-11-07").exists());
         assert!(!dir.path().join("pooltime.log.2026-11-05").exists());
+    }
+
+    #[test]
+    fn zero_disables_each_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        const MB: usize = 1024 * 1024;
+        let mk = |name: &str, bytes: usize, age_days: u64| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, vec![b'x'; bytes]).unwrap();
+            let t = now - Duration::from_secs(age_days * 86_400 + 60);
+            set_file_mtime(&p, FileTime::from_system_time(t)).unwrap();
+        };
+        mk("pooltime.log.2026-10-01", MB, 45);
+        mk("pooltime.log.2026-11-14", MB, 1);
+        mk("pooltime.log.2026-11-15", MB, 0);
+        // logs_days = 0: no age limit, only the 2 MiB cap (the oldest goes).
+        let s = prune_logs(dir.path(), 0, 2, now).unwrap();
+        assert_eq!(s.deleted_files, 1);
+        assert!(!dir.path().join("pooltime.log.2026-10-01").exists());
+        mk("pooltime.log.2026-10-01", MB, 45);
+        // logs_max_mb = 0: no size cap, only the age limit.
+        let s = prune_logs(dir.path(), 7, 0, now).unwrap();
+        assert_eq!(s.deleted_files, 1);
+        assert!(!dir.path().join("pooltime.log.2026-10-01").exists());
+        assert!(dir.path().join("pooltime.log.2026-11-14").exists());
+    }
+
+    #[test]
+    fn the_newest_dated_name_is_protected_whatever_its_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now();
+        const MB: usize = 1024 * 1024;
+        let mk = |name: &str, bytes: usize, age_secs: u64| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, vec![b'x'; bytes]).unwrap();
+            set_file_mtime(
+                &p,
+                FileTime::from_system_time(now - Duration::from_secs(age_secs)),
+            )
+            .unwrap();
+        };
+        // An old file touched recently (e.g. copied back) must not shield it nor doom today's.
+        mk("pooltime.log.2026-11-15", MB, 3600);
+        mk("pooltime.log.2026-11-10", MB, 0);
+        let s = prune_logs(dir.path(), 7, 1, now).unwrap();
+        assert_eq!(s.deleted_files, 1);
+        assert!(dir.path().join("pooltime.log.2026-11-15").exists());
+        assert!(!dir.path().join("pooltime.log.2026-11-10").exists());
+        assert_eq!(log_date("pooltime.log.2026-11-15"), Some("2026-11-15"));
+        assert_eq!(log_date("pooltime.log"), None);
+        assert_eq!(log_date("pooltime.log.backup"), None);
     }
 
     #[test]
