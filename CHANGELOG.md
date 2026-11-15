@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.2.1 - 2026-11-15
+
+### Fixed
+
+- Log files now stay within `retention.logs_max_mb` while the pool runs. Old logs were only
+  pruned when the daemon started, and since 1.1.0 the service's worker runs for days, so
+  `~/.pooltime/logs` kept growing past the cap until the next restart. The running pool now also
+  prunes them every hour (files older than `logs_days`, then the oldest until the log files are
+  under the cap). The file being written is never deleted; if it alone is over the cap, every
+  other log file goes. `pooltime doctor`'s storage line shows the logs against the cap.
+- When this machine's DNS is down, pooltime no longer blames your accounts. Before, every request
+  tried each account in turn, failed each one with `transport:dns`, recorded it as that account's
+  error, and DNS failures of token refreshes could mark accounts `erroring`. Now a failed DNS
+  lookup ends the request at once, with no failover to other accounts or to the other provider,
+  with a retryable 502 `api_error` "pooltime: network unavailable (DNS lookup failed)" that
+  Claude Code backs off and retries on. Nothing is recorded against the account, its status and
+  health are unchanged, the journal shows the reason as `network:dns`, and `doctor` leaves these
+  requests out of the accounts' error rates. Token refreshes that fail their DNS lookup are
+  retried on the usual schedule. The log has one warning when lookups start failing and one when
+  the network is back, instead of one per attempt. Other transport failures (connection reset,
+  refused, TLS, timeouts) still fail over as before.
+
 ## 1.2.0 - 2026-11-14
 
 ### Changed
