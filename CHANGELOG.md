@@ -9,9 +9,11 @@
   `~/.pooltime/logs` kept growing past the cap until the next restart. The running pool now also
   prunes them every hour (files older than `logs_days`, then the oldest until the log files are
   under the cap). The file being written (the newest date in its name) is never deleted; if it
-  alone is over the cap, every other log file goes. `logs_days = 0` or `logs_max_mb = 0` now
-  turns that limit off (it used to keep only the current file). `pooltime doctor`'s storage line
-  shows the logs against the cap.
+  alone is over the cap, every other log file goes. `pooltime doctor`'s storage line shows the
+  logs against the cap.
+- `retention.logs_days = 0` and `retention.logs_max_mb = 0` now mean "no limit" (no age limit,
+  no size cap), like `journal_max_requests = 0`. Before, 0 deleted every log file but the
+  current one.
 - A host that does not resolve (this machine's DNS is down, or a DNS filter blocks it) no longer
   counts against your accounts. Before, every request tried each account in turn, failed each
   with `transport:dns`, recorded it as that account's error, and DNS failures of token refreshes
@@ -20,9 +22,12 @@
     shows `network:dns` (API host) or `refresh:network:dns` (token host), and `doctor` leaves
     these out of the accounts' error rates.
   - When a provider's API host does not resolve, its other accounts are skipped (they send to the
-    same host), and for 30 seconds so is the provider. A mapped request still goes to the other
-    provider. With nowhere left to go, the request gets a retryable 502 `api_error` "pooltime:
-    network unavailable (DNS lookup failed)", which Claude Code backs off and retries on.
+    same host), and so is the provider until its next check: one real lookup at most every 2
+    seconds, and never more than 5 seconds of skipping after the last failed lookup, so a
+    resolver that is down for a moment (wake from sleep, a Wi-Fi change) costs seconds. Any
+    answer clears it at once. A mapped request still goes to the other provider. With nowhere
+    left to go, the request gets a retryable 502 `api_error` "pooltime: network unavailable (DNS
+    lookup failed)", which Claude Code backs off and retries on.
   - When the token host does not resolve, an account whose token is due for refresh but not yet
     expired keeps using it; one whose token has expired is skipped for this request, and another
     account with a fresh token serves it.

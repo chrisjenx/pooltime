@@ -2132,10 +2132,14 @@ mod inference {
 
     #[tokio::test]
     async fn lasting_dns_outage_shows_in_status() {
-        use pooltime::dnswatch::{DnsWatch, DNS_SKIP_TTL};
+        use pooltime::dnswatch::{DnsWatch, DNS_PROBE_EVERY, DNS_SKIP_CAP};
         // Shown at once here (persistence threshold 0; the default is 10 minutes).
         let fake = FakeAnthropic::start().await;
-        let pool = Pool::new().with_dns_watch(DnsWatch::new(DNS_SKIP_TTL, Duration::ZERO));
+        let pool = Pool::new().with_dns_watch(DnsWatch::new(
+            DNS_PROBE_EVERY,
+            DNS_SKIP_CAP,
+            Duration::ZERO,
+        ));
         let p = anthropic_at(&pool, UNRESOLVABLE, &format!("{}{}", fake.url(), TOKEN));
         let booted = pool.boot(Boot::default().provider(Arc::new(p))).await;
         let status = || async { http_get(booted.addr, "/api/v1/status", &[]).await.json() };
@@ -2154,9 +2158,12 @@ mod inference {
     async fn dns_state_is_per_host_so_other_hosts_never_flap_it() {
         use pooltime::dnswatch::DnsWatch;
         capture_logs();
-        // Fail fast off (TTL 0): every send to the dead host really tries it.
-        let up = dns_down_upstream()
-            .with_dns_watch(DnsWatch::new(Duration::ZERO, Duration::from_secs(600)));
+        // Fail fast off (probe every send): every send to the dead host really tries it.
+        let up = dns_down_upstream().with_dns_watch(DnsWatch::new(
+            Duration::ZERO,
+            Duration::ZERO,
+            Duration::from_secs(600),
+        ));
         let fake = FakeAnthropic::start().await;
         let get = |url: String| reqwest::Client::new().get(url).build().unwrap();
         let dead = "http://flap-test.invalid/x";
@@ -2178,6 +2185,51 @@ mod inference {
         };
         assert_eq!(lines("DNS lookup failed"), 1, "{logs}");
         assert_eq!(lines("DNS lookups work again"), 0, "{logs}");
+    }
+
+    #[tokio::test]
+    async fn dns_blip_recovers_on_the_next_probe() {
+        use pooltime::dnswatch::DNS_PROBE_EVERY;
+        use std::sync::atomic::Ordering;
+        // The resolver is down for a moment (wake from sleep, a Wi-Fi change), with the default
+        // half-open timing: one real lookup per 2 s while the host is down.
+        let fake = FakeAnthropic::start().await;
+        let ok = || Reply::json(200, &ok_message(1, 1));
+        fake.script(MESSAGES, vec![ok(), ok(), ok()]);
+        let port = fake.url().rsplit(':').next().unwrap().to_string();
+        let dns = Arc::new(FlakyDns::default());
+        let mut pool = Pool::new();
+        pool.up = Arc::new(pooltime::upstream::Upstream::new().with_dns_resolver(dns.clone()));
+        let api = format!("http://flaky-api.test:{port}");
+        let p = anthropic_at(&pool, &api, &format!("{}{}", fake.url(), TOKEN));
+        let booted = pool.boot(Boot::default().provider(Arc::new(p))).await;
+
+        dns.down.store(true, Ordering::SeqCst);
+        assert_eq!(post(booted.addr, &simple_body()).await.status, 502);
+        assert_eq!(dns.lookups.load(Ordering::SeqCst), 1);
+        // Back seconds later. Until the next probe is due, requests fail fast, without a lookup.
+        dns.down.store(false, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let body = simple_body();
+        let burst = futures_util::future::join_all((0..3).map(|_| post(booted.addr, &body))).await;
+        assert!(started.elapsed() < DNS_PROBE_EVERY);
+        assert!(burst.iter().all(|r| r.status == 502));
+        assert_eq!(
+            dns.lookups.load(Ordering::SeqCst),
+            1,
+            "no lookup while failing fast"
+        );
+        assert!(fake.requests_to(MESSAGES).is_empty());
+        // About 2 s after the failure, the next request does a real lookup and is served.
+        tokio::time::sleep(DNS_PROBE_EVERY + Duration::from_millis(200)).await;
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 200, "{}", resp.text());
+        assert_eq!(dns.lookups.load(Ordering::SeqCst), 2);
+        // Cleared at once: the next one goes straight out.
+        assert_eq!(post(booted.addr, &simple_body()).await.status, 200);
+        assert_eq!(fake.requests_to(MESSAGES).len(), 2);
+        assert!(booted.app.upstream.dns().outages().is_empty());
+        untouched(&pool, "work");
     }
 
     #[tokio::test]

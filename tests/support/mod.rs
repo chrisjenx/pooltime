@@ -135,6 +135,30 @@ impl reqwest::dns::Resolve for DnsDown {
     }
 }
 
+/// A resolver that can be switched off and on (a resolver that is down for a moment, e.g. after
+/// wake from sleep). Up, every name resolves to 127.0.0.1 (the URL's port is kept). Counts the
+/// lookups it was asked for.
+#[derive(Default)]
+pub struct FlakyDns {
+    pub down: std::sync::atomic::AtomicBool,
+    pub lookups: std::sync::atomic::AtomicUsize,
+}
+
+impl reqwest::dns::Resolve for FlakyDns {
+    fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        use std::sync::atomic::Ordering;
+        self.lookups.fetch_add(1, Ordering::SeqCst);
+        let down = self.down.load(Ordering::SeqCst);
+        Box::pin(async move {
+            if down {
+                return Err("simulated DNS outage: no resolver answered".into());
+            }
+            let addr: std::net::SocketAddr = ([127, 0, 0, 1], 0).into();
+            Ok(Box::new(std::iter::once(addr)) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 impl Pool {
     /// Start the real HTTP server on 127.0.0.1:0 over this pool (providers from `opts`).
     pub async fn boot(&self, opts: Boot) -> Booted {

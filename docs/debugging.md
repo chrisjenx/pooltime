@@ -62,8 +62,9 @@ over to the next account. **Reasons** are classified: `quota`, `status:<code>`, 
 blocking that host); `refresh:network:dns` means its token host did not, for an account whose
 token had expired. Neither is the account's fault: nothing is recorded against it and `doctor`
 leaves them out of the error rate. When the API host fails, that provider's other accounts are
-skipped (they send to the same host) and, for 30 seconds, so is the provider; a mapped request
-still goes to the other provider. With nowhere left to go, the request gets a retryable 502
+skipped (they send to the same host) and so is the provider until its next check (one real
+lookup at most every 2 seconds, at most 5 seconds of skipping after the last failed lookup; any
+answer clears it at once); a mapped request still goes to the other provider. With nowhere left to go, the request gets a retryable 502
 `pooltime: network unavailable (DNS lookup failed)`. An account whose token is due for refresh
 but not yet expired keeps using it while its token host does not resolve. The log has one
 warning per host when its lookups start failing and one when it answers again; a host failing for

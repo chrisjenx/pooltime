@@ -89,15 +89,16 @@ impl Upstream {
     /// Send `req` and wait for the response headers.
     ///
     /// Header-wait expiry is classified [`TransportKind::IdleTimeout`]; the attempt deadline
-    /// expiring first is [`TransportKind::Deadline`]. A host whose DNS lookup failed within
-    /// [`crate::dnswatch::DNS_SKIP_TTL`] is [`TransportKind::Dns`] at once, without a network call.
+    /// expiring first is [`TransportKind::Deadline`]. A host whose DNS lookup just failed is
+    /// [`TransportKind::Dns`] at once, without a network call, unless this send is its periodic
+    /// probe ([`DnsWatch::admit`]).
     pub async fn send(
         &self,
         req: reqwest::Request,
         lim: &Limits,
     ) -> Result<UpstreamResponse, TransportKind> {
         let host = req.url().host_str().map(str::to_ascii_lowercase);
-        if host.as_deref().is_some_and(|h| self.dns.is_down(h)) {
+        if host.as_deref().is_some_and(|h| !self.dns.admit(h)) {
             tracing::debug!(host = host.as_deref().unwrap_or("-"), "DNS down: not sent");
             return Err(TransportKind::Dns);
         }
