@@ -589,15 +589,26 @@ pub(super) async fn serve_provider(
             }
             AttemptOutcome::Terminal(mut resp, reason) => {
                 journal.end_attempt("error", Some(reason.detail()));
-                tracing::warn!(
-                    request_id = rid,
-                    account = %acct_id,
-                    provider = %pid,
-                    outcome = "terminal",
-                    reason = %reason.detail(),
-                    status = resp.status().as_u16(),
-                    "attempt failed"
-                );
+                if let FailReason::Network(_) = reason {
+                    // The machine's network is down: `Upstream` warns once per outage, and no
+                    // other account would do better, so the request ends here.
+                    tracing::info!(
+                        request_id = rid,
+                        provider = %pid,
+                        reason = %reason.detail(),
+                        "network unavailable; request not failed over"
+                    );
+                } else {
+                    tracing::warn!(
+                        request_id = rid,
+                        account = %acct_id,
+                        provider = %pid,
+                        outcome = "terminal",
+                        reason = %reason.detail(),
+                        status = resp.status().as_u16(),
+                        "attempt failed"
+                    );
+                }
                 set_account_header(&mut resp, &acct_id);
                 return Served {
                     response: resp,

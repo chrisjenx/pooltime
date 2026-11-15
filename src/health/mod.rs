@@ -15,7 +15,9 @@
 //! - anything else (network, 5xx, ...): `erroring`, never `needs_login`. The probe retries after
 //!   [`states::ERRORING_WINDOW`] (at most one token POST per 15 minutes per account while
 //!   unconfirmed), and the failure shows for [`states::PROBE_FAILURE_TTL`], so it stays visible
-//!   between retries but lapses if probing stops.
+//!   between retries but lapses if probing stops;
+//! - a failed DNS lookup (the machine's network is down): nothing is concluded or recorded, and
+//!   the probe runs again on the next tick.
 //!
 //! An unknown expiry is never probed. Accounts already `needs_login` are skipped.
 
@@ -47,6 +49,8 @@ pub enum ProbeOutcome {
     Billing,
     /// Unconfirmed failure (class, e.g. `refresh:server:503`): `erroring`, retried later.
     Erroring(String),
+    /// The machine's network is down (DNS): says nothing about the account; retried next tick.
+    NetworkDown,
 }
 
 /// Per account: the expiry value last probed, and when an unconfirmed (erroring) probe may be
@@ -95,6 +99,13 @@ impl ExpiryProbe {
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(meta.id.clone(), (expiry, Some(retry_at)));
             }
+            if outcome == ProbeOutcome::NetworkDown {
+                // Not probed after all: the next tick tries again.
+                self.probed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&meta.id);
+            }
             tracing::info!(
                 account = %meta.id,
                 outcome = ?outcome,
@@ -132,6 +143,25 @@ fn outcome_of(kind: RefreshErrorKind) -> ProbeOutcome {
     match kind {
         RefreshErrorKind::InvalidGrant | RefreshErrorKind::TokenReused => ProbeOutcome::NeedsLogin,
         RefreshErrorKind::AccountOnHold => ProbeOutcome::Billing,
+        k if k.is_machine_wide() => ProbeOutcome::NetworkDown,
         other => ProbeOutcome::Erroring(FailReason::Refresh(other).detail()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::TransportKind;
+
+    #[test]
+    fn dns_failure_is_no_verdict_on_the_account() {
+        assert_eq!(
+            outcome_of(RefreshErrorKind::Network(TransportKind::Dns)),
+            ProbeOutcome::NetworkDown
+        );
+        assert_eq!(
+            outcome_of(RefreshErrorKind::Network(TransportKind::Connect)),
+            ProbeOutcome::Erroring("refresh:network:connect".into())
+        );
     }
 }

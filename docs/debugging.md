@@ -54,9 +54,15 @@ carrying that id instead.
 account), `upstream_truncated`, `idle_timeout`, `reset` or `error`.
 
 **Attempt outcome**: the same words for the attempt that served, or `failover` for one that handed
-over to the next account. **Reasons** are classified: `quota`, `status:<code>`, `transport:dns`,
-`transport:tls`, `transport:connect`, `transport:reset`, `transport:idle_timeout`, `no_account`,
+over to the next account. **Reasons** are classified: `quota`, `status:<code>`, `transport:tls`,
+`transport:connect`, `transport:reset`, `transport:idle_timeout`, `network:dns`, `no_account`,
 `unknown_path`, `invalid_request`, and so on.
+
+`network:dns` means this machine's DNS lookups failed: the network is down, not an account. The
+request ends at once with a retryable 502 (`pooltime: network unavailable (DNS lookup failed)`)
+instead of failing over across every account, nothing is recorded against the account, and
+`doctor` leaves it out of the error rate. The log has one warning when lookups start failing and
+one when the network is back.
 
 Response headers worth knowing:
 

@@ -1877,6 +1877,179 @@ mod inference {
         assert_eq!(retries, 2);
     }
 
+    /// The journal entry of `rid` (written asynchronously, so polled).
+    async fn journal_entry(addr: std::net::SocketAddr, rid: &str) -> serde_json::Value {
+        for _ in 0..200 {
+            let r = http_get(
+                addr,
+                &format!("/api/v1/requests/{rid}"),
+                &[("authorization", "Bearer mgmt-test-key")],
+            )
+            .await;
+            if r.status == 200 {
+                return r.json();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no journal entry for {rid}");
+    }
+
+    /// Nothing recorded against `id`: no error, no erroring streak, status unchanged.
+    fn untouched(pool: &Pool, id: &str) {
+        let (id, now) = (id.parse().unwrap(), OffsetDateTime::now_utc());
+        let st = pool.state.state(&id, now);
+        assert!(st.last_error.is_none(), "{id}: {:?}", st.last_error);
+        assert_eq!(st.lifetime.errors, 0, "{id}");
+        assert!(pool.state.erroring(&id, now).is_none(), "{id}");
+        assert_eq!(pool.state.status(&id, true, now), AccountStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn dns_outage_fails_fast_without_failover_or_blame() {
+        use pooltime::providers::anthropic::NETWORK_UNAVAILABLE_MESSAGE;
+        // The machine's DNS is down: the API host never resolves (simulated; no real resolver).
+        let fake = FakeAnthropic::start().await;
+        let pool = Pool::new().with_dns_down();
+        pool.add_account("second", ProviderId::Anthropic, 100, "tok-second");
+        pool.add_account("codex1", ProviderId::OpenAi, 100, "tok-codex");
+        let codex = FakeProvider::new(ProviderId::OpenAi, |_, _| done(json!({"from": "codex"})));
+        let cfg = pooltime::config::AnthropicCfg {
+            api_base: UNRESOLVABLE.into(),
+            token_url: format!("{}{}", fake.url(), TOKEN),
+            ..Default::default()
+        };
+        let (policy, _) = fast_policy();
+        let p = AnthropicProvider::new(cfg, pool.reg.clone(), pool.state.clone(), pool.up.clone())
+            .with_overload_policy(policy);
+        let booted = pool
+            .boot(Boot {
+                models: Some(mapped_models()),
+                ..Boot::default()
+                    .provider(Arc::new(p))
+                    .provider(codex.clone())
+            })
+            .await;
+
+        let mut rids = Vec::new();
+        for _ in 0..2 {
+            let resp = post(booted.addr, &simple_body()).await;
+            // A retryable 5xx Claude Code backs off on, with a clear message.
+            assert_eq!(resp.status, 502, "{}", resp.text());
+            let j = resp.json();
+            assert_eq!(j["type"], "error");
+            assert_eq!(j["error"]["type"], "api_error");
+            assert_eq!(j["error"]["message"], NETWORK_UNAVAILABLE_MESSAGE);
+            assert_eq!(
+                NETWORK_UNAVAILABLE_MESSAGE,
+                "pooltime: network unavailable (DNS lookup failed)"
+            );
+            assert_eq!(resp.header("x-should-retry"), Some("true"));
+            // Not flagged for a hop to the other provider (same broken network).
+            assert!(resp.header("x-pool-retryable-transport").is_none());
+            rids.push(resp.header(REQUEST_ID_HEADER).unwrap().to_string());
+        }
+        // No failover: no second account, no cross-provider hop.
+        assert!(codex.calls().is_empty());
+        for rid in &rids {
+            let j = journal_entry(booted.addr, rid).await;
+            let attempts = j["attempts"].as_array().unwrap();
+            assert_eq!(attempts.len(), 1, "one attempt only: {j}");
+            assert_eq!(attempts[0]["reason"], "network:dns", "{j}");
+            assert_eq!(attempts[0]["outcome"], "error", "{j}");
+            assert_eq!(j["request"]["reason"], "network:dns", "{j}");
+            assert_eq!(j["request"]["status"], 502, "{j}");
+        }
+        // No account is blamed.
+        for id in ["work", "second", "codex1"] {
+            untouched(&pool, id);
+        }
+        // Nor rated against in the error rate `doctor` reads.
+        let st = http_get(
+            booted.addr,
+            "/api/v1/stats",
+            &[("authorization", "Bearer mgmt-test-key")],
+        )
+        .await
+        .json();
+        for a in st["accounts"].as_array().unwrap() {
+            assert_eq!(a["rated_attempts"], 0, "{st}");
+            assert_eq!(a["rated_errors"], 0, "{st}");
+        }
+        // One warning when the outage starts, not one per request.
+        let warned = |rid: &str| {
+            lines_for(rid)
+                .iter()
+                .any(|l| l.contains("network unavailable (DNS lookup failed)"))
+        };
+        assert!(warned(&rids[0]), "{:#?}", lines_for(&rids[0]));
+        assert!(!warned(&rids[1]), "{:#?}", lines_for(&rids[1]));
+        assert!(pool.up.network_down());
+    }
+
+    #[tokio::test]
+    async fn dns_outage_on_refresh_leaves_health_alone() {
+        // The API answers, but the token endpoint's host does not resolve: the access token is
+        // stale, so every request needs a refresh.
+        let fake = FakeAnthropic::start().await;
+        let pool = Pool::new().with_dns_down();
+        pool.reg
+            .write_creds(&pool.meta.id, &creds(ACCESS, -60))
+            .unwrap();
+        pool.add_account("second", ProviderId::Anthropic, 100, "tok-second");
+        let second: pooltime::accounts::AccountId = "second".parse().unwrap();
+        pool.reg
+            .write_creds(&second, &creds("tok-second", -60))
+            .unwrap();
+        let cfg = pooltime::config::AnthropicCfg {
+            api_base: fake.url(),
+            token_url: format!("{UNRESOLVABLE}{TOKEN}"),
+            ..Default::default()
+        };
+        let (policy, _) = fast_policy();
+        let p = Arc::new(
+            AnthropicProvider::new(cfg, pool.reg.clone(), pool.state.clone(), pool.up.clone())
+                .with_overload_policy(policy),
+        );
+        // More refresh failures than the erroring threshold: none of them counts.
+        for _ in 0..4 {
+            assert_eq!(
+                p.access_token(&pool.meta, false).await.unwrap_err(),
+                RefreshErrorKind::Network(TransportKind::Dns)
+            );
+        }
+        untouched(&pool, "work");
+
+        let booted = pool.boot(Boot::default().provider(p.clone())).await;
+        let resp = post(booted.addr, &simple_body()).await;
+        assert_eq!(resp.status, 502, "{}", resp.text());
+        assert_eq!(resp.json()["error"]["type"], "api_error");
+        assert!(resp.header("x-pool-retryable-transport").is_none());
+        let rid = resp.header(REQUEST_ID_HEADER).unwrap().to_string();
+        let j = journal_entry(booted.addr, &rid).await;
+        assert_eq!(j["attempts"].as_array().unwrap().len(), 1, "{j}");
+        assert_eq!(j["request"]["reason"], "network:dns", "{j}");
+        assert!(fake.requests_to(MESSAGES).is_empty());
+        untouched(&pool, "work");
+        untouched(&pool, "second");
+
+        // Contrast: a refresh that cannot connect (not machine-wide) does count.
+        let closed = support::procs::free_addr();
+        let cfg = pooltime::config::AnthropicCfg {
+            api_base: fake.url(),
+            token_url: format!("http://{closed}{TOKEN}"),
+            ..Default::default()
+        };
+        let p = AnthropicProvider::new(cfg, pool.reg.clone(), pool.state.clone(), pool.up.clone());
+        for _ in 0..3 {
+            assert_eq!(
+                p.access_token(&pool.meta, false).await.unwrap_err(),
+                RefreshErrorKind::Network(TransportKind::Connect)
+            );
+        }
+        let now = OffsetDateTime::now_utc();
+        assert!(pool.state.erroring(&pool.meta.id, now).is_some());
+    }
+
     #[tokio::test]
     async fn classifier_starts_on_anthropic_no_affinity() {
         let fake = FakeAnthropic::start().await;

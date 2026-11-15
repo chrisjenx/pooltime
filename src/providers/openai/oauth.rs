@@ -352,13 +352,18 @@ fn load(
     }
 }
 
-/// Log the classified outcome, record it as the account's last error, return it.
+/// Log the classified outcome, record it as the account's last error, return it. A machine-wide
+/// network failure (DNS) is not the account's: nothing is recorded (see the Anthropic `fail`).
 fn fail(
     state: &StateBook,
     id: &AccountId,
     kind: RefreshErrorKind,
     request_id: Option<String>,
 ) -> RefreshErrorKind {
+    if kind.is_machine_wide() {
+        tracing::debug!(account = %id, outcome = %kind.detail(), "openai oauth refresh failed: network unavailable");
+        return kind;
+    }
     tracing::warn!(
         account = %id,
         outcome = %kind.detail(),

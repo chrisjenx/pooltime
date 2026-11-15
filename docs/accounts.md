@@ -67,7 +67,7 @@ MCP, most severe first:
 | `needs_login` | refresh token refused (or never signed in) | no |
 | `billing` | provider reports a billing / entitlement problem | no |
 | `access_denied` | provider refused access; retried after a cooldown | no |
-| `erroring` | 3+ non-quota failures (refresh network/5xx, persistent 401, access denied) in 15 min with no success | yes (display only) |
+| `erroring` | 3+ non-quota failures (refresh network/5xx, persistent 401, access denied) in 15 min with no success; a failed DNS lookup (this machine's network is down) never counts | yes (display only) |
 | `rate_limited` | a quota window is spent; shows which and when it resets | no, until reset |
 | `expiring` | usable; recorded login expiry is within `alerts.warn_days[0]` days (3), or has passed but no refresh was refused yet (unconfirmed) | yes |
 | `ready` | usable | yes |

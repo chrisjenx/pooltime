@@ -114,8 +114,8 @@ pub struct AccountStats {
     /// outcome (ties: the alphabetically first); `None` without errors.
     pub top_error: Option<String>,
     /// Attempts and errors that say something about the account's health: without `failover`
-    /// hand-overs (the request went on to another account) and `invalid_request` (the client's
-    /// fault).
+    /// hand-overs (the request went on to another account), `invalid_request` (the client's
+    /// fault) and `network:*` (the machine's network was down, e.g. DNS).
     pub rated_attempts: u64,
     pub rated_errors: u64,
 }
@@ -295,7 +295,10 @@ pub fn account_stats(conn: &Connection, since: i64) -> anyhow::Result<Vec<Accoun
         }
         let (s, lat, kinds) = out.last_mut().expect("pushed above");
         s.attempts += 1;
-        let rated = outcome != FAILOVER && reason.as_deref() != Some("invalid_request");
+        let rated = outcome != FAILOVER
+            && reason
+                .as_deref()
+                .is_none_or(|r| r != "invalid_request" && !r.starts_with("network:"));
         s.rated_attempts += u64::from(rated);
         if outcome != "completed" && outcome != "client_cancelled" {
             s.errors += 1;

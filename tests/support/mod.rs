@@ -101,6 +101,29 @@ impl Pool {
         self
     }
 
+    /// The machine's DNS is down: every host-name lookup of this pool's upstream client fails
+    /// (no real resolver is consulted). IP-literal URLs, like every fake's, still connect.
+    /// Build providers after calling this (they take `up` when made).
+    pub fn with_dns_down(mut self) -> Pool {
+        self.up = Arc::new(Upstream::new().with_dns_resolver(Arc::new(DnsDown)));
+        self
+    }
+}
+
+/// A host name for upstream URLs that must fail their DNS lookup (with [`Pool::with_dns_down`];
+/// `.invalid` never resolves anyway).
+pub const UNRESOLVABLE: &str = "http://pooltime-test.invalid";
+
+/// A resolver that fails every lookup, like a machine whose DNS is down.
+struct DnsDown;
+
+impl reqwest::dns::Resolve for DnsDown {
+    fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async { Err("simulated DNS outage: no resolver answered".into()) })
+    }
+}
+
+impl Pool {
     /// Start the real HTTP server on 127.0.0.1:0 over this pool (providers from `opts`).
     pub async fn boot(&self, opts: Boot) -> Booted {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

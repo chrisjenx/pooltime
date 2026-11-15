@@ -45,6 +45,9 @@ pub enum FailReason {
     Transport(TransportKind),
     Refresh(RefreshErrorKind),
     Status(u16),
+    /// The machine's network is down ([`TransportKind::is_machine_wide`]): no account is to
+    /// blame, so it is never recorded against one and the request does not fail over.
+    Network(TransportKind),
 }
 
 impl TransportKind {
@@ -60,6 +63,12 @@ impl TransportKind {
             TransportKind::Other => "other",
         }
     }
+
+    /// A failure of the machine's network, not of an account or one connection: a DNS lookup
+    /// that fails fails the same way for every account and provider.
+    pub fn is_machine_wide(self) -> bool {
+        matches!(self, TransportKind::Dns)
+    }
 }
 
 impl RefreshErrorKind {
@@ -73,6 +82,11 @@ impl RefreshErrorKind {
             RefreshErrorKind::Server(code) => format!("server:{code}"),
             RefreshErrorKind::Other => "other".into(),
         }
+    }
+
+    /// A refresh that failed on the machine's network ([`TransportKind::is_machine_wide`]).
+    pub fn is_machine_wide(self) -> bool {
+        matches!(self, RefreshErrorKind::Network(k) if k.is_machine_wide())
     }
 }
 
@@ -90,23 +104,26 @@ impl FailReason {
             FailReason::Transport(_) => "transport",
             FailReason::Refresh(_) => "refresh",
             FailReason::Status(_) => "status",
+            FailReason::Network(_) => "network",
         }
     }
 
     /// `label()` plus the dynamic part: `transport:<kind>`, `refresh:<kind>`,
-    /// `status:<code>`. Never includes a quota reset time or upstream text.
+    /// `status:<code>`, `network:<kind>`. Never includes a quota reset time or upstream text.
     pub fn detail(&self) -> String {
         match self {
             FailReason::Transport(k) => format!("transport:{}", k.as_str()),
             FailReason::Refresh(k) => format!("refresh:{}", k.detail()),
             FailReason::Status(code) => format!("status:{code}"),
+            FailReason::Network(k) => format!("network:{}", k.as_str()),
             other => other.label().to_string(),
         }
     }
 
     /// Whether failing over to the *other* provider is sensible (INV §5): quota,
     /// surfaced overload, and transport failures yes; `UpstreamRejected` never
-    /// (the request itself is bad, the other provider would reject it too).
+    /// (the request itself is bad, the other provider would reject it too), nor `Network` (the
+    /// other provider is behind the same broken network).
     pub fn cross_provider_retryable(&self) -> bool {
         matches!(
             self,
@@ -133,6 +150,7 @@ mod tests {
             FailReason::Refresh(RefreshErrorKind::Server(503)),
             FailReason::Refresh(RefreshErrorKind::InvalidGrant),
             FailReason::Status(418),
+            FailReason::Network(TransportKind::Dns),
         ];
         let rendered: Vec<String> = all
             .iter()
@@ -149,6 +167,7 @@ mod tests {
         refresh | refresh:server:503
         refresh | refresh:invalid_grant
         status | status:418
+        network | network:dns
         ");
         let transports = [
             TransportKind::Dns,
@@ -221,9 +240,22 @@ mod tests {
             FailReason::Refresh(RefreshErrorKind::Other),
             FailReason::Status(400),
             FailReason::Status(529),
+            FailReason::Network(TransportKind::Dns),
         ] {
             assert!(!r.cross_provider_retryable(), "{r:?}");
         }
+    }
+
+    #[test]
+    fn only_dns_is_machine_wide() {
+        use TransportKind::*;
+        for k in [Connect, Tls, Reset, IdleTimeout, Deadline, Other] {
+            assert!(!k.is_machine_wide(), "{k:?}");
+            assert!(!RefreshErrorKind::Network(k).is_machine_wide(), "{k:?}");
+        }
+        assert!(Dns.is_machine_wide());
+        assert!(RefreshErrorKind::Network(Dns).is_machine_wide());
+        assert!(!RefreshErrorKind::Server(503).is_machine_wide());
     }
 
     #[test]
@@ -239,6 +271,10 @@ mod tests {
                 r#"{"refresh":{"server":503}}"#,
             ),
             (FailReason::Status(418), r#"{"status":418}"#),
+            (
+                FailReason::Network(TransportKind::Dns),
+                r#"{"network":"dns"}"#,
+            ),
             (
                 FailReason::Quota {
                     reset: Some(datetime!(2026-11-07 12:00 UTC)),

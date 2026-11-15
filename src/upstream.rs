@@ -7,6 +7,8 @@
 
 use std::error::Error as StdError;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -36,6 +38,9 @@ pub struct Upstream {
     client: reqwest::Client,
     /// While active, request/response headers of every send are logged (redacted).
     debug: DebugMode,
+    /// A send failed its DNS lookup and none has got an answer since: the machine's network is
+    /// down. Logged once when it goes down and once when it is back, not on every attempt.
+    network_down: Arc<AtomicBool>,
 }
 
 impl Default for Upstream {
@@ -46,16 +51,44 @@ impl Default for Upstream {
 
 impl Upstream {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .pool_idle_timeout(Duration::from_secs(90))
-            // Never follow redirects: auth headers must not travel cross-origin and the caller
-            // (failover logic) decides what a 3xx means.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("static reqwest client configuration is valid");
         Self {
-            client,
+            client: client(None),
             debug: DebugMode::default(),
+            network_down: Arc::default(),
+        }
+    }
+
+    /// Resolve host names with `resolver` instead of the system's (tests simulate a DNS outage
+    /// with it; IP-literal URLs never consult it).
+    pub fn with_dns_resolver(mut self, resolver: Arc<dyn reqwest::dns::Resolve>) -> Self {
+        self.client = client(Some(resolver));
+        self
+    }
+
+    /// Whether the network is down: a send failed its DNS lookup and none has got an answer since.
+    pub fn network_down(&self) -> bool {
+        self.network_down.load(Ordering::Relaxed)
+    }
+
+    /// Track the machine's network from one send's result: warn when DNS lookups start failing
+    /// and when an upstream answers again.
+    fn note_network(&self, result: Result<(), TransportKind>) {
+        match result {
+            Err(k) if k.is_machine_wide() => {
+                if !self.network_down.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        transport = k.as_str(),
+                        "network unavailable (DNS lookup failed): requests fail fast without \
+                         failover and no account is blamed until it is back"
+                    );
+                }
+            }
+            Ok(()) => {
+                if self.network_down.swap(false, Ordering::Relaxed) {
+                    tracing::warn!("network available again");
+                }
+            }
+            Err(_) => {}
         }
     }
 
@@ -91,9 +124,14 @@ impl Upstream {
         }
         let resp = match timeout_at(until, self.client.execute(req)).await {
             Err(_) => return Err(expiry),
-            Ok(Err(e)) => return Err(classify_reqwest(&e)),
+            Ok(Err(e)) => {
+                let k = classify_reqwest(&e);
+                self.note_network(Err(k));
+                return Err(k);
+            }
             Ok(Ok(r)) => r,
         };
+        self.note_network(Ok(()));
         let status = resp.status();
         let headers = resp.headers().clone();
         if self.debug.active() {
@@ -114,6 +152,20 @@ impl Upstream {
             },
         })
     }
+}
+
+/// The shared client: rustls, no decompression, no total timeout, pool idle 90 s, no redirects.
+fn client(resolver: Option<Arc<dyn reqwest::dns::Resolve>>) -> reqwest::Client {
+    let mut b = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(90))
+        // Never follow redirects: auth headers must not travel cross-origin and the caller
+        // (failover logic) decides what a 3xx means.
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(r) = resolver {
+        b = b.dns_resolver(r);
+    }
+    b.build()
+        .expect("static reqwest client configuration is valid")
 }
 
 /// `now + wait` capped by `deadline`, and which [`TransportKind`] its expiry means.
