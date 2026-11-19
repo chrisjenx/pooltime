@@ -251,6 +251,16 @@ fn exchange(addr: SocketAddr, method: &str, path: &str, body: Option<&Value>) ->
         return Answer::Broken(e.to_string());
     }
     let raw = String::from_utf8_lossy(&raw).into_owned();
+    // A chunked body without its terminating chunk was cut mid-stream (e.g. its worker was
+    // killed after the headers went out): that is a broken exchange, not an answer.
+    if let Some((head, body)) = raw.split_once("\r\n\r\n") {
+        let chunked = head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked");
+        if chunked && !body.ends_with("0\r\n\r\n") {
+            return Answer::Broken(format!("truncated chunked body: {raw:?}"));
+        }
+    }
     let parsed = raw
         .split_whitespace()
         .nth(1)
