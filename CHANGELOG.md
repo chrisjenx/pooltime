@@ -49,17 +49,17 @@
   unavailable in pooled sessions (Claude Code turns it off while `ANTHROPIC_AUTH_TOKEN` is set,
   and voice audio goes to api.anthropic.com directly), and suggests the OS dictation instead.
 
-### Fixed
-
-- An empty pool's weekly burn read `-0.0 subs used`; it now reads `0.0`.
-- A desktop notification could fail to start with "text file busy" when the notifier program had
-  just been written (seen in tests); starting it is now retried briefly.
-
 ### Changed
 
 - `pooltime doctor`'s service line shows the supervisor's and worker's versions and warns when
   either is older than the binary you run (with `pooltime update` as the fix). Its release check
   now suggests `pooltime update`.
+
+### Fixed
+
+- An empty pool's weekly burn read `-0.0 subs used`; it now reads `0.0`.
+- A desktop notification could fail to start with "text file busy" when the notifier program had
+  just been written (seen in tests); starting it is now retried briefly.
 
 ## 1.2.1 - 2026-11-15
 
