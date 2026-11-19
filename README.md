@@ -57,6 +57,7 @@ sign in in the browser. Never print tokens, key files or the dashboard URL.
 pooltime status                       # accounts, 7-day usage, weekly burn and runway, alerts
 pooltime accounts list                # every account and its state
 pooltime accounts relogin --dead      # re-sign-in every account that needs it, one after another
+pooltime accounts export pool.age     # move the pool to a new machine (then: accounts import)
 pooltime connect default --statusline --mcp   # status line segment + MCP tools in a profile
 pooltime open                         # dashboard
 pooltime doctor                       # what is wrong and how to fix it

@@ -27,7 +27,7 @@ runs).
 | `server/` | `daemon` (boot), `router` (routes + middleware), `auth`, `inference` (`/v1/messages` and the failover loop), `count_tokens`, `fallback` (cross-provider), `classifier`, `models_route`, `health`, `shutdown` (drain, handoff), `handoff` (a supervised worker's side), `mgmt` (management API), `journal_api`, `analytics_api`, `routing_preview`, `dashboard` |
 | `providers/` | the `Provider` trait; `anthropic/` (passthrough proxy, OAuth refresh, rate-limit headers, usage poll, catalog) and `openai/` (Codex: request/stream translation, OAuth, usage, catalog); `stream_guard` (shared stream pump) |
 | `signin/` | OAuth PKCE sign-in flows (`claude`, `openai`), the localhost `callback` listener, paste-code mode |
-| `accounts/` | account ids, `account.toml` registry, credentials (0600), identity verification, the runtime `StateBook` (availability per account) |
+| `accounts/` | account ids, `account.toml` registry, credentials (0600), identity verification, the runtime `StateBook` (availability per account), the `accounts export`/`import` bundle (`transfer.rs`) |
 | `health/` | display states on top of availability (`expiring`, `erroring`), alert events, desktop notifiers |
 | `routing/` | weighted account choice, in-flight reservations, sticky sessions, tuning |
 | `models/` | model table (`models.toml`), id resolution, family mappings to Codex routes |
