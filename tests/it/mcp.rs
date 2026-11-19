@@ -146,7 +146,7 @@ async fn mcp_tools_listed() {
     assert_eq!(v["pool"]["accounts"], 1);
 
     // pool_usage: per-account 7d used (and its complement), pool total, this week's burn and the
-    // forecast.
+    // forecast, and the runway forecast.
     let v = tool_json(&srv, "pool_usage", json!({})).await;
     assert!(account(&v, "work").get("seven_day_used").is_some(), "{v}");
     assert!(account(&v, "work").get("seven_day_left").is_some(), "{v}");
@@ -154,6 +154,7 @@ async fn mcp_tools_listed() {
     assert!(v["pool"]["seven_day_left_total"].is_number(), "{v}");
     assert!(v["this_week"].is_object(), "{v}");
     assert!(v["forecast"].is_object(), "{v}");
+    assert!(v["runway"]["state"].is_string(), "{v}");
     assert!(!v.to_string().contains("secret-person"));
 
     // Errors and request detail: an unknown path is journaled as an error.

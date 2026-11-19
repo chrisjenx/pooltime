@@ -15,6 +15,14 @@
 //!   into that state with an unknown `since`, in this process and after restarts alike, until
 //!   retention prunes the row. That is intended: without a start time, re-entries cannot be told
 //!   apart, and at most once beats spam.
+//! - **Runway** (pool-wide): the runway forecast ([`crate::analytics::runway`]) is at risk, i.e.
+//!   at the current burn rate the pool runs out of 7-day quota at least `alerts.runway_warn_hours`
+//!   before capacity comes back (`0` disables it). Key `pool:runway:<cycle>`, where the cycle is
+//!   the earliest upcoming 7-day reset of a usable account (`unknown` when none is known); a key
+//!   recorded for a cycle within an hour of it counts as the same cycle (`resets_at` jitters).
+//!   So it notifies at most once per reset cycle: after an account resets, a pool still at risk
+//!   alerts again. Message e.g. "At the current rate the pool runs out ~14h before the next reset
+//!   (Thu 09:00)", times in local time.
 //!
 //! Each key is written to `alerts_sent` *before* the notification is shown, and a failed send
 //! keeps the row: at most once beats spam. `alerts.notify = false` records and logs events but
@@ -26,11 +34,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use time::{Duration, OffsetDateTime};
+use time::{Duration, OffsetDateTime, UtcOffset};
 use tokio::task::JoinHandle;
 
 use super::notify::{Notification, Notifier};
 use crate::accounts::{AccountId, AccountStatus};
+use crate::analytics::local_offset;
+use crate::analytics::runway::{self, Runway};
 use crate::server::mgmt::{AccountView, CredsInfo};
 use crate::server::AppState;
 use crate::store::Store;
@@ -72,11 +82,20 @@ impl From<&AccountView> for AlertInput {
 /// One alert: the dedup keys it records and what it shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Event {
-    account: AccountId,
+    /// The account (or `pool` for a pool-wide event).
+    subject: String,
     keys: Vec<String>,
+    /// Also suppressed by a recorded `<prefix><unix>` key within [`NEAR_SECS`] of this time
+    /// (the runway's reset cycle, whose `resets_at` jitters by seconds).
+    near: Option<(&'static str, i64)>,
     message: String,
     action: &'static str,
 }
+
+/// Runway keys: `pool:runway:<cycle>`.
+const RUNWAY_PREFIX: &str = "pool:runway:";
+/// Two reset-cycle times this close are the same cycle.
+const NEAR_SECS: i64 = crate::store::usage_history::RESET_ADVANCE_SECS;
 
 /// The alert evaluator: remembers the states seen at the previous evaluation.
 pub struct Alerts {
@@ -120,68 +139,128 @@ impl Alerts {
             .collect();
         let mut due = Vec::new();
         for ev in events(accounts, &self.warn_days, &self.prev, now) {
-            let keys = ev.keys.clone();
-            let ts = now.unix_timestamp();
-            // Recorded before anything is shown; only a key new to the table fires.
-            let fresh = self
-                .store
-                .exec(move |conn| {
-                    let tx = conn.transaction()?;
-                    let mut fresh = false;
-                    for k in &keys {
-                        fresh |= tx.execute(
-                            "INSERT OR IGNORE INTO alerts_sent(key, ts) VALUES (?1, ?2)",
-                            rusqlite::params![k, ts],
-                        )? == 1;
-                    }
-                    tx.commit()?;
-                    Ok(fresh)
-                })
-                .await;
-            let fresh = match fresh {
-                Ok(f) => f,
-                Err(e) => {
+            match self.fire(&ev, now).await {
+                Ok(Some(n)) => due.push(n),
+                Ok(None) => {}
+                Err(()) => {
                     // Not recorded: retried next time (the account is not marked as seen).
-                    tracing::warn!(account = %ev.account, error = %format!("{e:#}"), "could not record alert");
-                    match self.prev.get(&ev.account) {
-                        Some(p) => seen.insert(ev.account.clone(), p),
-                        None => seen.remove(&ev.account),
-                    };
-                    continue;
-                }
-            };
-            if !fresh {
-                continue;
-            }
-            let n = Notification {
-                message: ev.message,
-                action: ev.action.to_string(),
-                url: self.url.clone(),
-            };
-            tracing::info!(
-                account = %ev.account,
-                event = %ev.keys.join(","),
-                notify = self.notify,
-                "alert: {}",
-                n.message
-            );
-            if self.notify {
-                let (notifier, note) = (self.notifier.clone(), n.clone());
-                match crate::background::blocking(move || notifier.notify(&note)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!(account = %ev.account, error = %format!("{e:#}"), "alert notification failed")
-                    }
-                    Err(e) => {
-                        tracing::warn!(account = %ev.account, error = %e, "alert notification task failed")
+                    let id = accounts
+                        .iter()
+                        .map(|a| &a.id)
+                        .find(|id| id.as_str() == ev.subject);
+                    if let Some(id) = id {
+                        match self.prev.get(id) {
+                            Some(p) => seen.insert(id.clone(), p),
+                            None => seen.remove(id),
+                        };
                     }
                 }
             }
-            due.push(n);
         }
         self.prev = seen;
         due
     }
+
+    /// Fire the runway event for forecast `r` at `now`, at most once per reset cycle (see the
+    /// module docs). Returns the notification when it is due.
+    pub async fn evaluate_runway(
+        &mut self,
+        r: Option<&Runway>,
+        now: OffsetDateTime,
+    ) -> Option<Notification> {
+        let ev = runway_event(r?, now, local_offset(now))?;
+        self.fire(&ev, now).await.ok().flatten()
+    }
+
+    /// Record `ev`'s keys, then show it when one of them is new (and no key near it was
+    /// recorded). `Err` when the keys could not be recorded (nothing shown; logged).
+    async fn fire(&self, ev: &Event, now: OffsetDateTime) -> Result<Option<Notification>, ()> {
+        let (keys, near) = (ev.keys.clone(), ev.near);
+        let ts = now.unix_timestamp();
+        // Recorded before anything is shown; only a key new to the table fires.
+        let fresh = self
+            .store
+            .exec(move |conn| {
+                let tx = conn.transaction()?;
+                let mut near_hit = false;
+                if let Some((prefix, at)) = near {
+                    let mut st = tx.prepare(
+                        "SELECT key FROM alerts_sent WHERE substr(key, 1, length(?1)) = ?1",
+                    )?;
+                    let rows = st.query_map([prefix], |r| r.get::<_, String>(0))?;
+                    for k in rows {
+                        near_hit |= k?[prefix.len()..]
+                            .parse::<i64>()
+                            .is_ok_and(|t| (t - at).abs() <= NEAR_SECS);
+                    }
+                }
+                if near_hit {
+                    return Ok(false);
+                }
+                let mut fresh = false;
+                for k in &keys {
+                    fresh |= tx.execute(
+                        "INSERT OR IGNORE INTO alerts_sent(key, ts) VALUES (?1, ?2)",
+                        rusqlite::params![k, ts],
+                    )? == 1;
+                }
+                tx.commit()?;
+                Ok(fresh)
+            })
+            .await;
+        let fresh = match fresh {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(subject = %ev.subject, error = %format!("{e:#}"), "could not record alert");
+                return Err(());
+            }
+        };
+        if !fresh {
+            return Ok(None);
+        }
+        let n = Notification {
+            message: ev.message.clone(),
+            action: ev.action.to_string(),
+            url: self.url.clone(),
+        };
+        tracing::info!(
+            subject = %ev.subject,
+            event = %ev.keys.join(","),
+            notify = self.notify,
+            "alert: {}",
+            n.message
+        );
+        if self.notify {
+            let (notifier, note) = (self.notifier.clone(), n.clone());
+            match crate::background::blocking(move || notifier.notify(&note)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(subject = %ev.subject, error = %format!("{e:#}"), "alert notification failed")
+                }
+                Err(e) => {
+                    tracing::warn!(subject = %ev.subject, error = %e, "alert notification task failed")
+                }
+            }
+        }
+        Ok(Some(n))
+    }
+}
+
+/// The runway event of an at-risk forecast at `now` (times shown in `offset`); `None` when not
+/// at risk, or while the rate covers less than a full day (a fresh install's first heavy session
+/// is not a trend).
+fn runway_event(r: &Runway, now: OffsetDateTime, offset: UtcOffset) -> Option<Event> {
+    if !r.at_risk || r.low_confidence {
+        return None;
+    }
+    let cycle = r.cycle.map_or("unknown".to_string(), |c| c.to_string());
+    Some(Event {
+        subject: "pool".into(),
+        keys: vec![format!("{RUNWAY_PREFIX}{cycle}")],
+        near: r.cycle.map(|c| (RUNWAY_PREFIX, c)),
+        message: runway::message(r, now, offset)?,
+        action: OPEN,
+    })
 }
 
 /// The events `accounts` raise at `now`, given the states seen at the previous evaluation.
@@ -208,8 +287,9 @@ fn events(
                     _ => (format!("{} is erroring", a.id), OPEN),
                 };
                 out.push(Event {
-                    account: a.id.clone(),
+                    subject: a.id.to_string(),
                     keys: vec![format!("{}:{label}:{since}", a.id)],
+                    near: None,
                     message,
                     action,
                 });
@@ -239,7 +319,8 @@ fn events(
         let days = (left.whole_seconds() + 86_399) / 86_400;
         let unit = if days == 1 { "day" } else { "days" };
         out.push(Event {
-            account: a.id.clone(),
+            subject: a.id.to_string(),
+            near: None,
             keys: crossed
                 .iter()
                 .map(|n| format!("{}:expiring_{n}d:{}", a.id, at.unix_timestamp()))
@@ -296,6 +377,8 @@ pub fn spawn_alerts(app: Arc<AppState>, notifier: Arc<dyn Notifier>) -> JoinHand
                         let accounts: Vec<AlertInput> =
                             inputs.accounts.iter().map(AlertInput::from).collect();
                         alerts.evaluate(&accounts, now).await;
+                        let forecast = runway::current(&app, now).await;
+                        alerts.evaluate_runway(forecast.as_ref(), now).await;
                     }
                     Err(e) => tracing::warn!(error = %e, "alerts: could not read the pool"),
                 }
@@ -511,5 +594,98 @@ mod tests {
         assert!(b.evaluate(&held, NOW).await.is_empty());
         assert_eq!(failing.sent().len(), 1);
         assert_eq!(rows(&store).len(), 2);
+    }
+
+    fn at_risk(cycle: Option<i64>, short_by: i64) -> Runway {
+        let ex = NOW + Duration::hours(10);
+        Runway {
+            state: "short",
+            rate_per_hour: Some(0.05),
+            rate_window_hours: Some(24.0),
+            headroom: 0.5,
+            exhausts_at: Some(ex),
+            next_reset: Some(ex + Duration::seconds(short_by)),
+            short_by_secs: Some(short_by),
+            at_risk: true,
+            warn_hours: 6,
+            low_confidence: false,
+            cycle,
+        }
+    }
+
+    #[tokio::test]
+    async fn runway_alerts_once_per_reset_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("p.db");
+        let rec = Arc::new(RecordingNotifier::default());
+        let cycle = NOW.unix_timestamp() + 30 * 3600;
+        {
+            let store = Arc::new(Store::open(&db).unwrap());
+            let mut a = alerts(&store, &rec, true);
+            // Nothing to say: no forecast, or one that is not at risk.
+            assert!(a.evaluate_runway(None, NOW).await.is_none());
+            let mut fine = at_risk(Some(cycle), 3600);
+            fine.at_risk = false;
+            assert!(a.evaluate_runway(Some(&fine), NOW).await.is_none());
+            // Under a day of history (a fresh install's first session): shown, never alerted,
+            // and nothing recorded, so it can still alert once the rate is trustworthy.
+            let mut young = at_risk(Some(cycle), 14 * 3600);
+            young.low_confidence = true;
+            assert!(a.evaluate_runway(Some(&young), NOW).await.is_none());
+            assert!(rows(&store).is_empty());
+
+            let n = a
+                .evaluate_runway(Some(&at_risk(Some(cycle), 14 * 3600)), NOW)
+                .await
+                .unwrap();
+            assert!(
+                n.message.starts_with(
+                    "At the current rate the pool runs out ~14h before the next reset ("
+                ),
+                "{}",
+                n.message
+            );
+            assert_eq!(n.action, "open pooltime");
+            // Same cycle, a different shortfall or a jittered resets_at: nothing new.
+            for (c, short) in [
+                (cycle, 20 * 3600),
+                (cycle + 40, 14 * 3600),
+                (cycle - 3000, 9 * 3600),
+            ] {
+                assert!(a
+                    .evaluate_runway(Some(&at_risk(Some(c), short)), NOW)
+                    .await
+                    .is_none());
+            }
+            assert_eq!(rows(&store), vec![format!("pool:runway:{cycle}")]);
+        }
+        // After a restart the cycle is still remembered.
+        let store = Arc::new(Store::open(&db).unwrap());
+        let mut a = alerts(&store, &rec, true);
+        assert!(a
+            .evaluate_runway(Some(&at_risk(Some(cycle + 60), 14 * 3600)), NOW)
+            .await
+            .is_none());
+        // The next cycle (an account reset) alerts again, once.
+        let next = cycle + 2 * 86_400;
+        let later = NOW + Duration::days(2);
+        assert!(a
+            .evaluate_runway(Some(&at_risk(Some(next), 8 * 3600)), later)
+            .await
+            .is_some());
+        assert!(a
+            .evaluate_runway(Some(&at_risk(Some(next), 8 * 3600)), later)
+            .await
+            .is_none());
+        // No reset known: one `unknown` cycle.
+        let mut out = at_risk(None, 0);
+        out.state = "out";
+        out.next_reset = None;
+        out.short_by_secs = None;
+        let n = a.evaluate_runway(Some(&out), later).await.unwrap();
+        assert_eq!(n.message, "The pool is out of 7-day quota (no reset known)");
+        assert!(a.evaluate_runway(Some(&out), later).await.is_none());
+        assert_eq!(rec.sent().len(), 3);
+        assert!(rows(&store).contains(&"pool:runway:unknown".to_string()));
     }
 }

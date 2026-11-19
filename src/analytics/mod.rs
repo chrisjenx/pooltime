@@ -3,8 +3,10 @@
 //! - [`sampler`] records each account's 7-day utilization into `usage_samples` as it changes.
 //! - [`burn`] totals the history per local ISO week ([`burn::report`], shared by the management
 //!   API, `pooltime status` and MCP).
+//! - [`runway`] forecasts whether the pool's 7-day quota lasts until capacity comes back.
 
 pub mod burn;
+pub mod runway;
 pub mod sampler;
 
 use time::{OffsetDateTime, UtcOffset};

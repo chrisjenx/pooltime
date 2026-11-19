@@ -32,12 +32,34 @@
   everything before the first write, and works with or without a running daemon. The file
   holds live refresh tokens: delete it after importing, and stop the old pool, since two
   machines refreshing the same sign-in log each other out. See [Accounts](docs/accounts.md#move-the-pool-to-a-new-machine).
+- Runway forecast: will the pool's weekly (7-day window) quota last until capacity comes back?
+  From the pool's burn rate over the last 24 hours and each usable account's 7-day headroom and
+  own reset time (an account resetting soon adds capacity), pooltime projects when every usable
+  account is spent and compares that with the next reset. `pooltime status` shows a `runway:`
+  line, the dashboard's weekly burn panel shows it too, the MCP `pool_usage` tool and
+  `GET /api/v1/analytics/burn` return it as `runway`, and while it is at risk the status line
+  segment adds `⚠ 7d out ~14h early`. See [Runway forecast](docs/relogin.md#runway-forecast).
+- Runway alert: a desktop notification when the pool is projected to run out at least
+  `alerts.runway_warn_hours` (default 6; `0` turns it off) before the next reset, at most once
+  per reset cycle: "At the current rate the pool runs out ~14h before the next reset (Thu 09:00)".
+  Only a shortfall within the next 7 days warns (one further out is shown only), and nothing
+  warns until there is a full day of usage history (the forecast is marked low confidence
+  until then).
+- `pooltime doctor` notes (`i voice`, never a failure) that Claude Code's `/voice` dictation is
+  unavailable in pooled sessions (Claude Code turns it off while `ANTHROPIC_AUTH_TOKEN` is set,
+  and voice audio goes to api.anthropic.com directly), and suggests the OS dictation instead.
 
 ### Changed
 
 - `pooltime doctor`'s service line shows the supervisor's and worker's versions and warns when
   either is older than the binary you run (with `pooltime update` as the fix). Its release check
   now suggests `pooltime update`.
+
+### Fixed
+
+- An empty pool's weekly burn read `-0.0 subs used`; it now reads `0.0`.
+- A desktop notification could fail to start with "text file busy" when the notifier program had
+  just been written (seen in tests); starting it is now retried briefly.
 
 ## 1.2.1 - 2026-11-15
 

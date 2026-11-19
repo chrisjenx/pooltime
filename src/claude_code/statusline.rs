@@ -4,10 +4,13 @@
 //!   pool's picture changes (at most once a second) and at least every [`HEARTBEAT`]. It holds
 //!   counts only, never tokens or emails:
 //!   `{written_at, port, pool: {available, total}, seven_day_used, seven_day_left, counts:
-//!   {needs_login, expiring_today, expiring, erroring}}` (`seven_day_left` is kept for older
-//!   readers; the segment shows `seven_day_used`).
+//!   {needs_login, expiring_today, expiring, erroring}, runway}` (`seven_day_left` is kept for
+//!   older readers; the segment shows `seven_day_used`). `runway` is `{state, short_by_secs}`
+//!   only while the runway forecast is at risk with a full day of history
+//!   ([`crate::analytics::runway`]), else `null`.
 //! - [`segment`] renders it without any network: `pool 6/8 · 7d 59% used · ⚠ 2 need login`, or
-//!   `pool down` when the cache is missing, unreadable or older than [`STALE_AFTER`].
+//!   `pool down` when the cache is missing, unreadable or older than [`STALE_AFTER`]. An at-risk
+//!   runway adds `⚠ 7d out ~14h early` (`⚠ 7d out for ~20h` when already out).
 //! - `connect --statusline` ([`install`]) puts `pooltime statusline --wrap <profile-id>` into the
 //!   profile's `statusLine`, keeping the user's own value in the profile snapshot
 //!   (`statusline_prior`); [`restore`] (run by `disconnect`) puts it back, or removes the key when
@@ -26,6 +29,7 @@ use tokio::task::JoinHandle;
 
 use super::snapshot::{self, SnapshotState};
 use super::{patch_json, Profile};
+use crate::analytics::runway::Runway;
 use crate::config::Paths;
 use crate::fsutil::{atomic_write_relaxed, WriteOutcome};
 use crate::server::AppState;
@@ -46,9 +50,9 @@ pub fn cache_path(paths: &Paths) -> PathBuf {
     paths.run.join(CACHE_FILE)
 }
 
-/// The cache document (without `written_at`) for a `GET /api/v1/status` document. The 7-day
-/// figure is `pooltime status`'s ([`crate::cli::status::pool_seven_day_used`]).
-pub fn cache_body(status: &Value, port: u16) -> Value {
+/// The cache document (without `written_at`) for a `GET /api/v1/status` document and the runway
+/// forecast. The 7-day figure is `pooltime status`'s ([`crate::cli::status::pool_seven_day_used`]).
+pub fn cache_body(status: &Value, runway: Option<&Runway>, port: u16) -> Value {
     let pool = &status["pool"];
     let counts = &status["counts"];
     let n = |v: &Value| v.as_u64().unwrap_or(0);
@@ -68,6 +72,12 @@ pub fn cache_body(status: &Value, port: u16) -> Value {
             "expiring": n(&counts["expiring"]),
             "erroring": erroring,
         },
+        // Whole hours: the document (and so the file) changes only when the badge would.
+        // Like the alert: not on under a day of history.
+        "runway": runway.filter(|r| r.at_risk && !r.low_confidence).map(|r| json!({
+            "state": r.state,
+            "short_by_secs": r.short_by_secs.map(|s| (s + 1800) / 3600 * 3600),
+        })),
     })
 }
 
@@ -79,6 +89,15 @@ struct Cache {
     /// Written by a daemon older than `seven_day_used`; read as `1 - left` when that is absent.
     seven_day_left: Option<f64>,
     counts: Counts,
+    /// Absent from a cache written before the runway forecast.
+    #[serde(default)]
+    runway: Option<RunwayBadge>,
+}
+
+#[derive(Deserialize)]
+struct RunwayBadge {
+    state: String,
+    short_by_secs: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -123,6 +142,15 @@ pub fn segment(cache: Option<&[u8]>, now: i64) -> String {
     }
     if c.counts.expiring_today > 0 {
         out.push_str(&format!(" · ⏳ {} expiring", c.counts.expiring_today));
+    }
+    if let Some(r) = &c.runway {
+        let span = r.short_by_secs.map(crate::analytics::runway::fmt_span);
+        out.push_str(&match (r.state.as_str(), span) {
+            ("out", Some(s)) => format!(" · ⚠ 7d out for {s}"),
+            ("out", None) => " · ⚠ 7d out".to_string(),
+            (_, Some(s)) => format!(" · ⚠ 7d out {s} early"),
+            (_, None) => " · ⚠ 7d running out".to_string(),
+        });
     }
     out
 }
@@ -217,8 +245,10 @@ pub fn spawn_status_cache(app: Arc<AppState>) -> StatusCache {
                 let inputs = crate::server::mgmt::try_gather(&app, now)
                     .await
                     .map_err(|e| e.to_string())?;
+                let runway = crate::analytics::runway::current(&app, now).await;
                 Ok::<_, String>(cache_body(
                     &crate::server::mgmt::build_status(&inputs, now),
+                    runway.as_ref(),
                     app.cfg.port,
                 ))
             };
@@ -513,6 +543,29 @@ mod tests {
     }
 
     #[test]
+    fn segment_runway_badge_only_when_at_risk() {
+        let now = 1_800_000_000;
+        let with = |runway: Value| {
+            let mut c: Value = serde_json::from_slice(&cache(now, json!(0.81), 0, 0)).unwrap();
+            c["runway"] = runway;
+            segment(Some(&serde_json::to_vec(&c).unwrap()), now)
+        };
+        assert_eq!(with(Value::Null), "pool 6/8 · 7d 81% used");
+        assert_eq!(
+            with(json!({"state": "short", "short_by_secs": 14 * 3600})),
+            "pool 6/8 · 7d 81% used · ⚠ 7d out ~14h early"
+        );
+        assert_eq!(
+            with(json!({"state": "out", "short_by_secs": 20 * 3600})),
+            "pool 6/8 · 7d 81% used · ⚠ 7d out for ~20h"
+        );
+        assert_eq!(
+            with(json!({"state": "out", "short_by_secs": null})),
+            "pool 6/8 · 7d 81% used · ⚠ 7d out"
+        );
+    }
+
+    #[test]
     fn segment_reads_a_cache_from_before_the_used_field() {
         let now = 1_800_000_000;
         let old = serde_json::to_vec(&json!({
@@ -532,18 +585,31 @@ mod tests {
             "counts": {"needs_login": 1, "expiring_today": 0, "expiring": 1},
         });
         assert_eq!(
-            cache_body(&status, 3460),
+            cache_body(&status, None, 3460),
             json!({
                 "port": 3460,
                 "pool": {"available": 2, "total": 3},
                 "seven_day_used": 0.5,
                 "seven_day_left": 0.5,
                 "counts": {"needs_login": 1, "expiring_today": 0, "expiring": 1, "erroring": 1},
+                "runway": null,
             })
         );
         let empty = json!({"pool": {"seven_day_used_total": 0.0, "accounts": 0, "available": 0}});
-        assert!(cache_body(&empty, 1)["seven_day_used"].is_null());
-        assert!(cache_body(&empty, 1)["seven_day_left"].is_null());
+        assert!(cache_body(&empty, None, 1)["seven_day_used"].is_null());
+        assert!(cache_body(&empty, None, 1)["seven_day_left"].is_null());
+        // The runway badge only while at risk, its shortfall in whole hours.
+        let mut r = crate::analytics::runway::forecast(&[], None, 0, 6);
+        assert!(cache_body(&status, Some(&r), 1)["runway"].is_null());
+        r.state = "short";
+        r.at_risk = true;
+        r.short_by_secs = Some(14 * 3600 + 1900);
+        assert_eq!(
+            cache_body(&status, Some(&r), 1)["runway"],
+            json!({"state": "short", "short_by_secs": 15 * 3600})
+        );
+        r.low_confidence = true;
+        assert!(cache_body(&status, Some(&r), 1)["runway"].is_null());
     }
 
     fn line(c: &str) -> Value {

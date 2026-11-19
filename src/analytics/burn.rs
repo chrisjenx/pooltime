@@ -34,7 +34,8 @@ pub const IDLE_BELOW: f64 = 0.10;
 pub const MIN_ELAPSED_SECS: i64 = 3600;
 
 fn round4<S: Serializer>(x: &f64, s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_f64((x * 10_000.0).round() / 10_000.0)
+    // `+ 0.0`: an empty sum is -0.0, which would show as "-0.0 subs used".
+    s.serialize_f64((x * 10_000.0).round() / 10_000.0 + 0.0)
 }
 
 fn round4_opt<S: Serializer>(x: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
@@ -418,6 +419,13 @@ mod tests {
         assert!(close(early.forecast.elapsed_fraction, 1800.0 / WEEK as f64));
         let json = serde_json::to_value(&early).unwrap();
         assert!(json["forecast"]["projected"].is_null(), "{json}");
+        // An empty pool's sums are 0, never -0 ("-0.0 subs used").
+        let empty = serde_json::to_value(compute(&[], MON + 2 * DAY, UtcOffset::UTC, 2)).unwrap();
+        assert!(!empty.to_string().contains(":-0"), "{empty}");
+        assert!(empty["forecast"]["projected"]
+            .as_f64()
+            .unwrap()
+            .is_sign_positive());
     }
 
     #[test]

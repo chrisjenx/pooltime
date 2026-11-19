@@ -500,6 +500,47 @@
       ticks, cap, marks);
   }
 
+  // "Thu 09:00" in the browser's local time.
+  // With the date ("Thu 26 Nov 09:00") when more than 6 days away: a bare weekday reads as this week's.
+  function weekdayTime(iso) {
+    const d = new Date(iso);
+    if (isNaN(d)) return "?";
+    const far = d.getTime() - Date.now() > 6 * 86400 * 1000;
+    const wd = d.toLocaleDateString(undefined, { weekday: "short" });
+    const day = far ? wd + " " + d.getDate() + " " + d.toLocaleDateString(undefined, { month: "short" }) : wd;
+    return day + " " + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+  }
+  function span(secs) {
+    if (secs < 3600) return "<1h";
+    const hrs = Math.round(secs / 3600);
+    return hrs < 48 ? "~" + hrs + "h" : "~" + Math.round(secs / 86400) + " days";
+  }
+
+  // The runway forecast (does the 7-day quota last at the current burn rate?), or null.
+  function runwayLine(r) {
+    if (!r || !r.state || r.state === "unknown") return null;
+    const rate = typeof r.rate_per_hour === "number"
+      ? " (" + r.rate_per_hour.toFixed(2) + " subs/h over the last " + Math.round(r.rate_window_hours || 0) + "h)"
+      : "";
+    const low = r.low_confidence ? " · low confidence: only " + Math.round(r.rate_window_hours || 0) + "h of history" : "";
+    let text;
+    if (r.state === "lasts") text = "Runway: the 7-day quota lasts at the current rate" + rate;
+    else if (r.state === "out") {
+      text = r.next_reset
+        ? "Runway: the pool is out of 7-day quota until the next reset (" + weekdayTime(r.next_reset) + ")"
+        : "Runway: the pool is out of 7-day quota (no reset known)";
+    } else if (r.next_reset && typeof r.short_by_secs === "number") {
+      text = "Runway: at the current rate the pool runs out " + span(r.short_by_secs) +
+        " before the next reset (" + weekdayTime(r.next_reset) + ")" + rate;
+    } else {
+      text = "Runway: at the current rate the pool runs out " + weekdayTime(r.exhausts_at) + " (no reset known)" + rate;
+    }
+    text += low;
+    return r.at_risk
+      ? h("p", { class: "runway warn-text" }, h("strong", { text: "⚠ " + text }))
+      : h("p", { class: "runway dim", text });
+  }
+
   function burnPanel() {
     const b = ui.burn;
     const title = h("h2", { text: "Weekly burn" });
@@ -512,6 +553,7 @@
     return h("div", { class: "panel" }, title,
       ui.burnError ? h("p", { class: "msg err", text: "Stale: the last refresh failed (" + ui.burnError + ")" }) : null,
       h("p", { class: "sub" }, h("strong", { text: pace }), " · " + subs(f.subs_used_so_far) + " used so far (" + pct(f.elapsed_fraction || 0) + " of the week)"),
+      runwayLine(b.runway),
       burnChart(b),
       idle.length
         ? h("p", { class: "dim" }, idle.length + (idle.length === 1 ? " sub" : " subs") + " mostly idle this week: ",
