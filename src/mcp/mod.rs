@@ -202,7 +202,8 @@ fn initialize(params: &Value) -> Value {
         "serverInfo": { "name": "pooltime", "version": env!("CARGO_PKG_VERSION") },
         "instructions": "pooltime pools Claude/ChatGPT subscriptions behind this Claude Code. \
             Use pool_health for account states and login expiry, pool_usage for 7-day usage \
-            and weekly burn, recent_errors/explain_request to see why a request failed, \
+            and weekly burn, usage_by_project for which projects and sessions use it, \
+            recent_errors/explain_request to see why a request failed, \
             start_relogin for a sign-in link, set_weight to steer routing (optionally until a \
             time, after which it reverts by itself).",
     })

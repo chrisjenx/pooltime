@@ -67,6 +67,11 @@
     // `select` is the picker element, kept across repaints; `pickingUntil` holds repaints off
     // while its dropdown may be open.
     routing: { doc: null, model: null, error: null, models: null, modelsAt: 0, select: null, optionsKey: "", pickingUntil: 0 },
+    // Usage by project (Projects view, key holders only): refetched at most every USAGE_MS or
+    // when the range changes. Each table keeps its own sort ({ key, desc }); "usage" is the
+    // server's order (estimated quota, then tokens).
+    usage: { doc: null, range: "24h", at: 0, error: null,
+      sort: { projects: { key: "usage", desc: true }, sessions: { key: "usage", desc: true } } },
     // Account order (Overview, Accounts, Routing), remembered in localStorage; filters are not.
     sort: { key: "reset7", reversed: false },
     filter: { q: "", state: "all", provider: "all" },
@@ -341,6 +346,92 @@
     return h("div", { class: cls }, fill);
   }
 
+  // ---- usage by project tables (Projects view) ----
+  // Sort value of a project/session line; "usage" is estimated quota, then tokens.
+  function usageValue(l, key) {
+    switch (key) {
+      case "usage": return [typeof l.est_subs === "number" ? l.est_subs : -1, l.tokens || 0];
+      case "project": return [String(l.project || "").toLowerCase(), l.key || ""];
+      case "key": return [l.key || ""];
+      case "accounts": return [(l.accounts || []).length, l.tokens || 0];
+      case "last_seen": return [Date.parse(l.last_seen) || 0];
+      case "est_subs": return [typeof l.est_subs === "number" ? l.est_subs : -1];
+      default: return [typeof l[key] === "number" ? l[key] : -1];
+    }
+  }
+  function sortLines(lines, sort) {
+    const dir = sort.desc ? -1 : 1;
+    return lines.slice().sort((a, b) => {
+      const va = usageValue(a, sort.key), vb = usageValue(b, sort.key);
+      for (let i = 0; i < va.length; i++) {
+        if (va[i] < vb[i]) return -dir;
+        if (va[i] > vb[i]) return dir;
+      }
+      return String(a.key).localeCompare(String(b.key));
+    });
+  }
+  function accountsText(l) {
+    const accts = l.accounts || [];
+    if (!accts.length) return "—";
+    return accts.map((a) => l.tokens > 0 ? a.account + " " + pct(a.tokens / l.tokens) : a.account).join(" · ");
+  }
+  // A sortable table of project (or session) lines; clicking a header sorts by it, again reverses.
+  function usageTable(which, lines, projects) {
+    const sort = ui.usage.sort[which];
+    const cols = [
+      projects ? ["project", "Project"] : ["key", "Session"],
+      projects ? null : ["project", "Project"],
+      ["requests", "Requests"],
+      ["input_tokens", "Input"],
+      ["output_tokens", "Output"],
+      ["cache_read", "Cache read"],
+      ["cache_write", "Cache write"],
+      ["tokens", "Tokens"],
+      ["share", "Share"],
+      ["est_subs", "Est. quota"],
+      ["accounts", "Accounts"],
+      projects ? ["sessions", "Sessions"] : null,
+      ["last_seen", "Last seen"],
+    ].filter(Boolean);
+    // The default "usage" order shows on the estimate's column (on Share without an estimate).
+    const usageCol = lines.some((l) => typeof l.est_subs === "number") ? "est_subs" : "share";
+    const isActive = (key) => sort.key === key || (sort.key === "usage" && key === usageCol);
+    const setSortKey = (key) => {
+      const textual = key === "project" || key === "key";
+      ui.usage.sort[which] = isActive(key) ? { key: sort.key, desc: !sort.desc } : { key, desc: !textual };
+      paintView();
+    };
+    const th = ([key, label]) => {
+      const active = isActive(key);
+      return h("th", { class: "sortable", tabindex: 0, title: "Sort by " + label.toLowerCase(),
+        "aria-sort": active ? (sort.desc ? "descending" : "ascending") : "none",
+        onclick: () => setSortKey(key),
+        onkeydown: (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); setSortKey(key); } } },
+        label + (active ? (sort.desc ? " ↓" : " ↑") : ""));
+    };
+    if (!lines.length) return h("p", { class: "empty", text: "No requests in this range." });
+    const best = Math.max(...lines.map((l) => l.share || 0));
+    const rows = sortLines(lines, sort).map((l) => h("tr", null,
+      projects
+        ? h("td", { class: "nowrap" }, h("strong", { text: l.project }))
+        : h("td", { class: "mono", text: l.key }),
+      projects ? null : h("td", { class: "nowrap", text: l.project }),
+      h("td", { class: "num", text: num(l.requests) }),
+      h("td", { class: "num", text: compact(l.input_tokens) }),
+      h("td", { class: "num", text: compact(l.output_tokens) }),
+      h("td", { class: "num", text: compact(l.cache_read) }),
+      h("td", { class: "num", text: compact(l.cache_write) }),
+      h("td", { class: "num", text: compact(l.tokens) }),
+      h("td", { class: "sharecell" }, h("div", { class: "share" }, scoreBar(l.share, best), h("span", { class: "num", text: pct(l.share || 0) }))),
+      h("td", { class: "num", text: typeof l.est_subs === "number" ? l.est_subs.toFixed(3) : "—" }),
+      h("td", { class: "small", text: accountsText(l) }),
+      projects ? h("td", { class: "num", text: num(l.sessions) }) : null,
+      h("td", { class: "nowrap dim", text: rel(l.last_seen) })));
+    return h("div", { class: "table-wrap" }, h("table", { class: "usage" },
+      h("thead", null, h("tr", null, cols.map(th))),
+      h("tbody", null, rows)));
+  }
+
   // A score bar: the share of the best score in the table (no usage tone).
   function scoreBar(score, best) {
     if (typeof score !== "number" || !(best > 0)) return h("div", { class: "bar none", title: "not scored" });
@@ -590,6 +681,27 @@
     ui.burnAt = Date.now();
   }
 
+  const USAGE_MS = 30000;
+  async function loadUsage(force) {
+    const u = ui.usage;
+    if (!manage || ui.view !== "projects") return;
+    if (!force && u.doc && u.doc.range === u.range && Date.now() - u.at < USAGE_MS) return;
+    try {
+      u.doc = await api("GET", "/api/v1/analytics/projects?range=" + encodeURIComponent(u.range));
+      u.error = null;
+    } catch (e) {
+      u.error = e.message;
+    }
+    u.at = Date.now();
+  }
+
+  async function setUsageRange(r) {
+    ui.usage.range = r;
+    paintView();
+    await loadUsage(true);
+    render();
+  }
+
   const MODELS_MS = 300000;
   async function loadRouting() {
     if (!manage || ui.view !== "routing") return;
@@ -639,6 +751,7 @@
       await loadJournal();
       await loadBurn();
       await loadRouting();
+      await loadUsage();
       render();
     } catch (e) {
       ui.error = e.message;
@@ -914,6 +1027,37 @@
         h("table", null,
           h("thead", null, h("tr", null, ["From", "To", "Effort", ""].map((t) => h("th", { text: t })))),
           h("tbody", null, rows, addRow)));
+    },
+
+    projects() {
+      if (!manage) return lockedPanel("Usage by project");
+      const u = ui.usage;
+      const doc = u.doc && u.doc.range === u.range ? u.doc : null;
+      const ranges = h("div", { class: "inline" },
+        ["24h", "7d", "30d"].map((r) => h("button", { type: "button", class: "small" + (u.range === r ? "" : " ghost"),
+          "aria-pressed": u.range === r ? "true" : "false", onclick: () => setUsageRange(r) }, r === "24h" ? "24 hours" : r === "7d" ? "7 days" : "30 days")),
+        u.error ? h("span", { class: "msg err", text: u.error }) : null);
+      const t = (doc && doc.totals) || {};
+      const q = doc && doc.quota;
+      const note = !doc ? "" : q
+        ? "Est. quota: each account's sampled 7-day usage in this range (" + q.consumed.toFixed(2) + " subscriptions in all" +
+          (q.unattributed > 0 ? ", " + q.unattributed.toFixed(2) + " on accounts with no recorded requests" : "") +
+          ") split over the projects by weighted tokens (output ×5, cache write ×1.25, cache read ×0.1). An estimate."
+        : "No usage history in this range, so no quota estimate: tokens only.";
+      const head = h("div", { class: "panel" },
+        h("div", { class: "panel-head" }, h("h2", { text: "Usage by project" }), ranges),
+        doc ? h("p", { class: "section-note" },
+          num(t.requests) + " requests · " + compact(t.tokens) + " tokens (" + compact(t.input_tokens) + " in · " +
+          compact(t.output_tokens) + " out · " + compact(t.cache_read) + " cache read · " + compact(t.cache_write) + " cache write). " +
+          "The project is the git repository (or directory) of the Claude Code session; \"unknown\" has no session or no working directory. " + note) : null,
+        doc ? usageTable("projects", doc.projects || [], true) : h("p", { class: "empty", text: u.error ? "" : "Loading…" }));
+      const sessions = h("div", { class: "panel" },
+        h("h2", { text: "Sessions" }),
+        doc && doc.sessions_total > (doc.sessions || []).length
+          ? h("p", { class: "section-note", text: "The " + doc.sessions.length + " sessions with the most usage of " + doc.sessions_total + "." })
+          : null,
+        doc ? usageTable("sessions", doc.sessions || [], false) : h("p", { class: "empty", text: u.error ? "" : "Loading…" }));
+      return [head, sessions];
     },
 
     requests() {
@@ -1389,6 +1533,7 @@
     render();
     loadJournal().then(render);
     loadRouting().then(render);
+    loadUsage().then(render);
   }
 
   function init() {

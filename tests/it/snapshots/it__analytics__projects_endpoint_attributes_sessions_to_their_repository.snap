@@ -1,0 +1,152 @@
+---
+source: tests/it/analytics.rs
+expression: "serde_json::to_string_pretty(&shown).unwrap()"
+---
+{
+  "range": "24h",
+  "since": "<time>",
+  "now": "<time>",
+  "totals": {
+    "requests": 4,
+    "input_tokens": 120,
+    "output_tokens": 80,
+    "cache_read": 400,
+    "cache_write": 40,
+    "tokens": 640
+  },
+  "quota": null,
+  "projects": [
+    {
+      "key": "<hash>",
+      "project": "acme",
+      "requests": 2,
+      "input_tokens": 60,
+      "output_tokens": 40,
+      "cache_read": 200,
+      "cache_write": 20,
+      "tokens": 320,
+      "share": 0.5,
+      "est_subs": null,
+      "accounts": [
+        {
+          "account": "work",
+          "requests": 2,
+          "tokens": 320
+        }
+      ],
+      "sessions": 1,
+      "first_seen": "<time>",
+      "last_seen": "<time>"
+    },
+    {
+      "key": "unknown",
+      "project": "unknown",
+      "requests": 1,
+      "input_tokens": 30,
+      "output_tokens": 20,
+      "cache_read": 100,
+      "cache_write": 10,
+      "tokens": 160,
+      "share": 0.25,
+      "est_subs": null,
+      "accounts": [
+        {
+          "account": "work",
+          "requests": 1,
+          "tokens": 160
+        }
+      ],
+      "sessions": 1,
+      "first_seen": "<time>",
+      "last_seen": "<time>"
+    },
+    {
+      "key": "<hash>",
+      "project": "widgets",
+      "requests": 1,
+      "input_tokens": 30,
+      "output_tokens": 20,
+      "cache_read": 100,
+      "cache_write": 10,
+      "tokens": 160,
+      "share": 0.25,
+      "est_subs": null,
+      "accounts": [
+        {
+          "account": "work",
+          "requests": 1,
+          "tokens": 160
+        }
+      ],
+      "sessions": 1,
+      "first_seen": "<time>",
+      "last_seen": "<time>"
+    }
+  ],
+  "sessions": [
+    {
+      "key": "<hash>",
+      "project": "acme",
+      "requests": 2,
+      "input_tokens": 60,
+      "output_tokens": 40,
+      "cache_read": 200,
+      "cache_write": 20,
+      "tokens": 320,
+      "share": 0.5,
+      "est_subs": null,
+      "accounts": [
+        {
+          "account": "work",
+          "requests": 2,
+          "tokens": 320
+        }
+      ],
+      "first_seen": "<time>",
+      "last_seen": "<time>"
+    },
+    {
+      "key": "<hash>",
+      "project": "unknown",
+      "requests": 1,
+      "input_tokens": 30,
+      "output_tokens": 20,
+      "cache_read": 100,
+      "cache_write": 10,
+      "tokens": 160,
+      "share": 0.25,
+      "est_subs": null,
+      "accounts": [
+        {
+          "account": "work",
+          "requests": 1,
+          "tokens": 160
+        }
+      ],
+      "first_seen": "<time>",
+      "last_seen": "<time>"
+    },
+    {
+      "key": "<hash>",
+      "project": "widgets",
+      "requests": 1,
+      "input_tokens": 30,
+      "output_tokens": 20,
+      "cache_read": 100,
+      "cache_write": 10,
+      "tokens": 160,
+      "share": 0.25,
+      "est_subs": null,
+      "accounts": [
+        {
+          "account": "work",
+          "requests": 1,
+          "tokens": 160
+        }
+      ],
+      "first_seen": "<time>",
+      "last_seen": "<time>"
+    }
+  ],
+  "sessions_total": 3
+}

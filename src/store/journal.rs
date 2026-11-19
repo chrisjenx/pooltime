@@ -18,7 +18,9 @@
 //!
 //! Privacy: no bodies, prompts, upstream error messages, tokens or raw `metadata.user_id` are
 //! ever stored; the session is kept as [`crate::logging::hash_session`] (16 hex chars of
-//! SHA-256), the upstream request id only when it is made of token-safe characters.
+//! SHA-256), the upstream request id only when it is made of token-safe characters. A session's
+//! project (usage attribution) goes to `session_projects` with the row: a directory name and a
+//! path hash, never the path ([`crate::analytics::attribution`]).
 //!
 //! Timing: `ts` is unix seconds at request start; `ttfb_ms` is the time until the response
 //! headers were ready; `total_ms` runs until the row is finalised (the end of a streamed body);
@@ -414,6 +416,8 @@ struct Draft {
     stream_outcome: Option<&'static str>,
     /// The provider whose response reached the client (wins over the last attempt's).
     served_provider: Option<String>,
+    /// The session's project (written to `session_projects` with the row).
+    project: Option<crate::analytics::attribution::Project>,
 }
 
 struct Live {
@@ -459,8 +463,15 @@ impl Drop for Live {
             row.provider = Some(last.provider.clone());
         }
         let attempts = std::mem::take(&mut d.attempts);
+        let project = d.project.take();
         let queued = self.store.submit(move |conn| {
             note_write(insert(conn, &row, &attempts).context("insert journal row"));
+            if let (Some(session), Some(p)) = (&row.session_hash, &project) {
+                note_write(
+                    super::projects::upsert(conn, session, p, row.ts)
+                        .context("record session project"),
+                );
+            }
             Ok(())
         });
         if let Err(e) = queued {
@@ -538,7 +549,17 @@ impl Journal {
 
     /// `metadata.user_id`, stored only as its hash.
     pub fn set_session(&self, user_id: &str) {
-        self.with(|d, _| d.row.session_hash = Some(crate::logging::hash_session(user_id)));
+        self.set_session_hash(crate::logging::hash_session(user_id));
+    }
+
+    /// The session as [`crate::logging::hash_session`] of `metadata.user_id`.
+    pub fn set_session_hash(&self, hash: String) {
+        self.with(|d, _| d.row.session_hash = Some(hash));
+    }
+
+    /// The session's project (recorded with the row when the request has a session).
+    pub fn set_project(&self, project: crate::analytics::attribution::Project) {
+        self.with(|d, _| d.project = Some(project));
     }
 
     /// An attempt on `account` starts.

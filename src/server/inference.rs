@@ -104,7 +104,13 @@ pub async fn messages(State(app): State<Arc<AppState>>, req: Request) -> Respons
         .map(str::to_string);
     journal.set_model(&model);
     if let Some(u) = &session_user_id {
-        journal.set_session(u);
+        let session = crate::logging::hash_session(u);
+        // Usage attribution: the session's project, from the body parsed above (cached per
+        // session, so only a session's first requests are scanned).
+        if let Some(p) = app.projects.resolve(&session, &json) {
+            journal.set_project(p);
+        }
+        journal.set_session_hash(session);
     }
     let req = InboundRequest {
         raw_body,

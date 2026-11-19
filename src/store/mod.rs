@@ -5,6 +5,7 @@
 mod db;
 pub mod journal;
 mod migrations;
+pub mod projects;
 mod retention;
 pub mod timeline;
 pub mod usage_history;

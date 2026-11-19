@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Usage by project and session: which repositories and Claude Code sessions are eating quota.
+  pooltime labels each session with the git repository it works in, taken from the working
+  directory in Claude Code's system prompt. Subdirectories and worktrees count as their
+  repository. Requests with no session or no working directory count as `unknown`. For the last
+  24 hours, 7 days or 30 days you get, per project and per session: requests, input/output/cache
+  tokens, share of all tokens, the accounts that served them, and an estimate of the 7-day quota
+  used. The estimate takes each account's sampled usage in the range and splits it by weighted
+  tokens; it is `null` when there is no usage history. It is available in:
+  - the dashboard's new **Projects** view (sortable tables, most usage first),
+  - `GET /api/v1/analytics/projects?range=24h|7d|30d` (management key),
+  - the MCP tool `usage_by_project`,
+  - a `top projects 24h: ...` line in `pooltime status`.
+
+  Only the directory name and a hash of its path are stored, locally (schema v5,
+  `session_projects`), never the path. They are pruned along with the journal.
+  See [Dashboard](docs/dashboard.md#reading-the-projects-view).
+
 ## 1.2.1 - 2026-11-15
 
 ### Fixed

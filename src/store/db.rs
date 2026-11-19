@@ -214,6 +214,7 @@ mod tests {
             "alerts_sent",
             "journal_attempts",
             "journal_requests",
+            "session_projects",
             "sessions",
             "timeline",
             "usage_samples",
@@ -336,6 +337,38 @@ mod tests {
             store.read(|c| journal::get(c, "new")).unwrap().unwrap().0,
             row
         );
+    }
+
+    #[test]
+    fn v4_database_upgrades_to_v5_session_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pooltime.db");
+        {
+            // A current database rolled back to v4: no `session_projects` yet, one request.
+            drop(Store::open(&path).unwrap());
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "DROP TABLE session_projects;
+                 INSERT INTO journal_requests(id, ts, outcome, session_hash)
+                     VALUES ('old', 1, 'completed', 'aaaaaaaaaaaaaaaa');",
+            )
+            .unwrap();
+            c.pragma_update(None, "user_version", 4).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.schema_version().unwrap(),
+            super::super::SCHEMA_VERSION
+        );
+        let (requests, projects): (i64, i64) = store
+            .read(|c| {
+                Ok((
+                    c.query_row("SELECT count(*) FROM journal_requests", [], |r| r.get(0))?,
+                    c.query_row("SELECT count(*) FROM session_projects", [], |r| r.get(0))?,
+                ))
+            })
+            .unwrap();
+        assert_eq!((requests, projects), (1, 0));
     }
 
     #[test]
