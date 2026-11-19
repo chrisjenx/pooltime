@@ -1,4 +1,6 @@
-//! `pooltime accounts list|add|login|relogin|remove|set`.
+//! `pooltime accounts list|add|login|relogin|remove|recheck|set|export|import`.
+//!
+//! `export` / `import` (moving the pool to another machine) live in [`super::transfer`].
 //!
 //! Everything goes through the management API of the running daemon, except sign-in, which runs
 //! in-process when no daemon answers (the daemon would otherwise own the account files), and the
@@ -109,6 +111,21 @@ pub enum AccountsCmd {
         #[arg(long, conflicts_with = "until")]
         clear_override: bool,
     },
+    /// Write every account (with its live sign-in), its weights and the pool's settings to one
+    /// passphrase-encrypted file, to move the pool to another machine.
+    ///
+    /// The file holds live refresh tokens: keep it private and delete it after importing. Stop
+    /// the pool here (best before exporting) and keep it stopped (`pooltime service uninstall`,
+    /// or `accounts remove` after the import): refresh tokens rotate, so two machines refreshing
+    /// the same account log each other out.
+    /// Not the same as `pooltime import bro`, which migrates from bro-cli.
+    Export(super::transfer::ExportArgs),
+    /// Add the accounts and settings from an `accounts export` file (works with or without a
+    /// running daemon). Existing accounts and settings are kept unless --replace.
+    ///
+    /// Sign-ins that had already expired are not restored: those accounts need
+    /// `pooltime accounts login`. Delete the file afterwards: it holds live refresh tokens.
+    Import(super::transfer::ImportArgs),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -150,6 +167,8 @@ pub struct LoginArgs {
 
 pub async fn run(paths: &Paths, cmd: AccountsCmd) -> anyhow::Result<i32> {
     match cmd {
+        AccountsCmd::Export(args) => super::transfer::export(paths, args).await,
+        AccountsCmd::Import(args) => super::transfer::import(paths, args).await,
         AccountsCmd::List { json } => {
             let status = client::require(paths).await?.get("/api/v1/status").await?;
             if json {

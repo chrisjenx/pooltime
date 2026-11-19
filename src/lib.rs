@@ -23,3 +23,4 @@ pub mod supervisor;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod upstream;
+pub mod version;

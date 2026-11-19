@@ -27,7 +27,7 @@ runs).
 | `server/` | `daemon` (boot), `router` (routes + middleware), `auth`, `inference` (`/v1/messages` and the failover loop), `count_tokens`, `fallback` (cross-provider), `classifier`, `models_route`, `health`, `shutdown` (drain, handoff), `handoff` (a supervised worker's side), `mgmt` (management API), `journal_api`, `analytics_api`, `routing_preview`, `dashboard` |
 | `providers/` | the `Provider` trait; `anthropic/` (passthrough proxy, OAuth refresh, rate-limit headers, usage poll, catalog) and `openai/` (Codex: request/stream translation, OAuth, usage, catalog); `stream_guard` (shared stream pump) |
 | `signin/` | OAuth PKCE sign-in flows (`claude`, `openai`), the localhost `callback` listener, paste-code mode |
-| `accounts/` | account ids, `account.toml` registry, credentials (0600), identity verification, the runtime `StateBook` (availability per account) |
+| `accounts/` | account ids, `account.toml` registry, credentials (0600), identity verification, the runtime `StateBook` (availability per account), the `accounts export`/`import` bundle (`transfer.rs`) |
 | `health/` | display states on top of availability (`expiring`, `erroring`), alert events, desktop notifiers |
 | `routing/` | weighted account choice, in-flight reservations, sticky sessions, tuning |
 | `models/` | model table (`models.toml`), id resolution, family mappings to Codex routes |
@@ -110,7 +110,17 @@ or if the first worker never starts, the supervisor exits non-zero for launchd/s
 restart). A new worker that fails during a restart leaves the old one serving. `SIGTERM`/`SIGINT`
 to the supervisor becomes `stop` for every worker (again: `force`); if the control socket closes
 (supervisor gone) a worker hands off and drains on its own. State for the CLI:
-`run/supervisor.json` (0600). The supervisor itself changes only with `service install`.
+`run/supervisor.json` (0600).
+
+The supervisor itself is replaced in place on `SIGUSR2` (`pooltime update`, `src/cli/update.rs`;
+`src/supervisor/resume.rs`): it runs `<bin> serve --reexec-probe` (the new binary must accept its
+hand-over format, load `config.toml` and write the log dir), waits until no restart is under way, clears
+`FD_CLOEXEC` on the listener and the workers' control sockets, blocks the stop/restart signals (only its main thread takes them) and
+`execve`s `<bin> serve --supervise ... --resume <json>` (fd numbers, worker pids and generations,
+counters). Same pid, so launchd/systemd see nothing; the workers stay its children. The new
+process adopts the workers (reaping them by pid), unblocks the signals and starts a generation
+from the new binary with the usual handoff. A failed probe or `exec` leaves the old supervisor
+running; `run/supervisor.json` records `upgrades` / `last_upgrade` for the CLI.
 
 ## Data
 

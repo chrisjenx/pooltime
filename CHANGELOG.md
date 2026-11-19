@@ -22,6 +22,41 @@
   the path. The filesystem lookup runs in the background, never on the request's path. They are pruned along with the journal.
   See [Dashboard](docs/dashboard.md#reading-the-projects-view).
 
+- `pooltime update`: installs the latest release the way pooltime was installed (`brew upgrade
+  chrisjenx/tap/pooltime` for Homebrew, the release's install script for a binary in a directory
+  you can write such as `~/.local/bin`; for `cargo install` and development builds it prints what
+  to run and exits 1), then moves the running service onto it without closing the port, the
+  supervisor included. `--check` reports the installed, latest and service versions and changes
+  nothing; `--yes` skips the question (required without a terminal). Already on the latest
+  release, it still moves a service that runs an older version.
+- The service's supervisor replaces itself in place on `SIGUSR2` (what `pooltime update` sends):
+  it checks the new binary, `exec`s it in the same process (the pid launchd/systemd track stays,
+  the listening socket and the worker are kept), then hands over to a worker from the new binary
+  like `service restart`. In-flight requests finish on the old worker, nothing is refused. If the
+  new binary cannot take over (an older one, or a `config.toml` that does not load) or the
+  `exec` fails, the running service keeps serving as it was and the error is reported.
+  `SIGHUP` / `service restart` still replace only the workers. Workers ignore `SIGUSR2`.
+- `pooltime accounts export <file>` and `pooltime accounts import <file>` move a pool to a new
+  machine without signing every account in again. The export holds every account's sign-in,
+  identity, priority and weights, plus `config.toml` (without the old machine's Claude Code
+  profile paths) and `models.toml`, encrypted with a passphrase as an
+  [age](https://age-encryption.org) file (scrypt + ChaCha20-Poly1305). The passphrase is asked
+  for without echo (twice on export), or read from `--passphrase-file` /
+  `POOLTIME_EXPORT_PASSPHRASE`; never from a command-line argument. The file is written 0600 and
+  never replaced without `--force`. Import skips accounts and settings that already exist unless
+  `--replace` (which keeps this machine's sign-in when the exported one had expired), leaves out
+  sign-ins that had already expired (those accounts are listed for `accounts login`), keeps
+  this machine's `host`, `port` and `proxy_key` unless `--replace-network-settings`, checks
+  everything before the first write, and works with or without a running daemon. The file
+  holds live refresh tokens: delete it after importing, and stop the old pool, since two
+  machines refreshing the same sign-in log each other out. See [Accounts](docs/accounts.md#move-the-pool-to-a-new-machine).
+
+### Changed
+
+- `pooltime doctor`'s service line shows the supervisor's and worker's versions and warns when
+  either is older than the binary you run (with `pooltime update` as the fix). Its release check
+  now suggests `pooltime update`.
+
 ## 1.2.1 - 2026-11-15
 
 ### Fixed

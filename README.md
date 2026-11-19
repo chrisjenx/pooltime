@@ -19,7 +19,7 @@ restores them when you disconnect). It runs on macOS and Linux, and replaces the
 > **Version.** This README and the docs describe pooltime **v1.0.0 or later**. On v0.1.0
 > (`pooltime --version`), `accounts relogin`, `statusline`, `connect --statusline/--mcp`,
 > `logs --request`, notifications, weekly burn and MCP do not exist yet: upgrade first
-> (`brew upgrade pooltime`, or re-run the install script).
+> (`brew upgrade pooltime`, or re-run the install script; from 1.3 on, `pooltime update`).
 
 ## 60-second quickstart
 
@@ -57,10 +57,12 @@ sign in in the browser. Never print tokens, key files or the dashboard URL.
 pooltime status                       # accounts, 7-day usage, alerts
 pooltime accounts list                # every account and its state
 pooltime accounts relogin --dead      # re-sign-in every account that needs it, one after another
+pooltime accounts export pool.age     # move the pool to a new machine (then: accounts import)
 pooltime connect default --statusline --mcp   # status line segment + MCP tools in a profile
 pooltime open                         # dashboard
 pooltime doctor                       # what is wrong and how to fix it
 pooltime logs --request <id>          # why did this request fail
+pooltime update                       # latest release, service moved onto it without a dropped request
 ```
 
 `pooltime --help` lists everything.

@@ -105,6 +105,17 @@ pub fn init(paths: &Paths, cfg: &RetentionCfg, foreground_tty: bool) -> anyhow::
     Ok(guard)
 }
 
+/// What [`init`] needs from the disk: the data directory, and today's log file opened for
+/// writing (nothing is written; nothing is installed). The supervisor's re-exec probe.
+pub fn check_writable(paths: &Paths) -> anyhow::Result<()> {
+    paths.ensure()?;
+    tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(LOG_PREFIX)
+        .build(&paths.logs)?;
+    Ok(())
+}
+
 /// Parse a `POOLTIME_LOG` directive; empty/absent means `info`, invalid warns and means `info`.
 fn make_filter(directive: Option<&str>) -> EnvFilter {
     match directive.map(str::trim).filter(|v| !v.is_empty()) {

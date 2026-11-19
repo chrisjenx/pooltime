@@ -35,7 +35,9 @@ Any later same-user process that binds with `SO_REUSEPORT` silently takes the po
 **(c) Others.** Socket activation (launchd `Sockets`, systemd `.socket`) keeps connections queued
 during the gap but the manager still waits for the old process to exit before starting the new
 one: no overlap. An nginx-style self re-exec needs the new process to outlive the job's main
-process, which launchd kills (process group) and systemd kills (cgroup). Rejected.
+process, which launchd kills (process group) and systemd kills (cgroup). Rejected. (An `execve`
+*in place*, with no fork, does not have that problem; it is how the supervisor itself is
+replaced, see "Replacing the supervisor" below.)
 
 ## Design
 
@@ -121,3 +123,53 @@ drain, but launchd may kill its process group first (in-flight streams lost, as 
 waits for them up to `TimeoutStopSec`. While the very first worker boots, or a crashed one is
 being replaced, connections wait in the backlog rather than being refused, for up to the boot
 time (under a second normally).
+
+## Replacing the supervisor (`pooltime update`, 1.3)
+
+A worker generation picks up a new binary, but the supervisor kept running the version it started
+with until `service install` (a full stop and start). Options:
+
+- **`service install`** stops the job: in-flight requests drain while new ones wait or fail.
+- **A new supervisor next to the old one**, handed the listener over a socket: it would not be the
+  job's main process, so launchd/systemd would kill it with the old one (constraint above).
+- **`execve` in place (chosen).** On `SIGUSR2` the supervisor `exec`s the binary at its configured
+  path *in its own process*: same pid, so the job's main process never exits and neither manager
+  notices (systemd `MainPID` and launchd's tracked pid unchanged; the workers stay in the job's
+  process group / cgroup and remain its children). The listener and each worker's control socket
+  survive the `exec` (`FD_CLOEXEC` cleared just before; set again by the new process), and the
+  state crosses as a hidden `--resume <json>` argument: fd numbers, worker pids, generations,
+  phases (active / draining, with their age for the drain backstop), restart and upgrade
+  counters. The new process adopts the workers (no `Child` handles across an `exec`: they are
+  reaped by pid on `SIGCHLD` plus a 1 s poll), then starts a generation from the new binary and
+  hands off to it exactly like `SIGHUP`.
+
+Safety:
+
+- **Probe first.** `<bin> serve --reexec-probe` must answer `pooltime-resume <formats>
+  <version>` with the format this supervisor writes, and fails if `config.toml` does not load
+  or the data / log directory cannot be prepared and written.
+  An older binary does not know the flag and fails the probe: no `exec`. The resumed process
+  still falls back to defaults if `config.toml` broke after the probe (the socket is bound
+  already), rather than orphaning its workers.
+- **Only when idle.** No generation booting or releasing (their `ready` / `released` lines would
+  be lost across the `exec`) and none to respawn; the upgrade waits up to 2 minutes for that.
+- **Signals.** In supervisor mode only the main thread (the supervisor's loop) takes
+  `SIGHUP`/`SIGTERM`/`SIGINT`/`SIGUSR2`: the runtime's threads block them from their start, and
+  the log writer thread is spawned while the main thread blocks them too (until the handlers are
+  installed). Before the `exec` the main thread blocks them and the loop runs on for 150 ms, so a
+  signal the runtime caught just before is still handled (a stop cancels the upgrade, a restart
+  postpones it until it is done). After that a signal stays pending in the kernel, survives the
+  `exec` (pending signals and the mask do; handlers do not) and is delivered once the new process
+  has its handlers. Workers get an empty mask from `std`'s spawn and ignore `SIGUSR2`, so a
+  `pkill -USR2` or process-group signal does not kill them.
+- **No exit once re-executed.** The new process holds the workers' control sockets, so it does
+  not exit on a data-directory, log or listener error: it logs to stderr and keeps the adopted
+  workers serving (without the listener it cannot start new ones; the first one's failure is
+  reported).
+- **Failure.** A failed probe or `execve` leaves the old supervisor as it was (descriptors marked
+  close-on-exec again, mask restored). A new first worker that fails leaves the adopted one
+  serving. Every outcome is recorded in `run/supervisor.json` (`upgrades`, `last_upgrade`), which
+  `pooltime update` waits for. A supervisor from before 1.3 has no `can_upgrade` in its state
+  file; `pooltime update` falls back to `service restart` for it.
+- **Compatibility.** The `--resume` format is versioned (`proto`); a binary lists every format it
+  reads, so a newer binary keeps accepting the older format.
