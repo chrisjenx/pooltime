@@ -18,6 +18,20 @@
   new binary cannot take over (an older one, or a `config.toml` that does not load) or the
   `exec` fails, the running service keeps serving as it was and the error is reported.
   `SIGHUP` / `service restart` still replace only the workers. Workers ignore `SIGUSR2`.
+- `pooltime accounts export <file>` and `pooltime accounts import <file>` move a pool to a new
+  machine without signing every account in again. The export holds every account's sign-in,
+  identity, priority and weights, plus `config.toml` (without the old machine's Claude Code
+  profile paths) and `models.toml`, encrypted with a passphrase as an
+  [age](https://age-encryption.org) file (scrypt + ChaCha20-Poly1305). The passphrase is asked
+  for without echo (twice on export), or read from `--passphrase-file` /
+  `POOLTIME_EXPORT_PASSPHRASE`; never from a command-line argument. The file is written 0600 and
+  never replaced without `--force`. Import skips accounts and settings that already exist unless
+  `--replace` (which keeps this machine's sign-in when the exported one had expired), leaves out
+  sign-ins that had already expired (those accounts are listed for `accounts login`), keeps
+  this machine's `host`, `port` and `proxy_key` unless `--replace-network-settings`, checks
+  everything before the first write, and works with or without a running daemon. The file
+  holds live refresh tokens: delete it after importing, and stop the old pool, since two
+  machines refreshing the same sign-in log each other out. See [Accounts](docs/accounts.md#move-the-pool-to-a-new-machine).
 
 ### Changed
 

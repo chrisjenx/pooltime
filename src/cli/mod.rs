@@ -14,6 +14,7 @@ pub mod service;
 pub mod setup;
 pub mod status;
 pub mod statusline;
+pub mod transfer;
 pub mod update;
 
 use std::ffi::OsString;
