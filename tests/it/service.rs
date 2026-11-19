@@ -814,6 +814,7 @@ fn live_supervisor(restarts: u64) -> SupervisorState {
         restarts,
         restarting: false,
         last_restart: None,
+        ..SupervisorState::default()
     }
 }
 

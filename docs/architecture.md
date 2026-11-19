@@ -110,7 +110,17 @@ or if the first worker never starts, the supervisor exits non-zero for launchd/s
 restart). A new worker that fails during a restart leaves the old one serving. `SIGTERM`/`SIGINT`
 to the supervisor becomes `stop` for every worker (again: `force`); if the control socket closes
 (supervisor gone) a worker hands off and drains on its own. State for the CLI:
-`run/supervisor.json` (0600). The supervisor itself changes only with `service install`.
+`run/supervisor.json` (0600).
+
+The supervisor itself is replaced in place on `SIGUSR2` (`pooltime update`, `src/cli/update.rs`;
+`src/supervisor/resume.rs`): it runs `<bin> serve --reexec-probe` (the new binary must accept its
+hand-over format, load `config.toml` and write the log dir), waits until no restart is under way, clears
+`FD_CLOEXEC` on the listener and the workers' control sockets, blocks the stop/restart signals (only its main thread takes them) and
+`execve`s `<bin> serve --supervise ... --resume <json>` (fd numbers, worker pids and generations,
+counters). Same pid, so launchd/systemd see nothing; the workers stay its children. The new
+process adopts the workers (reaping them by pid), unblocks the signals and starts a generation
+from the new binary with the usual handoff. A failed probe or `exec` leaves the old supervisor
+running; `run/supervisor.json` records `upgrades` / `last_upgrade` for the CLI.
 
 ## Data
 

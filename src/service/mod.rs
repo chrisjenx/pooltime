@@ -407,12 +407,23 @@ impl Backend {
 /// Send the supervisor `pid` its restart signal (`SIGHUP`). systemd's `ExecReload` runs this
 /// with `$MAINPID` (`pooltime service signal-reload`), so a reload needs no `/bin/kill`.
 pub fn signal_reload(pid: u32) -> anyhow::Result<()> {
+    signal_supervisor(pid, libc::SIGHUP)
+}
+
+/// Ask the supervisor `pid` to replace itself in place with the binary at its path (`SIGUSR2`,
+/// see [`crate::supervisor::resume`]). Sent straight to the pid: launchd and systemd only track
+/// it, and it stays the same.
+pub fn signal_upgrade(pid: u32) -> anyhow::Result<()> {
+    signal_supervisor(pid, libc::SIGUSR2)
+}
+
+fn signal_supervisor(pid: u32, sig: libc::c_int) -> anyhow::Result<()> {
     let pid = libc::pid_t::try_from(pid)
         .ok()
         .filter(|p| *p > 1)
         .ok_or_else(|| anyhow!("not a supervisor pid: {pid}"))?;
     // SAFETY: kill has no memory preconditions; `pid` is a single positive process id.
-    if unsafe { libc::kill(pid, libc::SIGHUP) } != 0 {
+    if unsafe { libc::kill(pid, sig) } != 0 {
         return Err(io::Error::last_os_error())
             .with_context(|| format!("signalling the pooltime supervisor (pid {pid})"));
     }
@@ -426,6 +437,8 @@ pub fn definition_is_supervised(definition: &str) -> bool {
 
 /// What `service restart` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Returned once per command; boxing the state would only add noise at every match.
+#[allow(clippy::large_enum_variant)]
 pub enum Restarted {
     /// A new worker generation serves; the previous one finishes its requests.
     /// `joined`: another restart was already under way, so the supervisor started nothing new

@@ -113,11 +113,19 @@ pub fn run_with(
                         .as_deref()
                         .is_some_and(|v| v != sup.version)
                     {
-                        println!(
-                            "note: the supervisor itself stays at {} until `pooltime service \
-                             install` (a full restart); that is fine",
-                            sup.version
-                        );
+                        if sup.can_upgrade {
+                            println!(
+                                "note: the supervisor itself stays at {}; `pooltime update` \
+                                 moves it onto the new binary without closing the port",
+                                sup.version
+                            );
+                        } else {
+                            println!(
+                                "note: the supervisor itself stays at {} until `pooltime \
+                                 service install` (a full restart); that is fine",
+                                sup.version
+                            );
+                        }
                     }
                 }
                 Restarted::Started => println!("restarted the pooltime service"),

@@ -18,7 +18,7 @@ pub struct Inherited {
     pub control: UnixStream,
 }
 
-fn fd_is_socket(fd: RawFd) -> bool {
+pub(crate) fn fd_is_socket(fd: RawFd) -> bool {
     // SAFETY: fstat writes into a zeroed stat buffer we own.
     unsafe {
         let mut st: libc::stat = std::mem::zeroed();
@@ -27,7 +27,7 @@ fn fd_is_socket(fd: RawFd) -> bool {
 }
 
 /// A stream socket (`SO_ACCEPTCONN` is not readable on macOS; `local_addr` then tells TCP).
-fn is_stream(fd: RawFd) -> bool {
+pub(crate) fn is_stream(fd: RawFd) -> bool {
     let mut v: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     // SAFETY: getsockopt into a c_int we own, with its size.
@@ -43,7 +43,7 @@ fn is_stream(fd: RawFd) -> bool {
     r == 0 && v == libc::SOCK_STREAM
 }
 
-fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
+pub(crate) fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
     // SAFETY: fcntl on an fd this process owns.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     // SAFETY: as above.
