@@ -12,10 +12,12 @@
   for without echo (twice on export), or read from `--passphrase-file` /
   `POOLTIME_EXPORT_PASSPHRASE`; never from a command-line argument. The file is written 0600 and
   never replaced without `--force`. Import skips accounts and settings that already exist unless
-  `--replace`, leaves out sign-ins that had already expired (those accounts are listed for
-  `accounts login`), and works with or without a running daemon. The file holds live refresh
-  tokens: delete it after importing, and stop the old pool, since two machines refreshing the
-  same sign-in log each other out. See [Accounts](docs/accounts.md#move-the-pool-to-a-new-machine).
+  `--replace` (which keeps this machine's sign-in when the exported one had expired), leaves out
+  sign-ins that had already expired (those accounts are listed for `accounts login`), keeps
+  this machine's `host`, `port` and `proxy_key` unless `--replace-network-settings`, checks
+  everything before the first write, and works with or without a running daemon. The file
+  holds live refresh tokens: delete it after importing, and stop the old pool, since two
+  machines refreshing the same sign-in log each other out. See [Accounts](docs/accounts.md#move-the-pool-to-a-new-machine).
 
 ## 1.2.1 - 2026-11-15
 

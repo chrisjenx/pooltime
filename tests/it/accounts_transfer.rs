@@ -166,7 +166,8 @@ fn source() -> Home {
     .unwrap();
     std::fs::write(
         acc.join("acct-b/account.toml"),
-        "id = \"acct-b\"\nprovider = \"openai\"\n",
+        // Not an address the management API accepts on create.
+        "id = \"acct-b\"\nprovider = \"openai\"\n[identity]\nemail = \"nobody\"\n",
     )
     .unwrap();
     std::fs::write(
@@ -254,10 +255,23 @@ fn export_then_import_restores_accounts_and_settings() {
     let cfg = std::fs::read_to_string(dst.pt().join("config.toml")).unwrap();
     assert!(cfg.contains("min_headroom = 0.25"), "{cfg}");
     assert!(!cfg.contains("old-machine"), "profiles stay behind: {cfg}");
-    assert_eq!(
-        std::fs::read_to_string(dst.pt().join("models.toml")).unwrap(),
-        "mapping_enabled = true\n"
-    );
+    // The port (like host and proxy_key) stays this machine's without the opt-in flag.
+    assert!(!cfg.contains(&src.port.to_string()), "{cfg}");
+    assert!(text.contains("changed: routing.min_headroom"), "{text}");
+    assert!(text.contains("kept this machine's port"), "{text}");
+    assert!(models_of(&dst).contains("mapping_enabled = true"));
+
+    // Opt in: the export's port comes along.
+    let again = Home::new();
+    again
+        .import(&out, PASSPHRASE, &["--replace-network-settings"])
+        .success();
+    let cfg = std::fs::read_to_string(again.pt().join("config.toml")).unwrap();
+    assert!(cfg.contains(&format!("port = {}", src.port)), "{cfg}");
+}
+
+fn models_of(h: &Home) -> String {
+    std::fs::read_to_string(h.pt().join("models.toml")).unwrap()
 }
 
 #[test]
@@ -337,13 +351,154 @@ fn existing_accounts_are_skipped_unless_replace() {
     assert!(text.contains("models.toml: kept"), "{text}");
     assert!(dst.account_toml("acct-a").contains("weight = 9.0"));
 
+    // acct-b signed in here meanwhile; the export's sign-in for it had expired.
+    std::fs::write(
+        dst.pt().join("accounts/acct-b/credentials.json"),
+        r#"{"provider":"openai","access_token":"HERE-ACCESS","refresh_token":"HERE-REFRESH"}"#,
+    )
+    .unwrap();
     let text = stdout_of(&dst.import(&out, PASSPHRASE, &["--replace"]).success());
     assert!(text.contains("imported 2 of 2"), "{text}");
+    assert!(
+        text.contains("acct-b (openai): settings replaced; kept this machine's sign-in"),
+        "{text}"
+    );
+    assert!(!text.contains("pooltime accounts login acct-b"), "{text}");
     assert!(dst.account_toml("acct-a").contains("weight = 2.5"));
     assert_eq!(
-        std::fs::read_to_string(dst.pt().join("models.toml")).unwrap(),
-        "mapping_enabled = true\n"
+        dst.creds("acct-b").expect("kept")["refresh_token"],
+        "HERE-REFRESH"
     );
+    assert!(models_of(&dst).contains("mapping_enabled = true"));
+}
+
+/// A stand-in daemon on `port` (answers /health as a pooltime) whose account creation fails
+/// for `acct-a`: the delete-then-create of `--replace` breaks halfway.
+fn flaky_daemon(port: u16) -> std::thread::JoinHandle<()> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    listener.set_nonblocking(false).unwrap();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Headers, then the body by Content-Length.
+            loop {
+                let n = s.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let req = String::from_utf8_lossy(&buf).into_owned();
+            let line = req.lines().next().unwrap_or_default().to_string();
+            let (status, body) = if line.starts_with("GET /health") {
+                (
+                    "200 OK",
+                    r#"{"service":"pooltime","status":"ok"}"#.to_string(),
+                )
+            } else if line.starts_with("POST /api/v1/accounts ") && req.contains("\"acct-a\"") {
+                (
+                    "500 Internal Server Error",
+                    r#"{"error":{"message":"could not create the account"}}"#.to_string(),
+                )
+            } else if line.starts_with("POST /api/v1/accounts ") {
+                ("201 Created", r#"{"ok":true}"#.to_string())
+            } else {
+                ("200 OK", r#"{"ok":true}"#.to_string())
+            };
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            if Instant::now() > deadline {
+                break;
+            }
+        }
+    })
+}
+
+#[test]
+fn a_failed_replace_puts_the_account_back_and_the_rest_carry_on() {
+    let src = source();
+    let out = src.file("pool.age");
+    src.export(&out, &[]).success();
+    let dst = Home::new();
+    dst.import(&out, PASSPHRASE, &[]).success();
+    std::fs::write(
+        dst.pt().join("accounts/acct-a/account.toml"),
+        "id = \"acct-a\"\nprovider = \"anthropic\"\nweight = 9.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dst.pt().join("accounts/acct-a/credentials.json"),
+        r#"{"provider":"anthropic","access_token":"HERE-A","refresh_token":"HERE-R"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(dst.pt().join("run")).unwrap();
+    std::fs::write(dst.pt().join("run/mgmt.key"), "ab".repeat(32)).unwrap();
+    let _fake = flaky_daemon(dst.port);
+
+    let a = dst.import(&out, PASSPHRASE, &["--replace"]).failure();
+    let text = stdout_of(&a);
+    assert!(text.contains("acct-a (anthropic): FAILED"), "{text}");
+    assert!(text.contains("put back"), "{text}");
+    assert!(
+        text.contains("acct-b (openai):"),
+        "the rest carried on: {text}"
+    );
+    assert!(text.contains("1 account could not be imported"), "{text}");
+    // acct-a is exactly as it was here.
+    assert!(dst.account_toml("acct-a").contains("weight = 9.0"));
+    assert_eq!(dst.creds("acct-a").unwrap()["refresh_token"], "HERE-R");
+}
+
+#[test]
+fn a_pooltime_of_another_home_on_the_port_is_refused_before_any_write() {
+    let other = Home::new();
+    other.write_config();
+    let _d = other.serve();
+
+    let src = source();
+    let out = src.file("pool.age");
+    src.export(&out, &[]).success();
+    // This home's port is the other pooltime's.
+    let dst = Home {
+        dir: tempfile::tempdir().unwrap(),
+        port: other.port,
+    };
+    std::fs::create_dir_all(dst.pt()).unwrap();
+    dst.import(&out, PASSPHRASE, &[])
+        .failure()
+        .stderr(predicate::str::contains("different home"))
+        .stderr(predicate::str::contains("POOLTIME_PORT"));
+    assert!(!dst.pt().join("accounts").exists(), "nothing written");
+    // A stale key from an earlier run of this home gets a 401: refused the same way.
+    std::fs::create_dir_all(dst.pt().join("run")).unwrap();
+    std::fs::write(dst.pt().join("run/mgmt.key"), "cd".repeat(32)).unwrap();
+    dst.import(&out, PASSPHRASE, &[])
+        .failure()
+        .stderr(predicate::str::contains("different home"));
+    assert!(!dst.pt().join("accounts").exists(), "nothing written");
 }
 
 #[test]
@@ -375,8 +530,10 @@ fn import_into_a_running_daemon_serves_the_accounts_at_once() {
     assert_eq!(a["weight"], 2.5, "{a}");
     assert_eq!(by_id("acct-b")["status"], "needs_login");
 
-    // --replace goes through the daemon's delete + create.
+    // --replace goes through the daemon's delete + create; acct-b's malformed email (which
+    // the daemon's create refuses) is sent as null, and account.toml still keeps it.
     let text = stdout_of(&dst.import(&out, PASSPHRASE, &["--replace"]).success());
     assert!(text.contains("imported 2 of 2"), "{text}");
     assert!(dst.creds("acct-a").is_some());
+    assert!(dst.account_toml("acct-b").contains("nobody"));
 }

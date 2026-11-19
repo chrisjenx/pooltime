@@ -162,21 +162,116 @@ pub fn portable_config(text: &str) -> anyhow::Result<String> {
     Ok(toml::to_string_pretty(&t)?)
 }
 
-/// The bundle's `config.toml` for this machine: `incoming` with `existing`'s `profiles` (if any)
-/// kept, so `connect`ed profiles here are not forgotten. Rejects text pooltime cannot load.
-pub fn merge_config(incoming: &str, existing: Option<&str>) -> anyhow::Result<String> {
+/// The settings that tie Claude Code profiles to this machine's pool: `connect`ed profiles point
+/// at this address and send this key. Kept from this machine unless explicitly taken.
+pub const NETWORK_KEYS: [&str; 3] = ["host", "port", "proxy_key"];
+
+/// [`merge_config`]'s result.
+pub struct MergedConfig {
+    /// The new `config.toml`.
+    pub text: String,
+    /// Dotted keys whose effective value changes (names only: values may be secret).
+    pub changed: Vec<String>,
+    /// [`NETWORK_KEYS`] the export sets differently, kept from this machine instead.
+    pub kept_network: Vec<&'static str>,
+}
+
+/// The export's `config.toml` for this machine. Always keeps `existing`'s `profiles`; keeps its
+/// [`NETWORK_KEYS`] (or the defaults) too unless `take_network`. The result must load and pass
+/// [`Config::validate`](crate::config::Config::validate) with the `POOLTIME_*` overlay `env`
+/// (the non-loopback host check), else nothing is returned. Errors never quote either file.
+pub fn merge_config(
+    incoming: &str,
+    existing: Option<&str>,
+    take_network: bool,
+    env: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<MergedConfig> {
+    use crate::config::Config;
     let bad = || anyhow::anyhow!("the export's config.toml is not a valid pooltime config");
     let mut t: toml::Table = toml::from_str(incoming).map_err(|_| bad())?;
+    let here: toml::Table = match existing {
+        Some(e) => toml::from_str(e).map_err(|_| {
+            anyhow::anyhow!("this machine's config.toml does not parse; fix it first")
+        })?,
+        None => toml::Table::new(),
+    };
+    let before: Config = toml::Value::Table(here.clone()).try_into().map_err(|_| {
+        anyhow::anyhow!("this machine's config.toml is not a valid pooltime config")
+    })?;
+    let exported: Config = toml::Value::Table(t.clone())
+        .try_into()
+        .map_err(|_| bad())?;
     t.remove("profiles");
-    if let Some(profiles) = existing
-        .and_then(|e| toml::from_str::<toml::Table>(e).ok())
-        .and_then(|mut e| e.remove("profiles"))
-    {
-        t.insert("profiles".into(), profiles);
+    if let Some(p) = here.get("profiles") {
+        t.insert("profiles".into(), p.clone());
     }
-    let out = toml::to_string_pretty(&t)?;
-    toml::from_str::<crate::config::Config>(&out).map_err(|_| bad())?;
-    Ok(out)
+    let mut kept_network = Vec::new();
+    if !take_network {
+        for k in NETWORK_KEYS {
+            t.remove(k);
+            if let Some(v) = here.get(k) {
+                t.insert(k.into(), v.clone());
+            }
+        }
+        if exported.host != before.host {
+            kept_network.push("host");
+        }
+        if exported.port != before.port {
+            kept_network.push("port");
+        }
+        if exported.proxy_key != before.proxy_key {
+            kept_network.push("proxy_key");
+        }
+    }
+    let text = toml::to_string_pretty(&t)?;
+    let after: Config = toml::from_str(&text).map_err(|_| bad())?;
+    let mut runtime = after.clone();
+    runtime.apply_env(env)?;
+    runtime
+        .validate()
+        .context("the export's config.toml would not run here")?;
+    let changed = changed_keys(&before, &after);
+    Ok(MergedConfig {
+        text,
+        changed,
+        kept_network,
+    })
+}
+
+/// Dotted keys (`routing.min_headroom`) whose values differ between two configs, `profiles`
+/// left out.
+fn changed_keys(a: &crate::config::Config, b: &crate::config::Config) -> Vec<String> {
+    fn flat(prefix: &str, v: &toml::Value, out: &mut std::collections::BTreeMap<String, String>) {
+        match v {
+            toml::Value::Table(t) => {
+                for (k, v) in t {
+                    let key = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    flat(&key, v, out);
+                }
+            }
+            other => {
+                out.insert(prefix.to_string(), other.to_string());
+            }
+        }
+    }
+    let map = |c: &crate::config::Config| {
+        let mut out = std::collections::BTreeMap::new();
+        if let Ok(v) = toml::Value::try_from(c) {
+            flat("", &v, &mut out);
+        }
+        out.retain(|k, _| k != "profiles" && !k.starts_with("profiles."));
+        out
+    };
+    let (a, b) = (map(a), map(b));
+    let keys: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+    keys.into_iter()
+        .filter(|k| a.get(*k) != b.get(*k))
+        .cloned()
+        .collect()
 }
 
 /// Encrypt `bundle` to `passphrase`. `work_factor` overrides age's calibrated scrypt `log_n`
@@ -445,16 +540,47 @@ mod tests {
     }
 
     #[test]
-    fn merge_config_keeps_this_machines_profiles() {
-        let incoming = "port = 4100\n[[profiles]]\nid = \"old\"\nsettings_dir = \"/old\"\n";
-        let here = "port = 3460\n[[profiles]]\nid = \"new\"\nsettings_dir = \"/new\"\n";
-        let out = merge_config(incoming, Some(here)).unwrap();
+    fn merge_config_keeps_this_machines_profiles_and_network_settings() {
+        let no_env = |_: &str| None;
+        let incoming = "port = 4100\nproxy_key = \"OLD-KEY\"\n[routing]\nmin_headroom = 0.3\n\
+                        [[profiles]]\nid = \"old\"\nsettings_dir = \"/old\"\n";
+        let here = "port = 3460\nproxy_key = \"NEW-KEY\"\n[[profiles]]\nid = \"new\"\n\
+                    settings_dir = \"/new\"\n";
+        let m = merge_config(incoming, Some(here), false, no_env).unwrap();
+        let out = &m.text;
+        assert!(out.contains("3460") && out.contains("NEW-KEY"), "{out}");
+        assert!(!out.contains("4100") && !out.contains("OLD-KEY"), "{out}");
+        assert!(out.contains("/new") && !out.contains("/old"), "{out}");
+        assert!(out.contains("min_headroom = 0.3"), "{out}");
+        assert_eq!(m.kept_network, ["port", "proxy_key"]);
+        assert_eq!(m.changed, ["routing.min_headroom"]);
+
+        let m = merge_config(incoming, Some(here), true, no_env).unwrap();
         assert!(
-            out.contains("4100") && out.contains("/new") && !out.contains("/old"),
-            "{out}"
+            m.text.contains("4100") && m.text.contains("OLD-KEY"),
+            "{}",
+            m.text
         );
-        let out = merge_config(incoming, None).unwrap();
-        assert!(!out.contains("profiles"), "{out}");
-        assert!(merge_config("port = \"x\"", None).is_err());
+        assert!(m.kept_network.is_empty());
+        assert_eq!(m.changed, ["port", "proxy_key", "routing.min_headroom"]);
+
+        // A fresh machine: defaults stand in for this machine's values.
+        let m = merge_config(incoming, None, false, no_env).unwrap();
+        assert!(
+            !m.text.contains("profiles") && !m.text.contains("port"),
+            "{}",
+            m.text
+        );
+        assert_eq!(m.kept_network, ["port", "proxy_key"]);
+
+        assert!(merge_config("port = \"x\"", None, false, no_env).is_err());
+        // Full validation: a network bind without a proxy key is refused.
+        let open = "host = \"0.0.0.0\"\n";
+        let e = merge_config(open, None, true, no_env).err().unwrap();
+        assert!(format!("{e:#}").contains("loopback"), "{e:#}");
+        assert!(merge_config(open, None, true, |k: &str| {
+            (k == "POOLTIME_PROXY_KEY").then(|| "k".to_string())
+        })
+        .is_ok());
     }
 }

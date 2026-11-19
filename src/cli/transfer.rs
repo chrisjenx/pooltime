@@ -6,7 +6,9 @@
 //! `accounts add --from-codex-auth` does: through the management API's account creation when a
 //! daemon answers (so it notices the new account at once), then `account.toml` and
 //! `credentials.json` on disk, which the daemon reads per request. Without a daemon it writes
-//! the files in-process.
+//! the files in-process. Both paths make the same decisions: everything (accounts, config,
+//! models) is planned and validated before the first write, and an account whose import fails
+//! is reported (a replaced one is put back) while the others carry on.
 //!
 //! The passphrase comes from `--passphrase-file`, else `POOLTIME_EXPORT_PASSPHRASE`, else a
 //! no-echo prompt on the terminal (twice for export). Never from a command-line argument.
@@ -16,15 +18,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use age::secrecy::SecretString;
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::client::{self, seg, Client};
-use crate::accounts::transfer::{self, Bundle, BundledAccount, Login, PASSPHRASE_ENV};
-use crate::accounts::{Registry, StateBook};
-use crate::config::Paths;
+use crate::accounts::transfer::{
+    self, Bundle, BundledAccount, Login, MergedConfig, PASSPHRASE_ENV,
+};
+use crate::accounts::{AccountId, AccountMeta, Credentials, Registry, StateBook};
+use crate::config::{Config, Paths};
 use crate::models::ModelTable;
 use crate::store::Store;
 
@@ -56,9 +60,13 @@ pub struct ImportArgs {
     /// An export written by `pooltime accounts export`.
     pub file: PathBuf,
     /// Overwrite accounts that already exist here (and config.toml / models.toml), instead of
-    /// skipping them.
+    /// skipping them. An account whose exported sign-in had expired keeps this machine's.
     #[arg(long)]
     pub replace: bool,
+    /// Also take the export's host, port and proxy_key when config.toml is restored (by
+    /// default this machine's are kept, so Claude Code profiles connected here keep working).
+    #[arg(long)]
+    pub replace_network_settings: bool,
     /// Read the passphrase from the first line of this file instead of prompting
     /// (or set POOLTIME_EXPORT_PASSPHRASE).
     #[arg(long, value_name = "PATH")]
@@ -73,11 +81,14 @@ enum Purpose {
 
 /// `--passphrase-file`, then the env var, then the terminal. Empty is refused everywhere.
 fn passphrase(file: Option<&Path>, purpose: Purpose) -> anyhow::Result<SecretString> {
-    let given = match file {
-        Some(p) => Some(read_passphrase_file(p)?),
-        None => std::env::var(PASSPHRASE_ENV).ok().filter(|v| !v.is_empty()),
+    let file_text = match file {
+        Some(p) => Some(
+            std::fs::read_to_string(p)
+                .with_context(|| format!("reading the passphrase file {}", p.display()))?,
+        ),
+        None => None,
     };
-    let pw = match given {
+    let pw = match given_passphrase(file_text, std::env::var(PASSPHRASE_ENV).ok()) {
         Some(pw) => pw,
         None => prompt(purpose)?,
     };
@@ -90,11 +101,22 @@ fn passphrase(file: Option<&Path>, purpose: Purpose) -> anyhow::Result<SecretStr
     Ok(SecretString::from(pw))
 }
 
-/// The first line, without its line ending.
-fn read_passphrase_file(p: &Path) -> anyhow::Result<String> {
-    let text = std::fs::read_to_string(p)
-        .with_context(|| format!("reading the passphrase file {}", p.display()))?;
-    Ok(text.lines().next().unwrap_or_default().to_string())
+/// The passphrase file's first line, else the env var; both without a trailing line ending
+/// (`echo pw > file` and `VAR=$(cat file)` mean the same passphrase). `None`: ask.
+fn given_passphrase(file_text: Option<String>, env: Option<String>) -> Option<String> {
+    let first_line = |s: &str| {
+        s.split('\n')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('\r')
+            .to_string()
+    };
+    match file_text {
+        Some(t) => Some(first_line(&t)),
+        None => env
+            .map(|v| v.trim_end_matches(['\r', '\n']).to_string())
+            .filter(|v| !v.is_empty()),
+    }
 }
 
 fn prompt(purpose: Purpose) -> anyhow::Result<String> {
@@ -188,16 +210,113 @@ pub async fn export(paths: &Paths, args: ExportArgs) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+// ---- import ----------------------------------------------------------------------------------
+
+/// This machine's copy of an account, to put back if replacing it fails.
+struct Snapshot {
+    meta: AccountMeta,
+    creds: Option<Credentials>,
+}
+
+/// What import does with one account, decided before anything is written.
+enum Action {
+    Add,
+    Skip,
+    /// `--replace`, but the export has no usable sign-in and this machine has one for the same
+    /// provider: replace `account.toml` only and keep `credentials.json`.
+    MetadataOnly,
+    /// `--replace`: remove this machine's account, then add the export's.
+    Replace(Box<Snapshot>),
+}
+
+struct Planned<'a> {
+    a: &'a BundledAccount,
+    login: Login,
+    /// The email as the management API accepts it (`None` when it would be refused), so the
+    /// daemon's create cannot fail on it. The full identity is written to `account.toml` after.
+    api_email: Option<String>,
+    action: Action,
+}
+
 /// How one account's import went.
-enum Done {
-    Imported(Login),
+enum Outcome {
+    Added(Login),
+    Replaced(Login),
+    KeptSignIn,
     Skipped,
+    Failed(String),
 }
 
 /// Where accounts are written: through a running daemon, or straight to the files.
 enum Target<'a> {
     Daemon(&'a Client),
     Offline { state: Option<Arc<StateBook>> },
+}
+
+/// The management API's rule for `email` on account creation (`server::mgmt`).
+fn api_email(e: Option<&str>) -> Option<String> {
+    e.map(str::trim)
+        .filter(|e| e.len() > 2 && e.contains('@'))
+        .map(str::to_string)
+}
+
+fn plan<'a>(
+    reg: &Registry,
+    bundle: &'a Bundle,
+    replace: bool,
+    now: OffsetDateTime,
+) -> Vec<Planned<'a>> {
+    bundle
+        .accounts
+        .iter()
+        .map(|a| {
+            let login = a.login(now);
+            let action = match reg.get(&a.meta.id) {
+                None => Action::Add,
+                Some(_) if !replace => Action::Skip,
+                Some(meta) => {
+                    // An unreadable credentials.json counts as none: nothing to keep.
+                    let creds = reg.read_creds(&a.meta.id).ok().flatten();
+                    let keep = login == Login::NeedsSignIn
+                        && creds
+                            .as_ref()
+                            .is_some_and(|c| c.provider == a.meta.provider);
+                    if keep {
+                        Action::MetadataOnly
+                    } else {
+                        Action::Replace(Box::new(Snapshot { meta, creds }))
+                    }
+                }
+            };
+            Planned {
+                a,
+                login,
+                api_email: api_email(a.meta.identity.email.as_deref()),
+                action,
+            }
+        })
+        .collect()
+}
+
+/// A daemon answers on this home's port: make sure it is this home's (its management key is
+/// ours) before writing anything, instead of failing halfway or writing behind its back.
+async fn check_daemon_home(c: &Client) -> anyhow::Result<()> {
+    let wrong = || {
+        anyhow!(
+            "a pooltime from a different home (POOLTIME_HOME) is listening on port {}: set \
+             POOLTIME_PORT to a free port for this home, or stop that pooltime, then retry. \
+             Nothing was imported.",
+            c.addr.port()
+        )
+    };
+    if c.mgmt_key().is_err() {
+        return Err(wrong());
+    }
+    match c.get_authed_opt("/api/v1/debug").await {
+        Ok(_) => Ok(()),
+        Err(e) if format!("{e:#}").contains("management key required") => Err(wrong()),
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn import(paths: &Paths, args: ImportArgs) -> anyhow::Result<i32> {
@@ -207,7 +326,7 @@ pub async fn import(paths: &Paths, args: ImportArgs) -> anyhow::Result<i32> {
     let bundle = tokio::task::spawn_blocking(move || transfer::open(&bytes, pw))
         .await
         .context("decrypting the export")?
-        .map_err(|e| anyhow::anyhow!("cannot open {}: {e}", args.file.display()))?;
+        .map_err(|e| anyhow!("cannot open {}: {e}", args.file.display()))?;
     let created = bundle
         .created_at
         .format(&Rfc3339)
@@ -218,59 +337,96 @@ pub async fn import(paths: &Paths, args: ImportArgs) -> anyhow::Result<i32> {
         describe(&bundle)
     );
 
+    let found = client::find(paths).await?;
+    if let Some(c) = &found {
+        check_daemon_home(c).await?;
+    }
+
+    // Plan and validate everything before the first write.
+    let config = match &bundle.config_toml {
+        Some(text) => plan_config(paths, text, args.replace, args.replace_network_settings)?,
+        None => None,
+    };
+    let models = match &bundle.models_toml {
+        Some(text) => plan_models(paths, text, args.replace)?,
+        None => None,
+    };
     paths
         .ensure()
         .context("creating the pooltime data directory")?;
-    let found = client::find(paths).await?;
+    let reg = Registry::load(paths)?;
+    let now = OffsetDateTime::now_utc();
+    let planned = plan(&reg, &bundle, args.replace, now);
+
     let mut target = match &found {
         Some(c) => Target::Daemon(c),
         None => Target::Offline { state: None },
     };
-    let reg = Registry::load(paths)?;
-    let now = OffsetDateTime::now_utc();
-    let mut imported = 0;
+    let (mut imported, mut failed) = (0, 0);
     let mut sign_in = Vec::new();
-    for a in &bundle.accounts {
-        let id = a.meta.id.to_string();
-        let provider = a.meta.provider;
-        let r = import_one(paths, &reg, &mut target, a, args.replace, now)
-            .await
-            .with_context(|| format!("importing '{id}'"))?;
-        match r {
-            Done::Imported(Login::Usable) => {
+    for p in &planned {
+        let id = p.a.meta.id.as_str();
+        let provider = p.a.meta.provider;
+        let outcome = apply(paths, &reg, &mut target, p).await;
+        let line = match &outcome {
+            Outcome::Added(_) => "imported".to_string(),
+            Outcome::Replaced(_) => "replaced with the export's".to_string(),
+            Outcome::KeptSignIn => "settings replaced; kept this machine's sign-in (the \
+                                    export's had expired)"
+                .to_string(),
+            Outcome::Skipped => "skipped, an account with this name exists here (--replace \
+                                 overwrites it)"
+                .to_string(),
+            Outcome::Failed(e) => format!("FAILED: {e}"),
+        };
+        match &outcome {
+            Outcome::Added(l) | Outcome::Replaced(l) => {
                 imported += 1;
-                println!("  {id} ({provider}): imported");
+                if *l == Login::NeedsSignIn {
+                    sign_in.push(id.to_string());
+                }
             }
-            Done::Imported(Login::NeedsSignIn) => {
-                imported += 1;
-                sign_in.push(id.clone());
-                println!(
-                    "  {id} ({provider}): imported, needs sign-in (no saved login, or it had \
-                     expired; not restored)"
-                );
-            }
-            Done::Skipped => println!(
-                "  {id} ({provider}): skipped, an account with this name exists here (--replace \
-                 overwrites it)"
-            ),
+            Outcome::KeptSignIn => imported += 1,
+            Outcome::Skipped => {}
+            Outcome::Failed(_) => failed += 1,
         }
+        let needs = matches!(
+            outcome,
+            Outcome::Added(Login::NeedsSignIn) | Outcome::Replaced(Login::NeedsSignIn)
+        );
+        println!(
+            "  {id} ({provider}): {line}{}",
+            if needs {
+                ", needs sign-in (no saved login, or it had expired; not restored)"
+            } else {
+                ""
+            }
+        );
     }
     if let Target::Offline { state: Some(s) } = &target {
         s.flush().await?;
     }
 
     let mut restart = false;
-    if let Some(text) = &bundle.config_toml {
-        restart |= restore_config(paths, text, args.replace, found.as_ref()).await?;
+    if let Some(m) = &config {
+        restart |= write_config(paths, m, found.as_ref()).await?;
     }
-    if let Some(text) = &bundle.models_toml {
-        restart |= restore_models(paths, text, args.replace)?;
+    if let Some(t) = &models {
+        t.save(paths).context("writing models.toml")?;
+        println!("models.toml: restored");
+        restart = true;
     }
 
     println!(
         "imported {imported} of {}",
         plural(bundle.accounts.len(), "account", "accounts")
     );
+    if failed > 0 {
+        println!(
+            "{} could not be imported (see above)",
+            plural(failed, "account", "accounts")
+        );
+    }
     for id in &sign_in {
         println!("sign in: pooltime accounts login {id}");
     }
@@ -288,69 +444,110 @@ pub async fn import(paths: &Paths, args: ImportArgs) -> anyhow::Result<i32> {
          not yet (both refreshing the same sign-ins log each other out).",
         args.file.display()
     );
-    Ok(0)
+    Ok(if failed > 0 { 1 } else { 0 })
 }
 
-async fn import_one(
-    paths: &Paths,
-    reg: &Registry,
-    target: &mut Target<'_>,
-    a: &BundledAccount,
-    replace: bool,
-    now: OffsetDateTime,
-) -> anyhow::Result<Done> {
-    let id = &a.meta.id;
-    if reg.get(id).is_some() {
-        if !replace {
-            return Ok(Done::Skipped);
-        }
-        match target {
-            // Also ends a pending sign-in and forgets its runtime state.
-            Target::Daemon(c) => {
-                c.delete(&format!("/api/v1/accounts/{}", seg(id.as_str())))
-                    .await?;
+/// Carry out one planned account. Never aborts the import: a failure is reported, and a
+/// replaced account is put back as it was.
+async fn apply(paths: &Paths, reg: &Registry, target: &mut Target<'_>, p: &Planned<'_>) -> Outcome {
+    let id = &p.a.meta.id;
+    match &p.action {
+        Action::Skip => Outcome::Skipped,
+        Action::MetadataOnly => match reg.upsert(p.a.meta.clone()) {
+            Ok(()) => Outcome::KeptSignIn,
+            Err(e) => Outcome::Failed(format!("{e:#}")),
+        },
+        Action::Add => match add(reg, target, p).await {
+            Ok(()) => Outcome::Added(p.login),
+            Err(e) => Outcome::Failed(format!("{e:#}")),
+        },
+        Action::Replace(old) => {
+            if let Err(e) = remove(paths, reg, target, id).await {
+                return Outcome::Failed(format!(
+                    "{e:#} (this machine's account was left as it was)"
+                ));
             }
-            Target::Offline { state } => {
-                reg.remove(id)?;
-                if state.is_none() {
-                    *state = Some(Arc::new(StateBook::load(Arc::new(Store::open(
-                        &paths.db,
-                    )?))?));
-                }
-                if let Some(s) = state {
-                    s.forget(id);
-                }
+            match add(reg, target, p).await {
+                Ok(()) => Outcome::Replaced(p.login),
+                Err(e) => match restore(reg, old) {
+                    Ok(()) => {
+                        Outcome::Failed(format!("{e:#} (this machine's account was put back)"))
+                    }
+                    Err(r) => Outcome::Failed(format!(
+                        "{e:#}; putting this machine's account back failed too: {r:#}"
+                    )),
+                },
             }
         }
     }
+}
+
+/// Remove this machine's account: through the daemon (which also ends a pending sign-in and
+/// forgets its runtime state), or the files and the state row.
+async fn remove(
+    paths: &Paths,
+    reg: &Registry,
+    target: &mut Target<'_>,
+    id: &AccountId,
+) -> anyhow::Result<()> {
+    match target {
+        Target::Daemon(c) => {
+            c.delete(&format!("/api/v1/accounts/{}", seg(id.as_str())))
+                .await?;
+        }
+        Target::Offline { state } => {
+            if state.is_none() {
+                *state = Some(Arc::new(StateBook::load(Arc::new(Store::open(
+                    &paths.db,
+                )?))?));
+            }
+            reg.remove(id)?;
+            if let Some(s) = state {
+                s.forget(id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Create the account (through the daemon when one runs), then write the full `account.toml`
+/// (priority, weight, identity, note, override) and the sign-in if it is still usable.
+async fn add(reg: &Registry, target: &Target<'_>, p: &Planned<'_>) -> anyhow::Result<()> {
+    let id = &p.a.meta.id;
     if let Target::Daemon(c) = target {
         c.post(
             "/api/v1/accounts",
             json!({
                 "id": id.as_str(),
-                "provider": a.meta.provider.as_str(),
-                "email": a.meta.identity.email,
+                "provider": p.a.meta.provider.as_str(),
+                "email": p.api_email,
             }),
         )
         .await?;
     }
-    // The full account.toml (priority, weight, identity, note, override).
-    reg.upsert(a.meta.clone())?;
-    let login = a.login(now);
-    if let (Login::Usable, Some(creds)) = (login, &a.credentials) {
+    reg.upsert(p.a.meta.clone())?;
+    if let (Login::Usable, Some(creds)) = (p.login, &p.a.credentials) {
         reg.write_creds(id, creds)?;
     }
-    Ok(Done::Imported(login))
+    Ok(())
 }
 
-/// Write `config.toml` unless one exists (and `--replace` was not given). This machine's
-/// `profiles` are always kept. Returns whether it was written.
-async fn restore_config(
+fn restore(reg: &Registry, old: &Snapshot) -> anyhow::Result<()> {
+    reg.upsert(old.meta.clone())?;
+    if let Some(c) = &old.creds {
+        reg.write_creds(&old.meta.id, c)?;
+    }
+    Ok(())
+}
+
+/// The merged `config.toml` to write, or `None` to keep this machine's. Validated in full here
+/// (before any write); prints what will be kept.
+fn plan_config(
     paths: &Paths,
     text: &str,
     replace: bool,
-    daemon: Option<&Client>,
-) -> anyhow::Result<bool> {
+    take_network: bool,
+) -> anyhow::Result<Option<MergedConfig>> {
     let existing = match std::fs::read_to_string(&paths.config) {
         Ok(s) => Some(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -358,57 +555,80 @@ async fn restore_config(
     };
     if existing.is_some() && !replace {
         println!("config.toml: kept this machine's (--replace takes the export's)");
-        return Ok(false);
+        return Ok(None);
     }
-    let merged = transfer::merge_config(text, existing.as_deref())?;
-    crate::fsutil::atomic_write(&paths.config, merged.as_bytes(), 0o600)
-        .with_context(|| format!("writing {}", paths.config.display()))?;
-    println!("config.toml: restored");
-    // A running daemon saves its in-memory tuning back into config.toml on its next tuning
-    // change: give it the restored values now so that save cannot undo them.
-    if let Some(c) = daemon {
-        if let Ok(cfg) = crate::config::Config::load_file(paths) {
-            let r = &cfg.routing;
-            let body = json!({
-                "five_hour_exp": r.five_hour_exp,
-                "min_headroom": r.min_headroom,
-                "headroom_taper_start": r.headroom_taper_start,
-            });
-            if let Err(e) = c.post("/api/v1/tuning", body).await {
-                eprintln!("warning: could not apply the restored tuning live: {e:#}");
-            }
-        }
-    }
-    Ok(true)
+    let merged = transfer::merge_config(text, existing.as_deref(), take_network, |k| {
+        std::env::var(k).ok()
+    })
+    .context("config.toml not restored, nothing was imported")?;
+    Ok(Some(merged))
 }
 
-/// Write `models.toml` unless one exists (and `--replace` was not given).
-fn restore_models(paths: &Paths, text: &str, replace: bool) -> anyhow::Result<bool> {
-    let path = ModelTable::path(paths);
-    if path.exists() && !replace {
+/// Write the merged `config.toml`.
+///
+/// The daemon's own config.toml writers hold its in-process `config_write` lock, which this
+/// process cannot take. They each re-read the file under that lock and replace only the fields
+/// they own: the routing tuning (from the daemon's memory) and `connect`'s profiles and proxy
+/// key. So the restored tuning is sent to the daemon first (its next tuning save then writes
+/// the same values), and profiles are always, the proxy key by default, this machine's. Only a
+/// tuning change or `connect` running at the same moment as the import could interleave.
+async fn write_config(
+    paths: &Paths,
+    m: &MergedConfig,
+    daemon: Option<&Client>,
+) -> anyhow::Result<bool> {
+    if let Some(c) = daemon {
+        let cfg: Config = toml::from_str(&m.text).context("parsing the merged config")?;
+        let r = &cfg.routing;
+        let body = json!({
+            "five_hour_exp": r.five_hour_exp,
+            "min_headroom": r.min_headroom,
+            "headroom_taper_start": r.headroom_taper_start,
+        });
+        if let Err(e) = c.post("/api/v1/tuning", body).await {
+            eprintln!("warning: could not apply the restored tuning live: {e:#}");
+        }
+    }
+    crate::fsutil::atomic_write(&paths.config, m.text.as_bytes(), 0o600)
+        .with_context(|| format!("writing {}", paths.config.display()))?;
+    if m.changed.is_empty() {
+        println!("config.toml: restored (no setting changed)");
+    } else {
+        println!("config.toml: restored; changed: {}", m.changed.join(", "));
+    }
+    if !m.kept_network.is_empty() {
+        println!(
+            "config.toml: kept this machine's {} (--replace-network-settings takes the export's)",
+            m.kept_network.join(", ")
+        );
+    }
+    Ok(!m.changed.is_empty())
+}
+
+/// The export's model table, or `None` to keep this machine's `models.toml`. It must parse, and
+/// is loaded as a [`ModelTable`] (rows and mappings sanitised as at startup) and saved from that.
+fn plan_models(paths: &Paths, text: &str, replace: bool) -> anyhow::Result<Option<ModelTable>> {
+    if ModelTable::path(paths).exists() && !replace {
         println!("models.toml: kept this machine's (--replace takes the export's)");
-        return Ok(false);
+        return Ok(None);
     }
     if toml::from_str::<toml::Table>(text).is_err() {
-        eprintln!("warning: the export's models.toml does not parse; not restored");
-        return Ok(false);
+        bail!("the export's models.toml does not parse; nothing was imported");
     }
-    crate::fsutil::atomic_write(&path, text.as_bytes(), 0o600)
-        .with_context(|| format!("writing {}", path.display()))?;
-    println!("models.toml: restored");
-    Ok(true)
+    Ok(Some(ModelTable::from_toml_str(text)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ProviderId;
     use age::secrecy::ExposeSecret;
 
     #[test]
     fn passphrase_file_reads_the_first_line_and_refuses_empty() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("pw");
-        std::fs::write(&f, "correct horse battery\nignored\n").unwrap();
+        std::fs::write(&f, "correct horse battery\r\nignored\n").unwrap();
         let pw = passphrase(Some(&f), Purpose::Import).unwrap();
         assert_eq!(pw.expose_secret(), "correct horse battery");
         std::fs::write(&f, "\n").unwrap();
@@ -418,5 +638,89 @@ mod tests {
         assert!(e.contains("empty"), "{e}");
         std::fs::write(&f, "").unwrap();
         assert!(passphrase(Some(&f), Purpose::Import).is_err());
+    }
+
+    #[test]
+    fn env_passphrase_loses_its_line_ending_like_the_file() {
+        let env = |v: &str| given_passphrase(None, Some(v.to_string()));
+        assert_eq!(env("pw here\n").as_deref(), Some("pw here"));
+        assert_eq!(env("pw here\r\n").as_deref(), Some("pw here"));
+        assert_eq!(
+            env("  pw  ").as_deref(),
+            Some("  pw  "),
+            "inner spaces are kept"
+        );
+        assert_eq!(env("\n"), None);
+        assert_eq!(
+            given_passphrase(Some("pw here\n".into()), Some("other".into())).as_deref(),
+            Some("pw here"),
+            "the file wins"
+        );
+    }
+
+    #[test]
+    fn api_email_matches_the_daemons_rule() {
+        assert_eq!(
+            api_email(Some(" user@example.com ")).as_deref(),
+            Some("user@example.com")
+        );
+        assert_eq!(api_email(Some("@")), None);
+        assert_eq!(api_email(Some("a@")), None);
+        assert_eq!(api_email(Some("nobody")), None);
+        assert_eq!(api_email(None), None);
+    }
+
+    fn creds(p: ProviderId) -> Credentials {
+        serde_json::from_value(json!({
+            "provider": p.as_str(), "access_token": "SECRET-A", "refresh_token": "SECRET-R"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn replace_keeps_a_working_sign_in_when_the_export_has_none() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = Paths::under(d.path());
+        paths.ensure().unwrap();
+        let reg = Registry::load(&paths).unwrap();
+        for id in ["acct-a", "acct-b", "acct-c"] {
+            let id: AccountId = id.parse().unwrap();
+            reg.upsert(AccountMeta::new(id.clone(), ProviderId::Anthropic))
+                .unwrap();
+            reg.write_creds(&id, &creds(ProviderId::Anthropic)).unwrap();
+        }
+        let entry = |id: &str, c: Option<Credentials>, p: ProviderId| BundledAccount {
+            meta: AccountMeta::new(id.parse().unwrap(), p),
+            credentials: c,
+        };
+        let bundle = Bundle {
+            format: transfer::FORMAT.into(),
+            version: transfer::VERSION,
+            created_at: OffsetDateTime::now_utc(),
+            pooltime_version: "test".into(),
+            accounts: vec![
+                // No sign-in in the export: keep this machine's.
+                entry("acct-a", None, ProviderId::Anthropic),
+                // A live sign-in in the export: replace.
+                entry(
+                    "acct-b",
+                    Some(creds(ProviderId::Anthropic)),
+                    ProviderId::Anthropic,
+                ),
+                // Another provider: this machine's sign-in would not fit; replace.
+                entry("acct-c", None, ProviderId::OpenAi),
+                entry("acct-d", None, ProviderId::Anthropic),
+            ],
+            config_toml: None,
+            models_toml: None,
+        };
+        let now = OffsetDateTime::now_utc();
+        let p = plan(&reg, &bundle, true, now);
+        assert!(matches!(p[0].action, Action::MetadataOnly));
+        assert!(matches!(p[1].action, Action::Replace(_)));
+        assert!(matches!(p[2].action, Action::Replace(_)));
+        assert!(matches!(p[3].action, Action::Add));
+        let p = plan(&reg, &bundle, false, now);
+        assert!(matches!(p[0].action, Action::Skip));
     }
 }

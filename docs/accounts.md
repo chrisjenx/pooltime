@@ -142,16 +142,29 @@ Import:
 - prints what the file holds (number of accounts per provider and their names), then a line per
   account;
 - **skips** an account whose name already exists here, and keeps an existing `config.toml` /
-  `models.toml`; `--replace` overwrites them (this machine's `[[profiles]]` are always kept);
+  `models.toml`. `--replace` overwrites them. If the export has no usable sign-in for an
+  account but this machine has one, `--replace` takes only the export's settings for it
+  (priority, weight, identity) and keeps the sign-in here;
 - does not restore a sign-in that had already expired (no refresh token left, or its login
   expiry has passed): the account is added and listed with `pooltime accounts login <name>`;
+- restores `config.toml` but keeps this machine's `host`, `port` and `proxy_key` (Claude Code
+  profiles connected here point at that address and send that key), and always this machine's
+  `[[profiles]]`. `--replace-network-settings` takes the export's host, port and proxy key too.
+  It prints which settings changed, and checks the result as `pooltime serve` would (for
+  example a non-loopback `host` needs a `proxy_key`) before writing anything;
+- checks everything (the file, every account, `config.toml`, `models.toml`) before the first
+  write. If one account fails to import, the others still do, a replaced account is put back as
+  it was, and the command exits non-zero;
 - works whether or not the daemon runs. A running daemon picks the accounts up at once (they are
   created through its management API, like `accounts add`); restart it (`pooltime service
-  restart`) if `config.toml` or `models.toml` were restored.
+  restart`) if `config.toml` or `models.toml` were restored. If a pooltime from another
+  `POOLTIME_HOME` answers on this home's port, import stops before writing anything: set
+  `POOLTIME_PORT` to a free port or stop that pooltime.
 
 Passphrase: typed at the terminal by default (never echoed; twice for export). For scripts, use
 `--passphrase-file PATH` (its first line) or the `POOLTIME_EXPORT_PASSPHRASE` environment
-variable; it is never accepted as a command-line argument. An empty passphrase is refused.
+variable (a trailing line ending is dropped from either); it is never accepted as a
+command-line argument. An empty passphrase is refused.
 `export` writes the file with mode 0600, atomically, and refuses to replace an existing file
 without `--force`.
 
