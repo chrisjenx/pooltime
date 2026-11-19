@@ -9,21 +9,27 @@ use rusqlite::{params, Connection};
 use crate::analytics::attribution::Project;
 
 /// Record that working directory `cwd_hash` belongs to `project`, first seen at `ts` (unix
-/// seconds). The latest label wins; `first_seen` is kept.
+/// seconds). `resolved`: the label came from a filesystem lookup (else from the path alone).
+/// The latest label wins, except that a path-only label never replaces a resolved one;
+/// `first_seen` is kept.
 pub fn upsert(
     conn: &Connection,
     cwd_hash: &str,
     project: &Project,
     ts: i64,
+    resolved: bool,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO cwd_projects(cwd_hash, project, path_hash, first_seen)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO cwd_projects(cwd_hash, project, path_hash, first_seen, resolved)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(cwd_hash) DO UPDATE SET
-             project = excluded.project,
-             path_hash = excluded.path_hash,
+             project = CASE WHEN excluded.resolved >= resolved THEN excluded.project
+                            ELSE project END,
+             path_hash = CASE WHEN excluded.resolved >= resolved THEN excluded.path_hash
+                              ELSE path_hash END,
+             resolved = max(resolved, excluded.resolved),
              first_seen = min(first_seen, excluded.first_seen)",
-        params![cwd_hash, project.name, project.path_hash, ts],
+        params![cwd_hash, project.name, project.path_hash, ts, resolved],
     )?;
     Ok(())
 }
@@ -112,11 +118,18 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(store.exec(|c| {
-            upsert(c, "c1", &project("acme", "h1"), 100)?;
-            upsert(c, "c1", &project("acme2", "h2"), 200)?;
+            // Path-only first, then corrected by a lookup; a later path-only label is ignored.
+            upsert(c, "c1", &project("acme", "h1"), 100, false)?;
+            upsert(c, "c1", &project("acme2", "h2"), 200, true)?;
+            upsert(c, "c1", &project("stale", "h3"), 300, false)?;
+            // Two path-only labels: the latest wins.
+            upsert(c, "c2", &project("a", "x1"), 1, false)?;
+            upsert(c, "c2", &project("b", "x2"), 2, false)?;
             Ok(())
         }))
         .unwrap();
+        let c2 = store.read(projects).unwrap()["c2"].clone();
+        assert_eq!(c2, ("b".to_string(), Some("x2".to_string())));
         let row: (String, String, i64) = store
             .read(|c| {
                 Ok(c.query_row(
@@ -165,8 +178,8 @@ mod tests {
             )?;
             journal::insert(c, &req("b", 21, "/v1/messages", None), &[att(1, "acct-a")])?;
             journal::insert(c, &req("c", 22, "/v1/messages/count_tokens", None), &[])?;
-            upsert(c, "c1", &project("acme", "h1"), 20)?;
-            upsert(c, "gone", &project("old", "h0"), 1)?;
+            upsert(c, "c1", &project("acme", "h1"), 20, true)?;
+            upsert(c, "gone", &project("old", "h0"), 1, true)?;
             Ok(())
         }))
         .unwrap();

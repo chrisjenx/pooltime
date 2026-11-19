@@ -25,10 +25,13 @@
 //! Cost: the request path only scans the body and hashes one line. Mapping a directory to its
 //! project touches the filesystem, so [`ProjectCache::observe`] does it once per directory, on
 //! a blocking thread, off the request path and bounded by [`PROBE_TIMEOUT`] (a stalled network
-//! mount falls back to the path-only answer), then queues the `cwd_projects` row on the store
-//! writer. The request never waits for any of it.
+//! mount falls back to the path-only answer, which the lookup corrects if it still finishes; a
+//! path-only label never replaces a looked-up one), then writes the `cwd_projects` row. A
+//! directory counts as known only once its row is written, so a failed write is retried by the
+//! next request naming it. At most [`MAX_PROBES`] lookups run at once (a slot is freed when its
+//! lookup ends, also on a panic). The request never waits for any of it.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,7 +51,7 @@ pub const MAX_DEPTH: usize = 64;
 /// How long a filesystem lookup may take before the path-only answer is used.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Filesystem lookups running at once; beyond that the path-only answer is used.
-const MAX_PROBES: usize = 4;
+pub const MAX_PROBES: usize = 4;
 /// Longest stored label (characters).
 const MAX_NAME: usize = 64;
 /// Directories remembered by [`ProjectCache`] before it starts over.
@@ -230,12 +233,84 @@ pub fn project_of(
     })
 }
 
+/// Where a working directory stands in [`ProjectCache`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seen {
+    /// Its lookup is running; no row written yet.
+    Pending,
+    /// A row was written (or it has no project, like `/`).
+    Done,
+}
+
+type Known = Arc<Mutex<HashMap<String, Seen>>>;
+
+fn lock(known: &Known) -> std::sync::MutexGuard<'_, HashMap<String, Seen>> {
+    known.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One running filesystem lookup: holds a slot of the [`MAX_PROBES`] and frees it when dropped,
+/// also when the lookup panics.
+struct ProbeSlot(Arc<AtomicUsize>);
+
+impl ProbeSlot {
+    /// A slot, or `None` when [`MAX_PROBES`] lookups are already running.
+    fn take(probes: &Arc<AtomicUsize>) -> Option<ProbeSlot> {
+        // Check and increment in one atomic step (compare-and-swap loop).
+        let mut n = probes.load(Ordering::SeqCst);
+        while n < MAX_PROBES {
+            match probes.compare_exchange_weak(n, n + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(ProbeSlot(probes.clone())),
+                Err(current) => n = current,
+            }
+        }
+        None
+    }
+}
+
+impl Drop for ProbeSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Working directories already mapped (or being mapped) to a project, by hash (bounded; cleared
-/// when full).
+/// when full). A directory counts as done only once its row was written; a failed write is
+/// forgotten, so the next request naming it tries again.
 #[derive(Debug, Default)]
 pub struct ProjectCache {
-    known: Mutex<HashSet<String>>,
+    known: Known,
     probes: Arc<AtomicUsize>,
+}
+
+/// Write `project` for `key` (`resolved`: from a filesystem lookup) and mark the directory done,
+/// or forget it when the write fails. `None` (no project) is done at once.
+async fn record(
+    store: &Arc<Store>,
+    known: &Known,
+    key: &str,
+    ts: i64,
+    project: Option<Project>,
+    resolved: bool,
+) {
+    let ok = match project {
+        None => true,
+        Some(p) => {
+            let k = key.to_string();
+            let res = store
+                .exec(move |c| Ok(crate::store::projects::upsert(c, &k, &p, ts, resolved)?))
+                .await;
+            if let Err(e) = &res {
+                tracing::debug!(error = %format!("{e:#}"), "could not record a project label");
+            }
+            res.is_ok()
+        }
+    };
+    let mut k = lock(known);
+    if ok {
+        k.insert(key.to_string(), Seen::Done);
+    } else if k.get(key) == Some(&Seen::Pending) {
+        k.remove(key);
+    }
 }
 
 impl ProjectCache {
@@ -258,62 +333,68 @@ impl ProjectCache {
         let path = normalize(cwd)?;
         let hash = hash_session(&path.to_string_lossy());
         {
-            let mut known = self.known.lock().unwrap_or_else(|e| e.into_inner());
-            if known.contains(&hash) {
+            let mut known = lock(&self.known);
+            if known.contains_key(&hash) {
                 return Some(hash);
             }
             if known.len() >= CACHE_CAP {
                 known.clear();
             }
-            known.insert(hash.clone());
+            known.insert(hash.clone(), Seen::Pending);
         }
         let path = path.to_string_lossy().into_owned();
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        let (store, key) = (store.clone(), hash.clone());
-        let record = move |project: Option<Project>| {
-            if let Some(p) = project {
-                tracing::debug!(project = %p.name, "working directory project found");
-                let queued = store.submit(move |c| {
-                    crate::store::projects::upsert(c, &key, &p, ts)?;
+        let (lookup_path, lookup_home) = (path.clone(), home.clone());
+        let text_only = move || project_of(&path, home.as_deref(), |_| None);
+        let (store, known, key) = (store.clone(), self.known.clone(), hash.clone());
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            // No runtime (not the daemon): the path alone, written in order on the store writer.
+            let project = text_only();
+            let queued = match project {
+                None => Ok(()),
+                Some(p) => store.submit(move |c| {
+                    crate::store::projects::upsert(c, &key, &p, ts, false)?;
                     Ok(())
-                });
-                if let Err(e) = queued {
-                    tracing::debug!(error = %format!("{e:#}"), "could not queue a project label");
+                }),
+            };
+            let mut k = lock(&known);
+            if queued.is_ok() {
+                k.insert(hash.clone(), Seen::Done);
+            } else {
+                k.remove(&hash);
+            }
+            return Some(hash);
+        };
+        let slot = ProbeSlot::take(&self.probes);
+        rt.spawn(async move {
+            let Some(slot) = slot else {
+                // Too many lookups stuck: the path alone, no filesystem.
+                record(&store, &known, &key, ts, text_only(), false).await;
+                return;
+            };
+            let mut job = tokio::task::spawn_blocking(move || {
+                let _slot = slot; // freed when the lookup ends, also on a panic
+                project_of(&lookup_path, lookup_home.as_deref(), probe)
+            });
+            match tokio::time::timeout(PROBE_TIMEOUT, &mut job).await {
+                Ok(Ok(p)) => record(&store, &known, &key, ts, p, true).await,
+                Ok(Err(_)) => record(&store, &known, &key, ts, text_only(), false).await,
+                Err(_) => {
+                    // Slow filesystem: label by the path alone now, and correct it if the
+                    // lookup still finishes.
+                    record(&store, &known, &key, ts, text_only(), false).await;
+                    if let Ok(p) = job.await {
+                        record(&store, &known, &key, ts, p, true).await;
+                    }
                 }
             }
-        };
-        let text_only = |path: &str, home: Option<&Path>| project_of(path, home, |_| None);
-        match tokio::runtime::Handle::try_current() {
-            Ok(rt) if self.probes.load(Ordering::SeqCst) < MAX_PROBES => {
-                let probes = self.probes.clone();
-                probes.fetch_add(1, Ordering::SeqCst);
-                rt.spawn(async move {
-                    let (p, h) = (path.clone(), home.clone());
-                    let job = tokio::task::spawn_blocking(move || {
-                        let r = project_of(&p, h.as_deref(), probe);
-                        probes.fetch_sub(1, Ordering::SeqCst);
-                        r
-                    });
-                    let project = match tokio::time::timeout(PROBE_TIMEOUT, job).await {
-                        Ok(Ok(p)) => p,
-                        // Slow or failed filesystem: label by the path alone.
-                        _ => text_only(&path, home.as_deref()),
-                    };
-                    record(project);
-                });
-            }
-            // No runtime, or too many lookups stuck: the path alone, no filesystem.
-            _ => record(text_only(&path, home.as_deref())),
-        }
+        });
         Some(hash)
     }
 
     #[cfg(test)]
-    fn knows(&self, hash: &str) -> bool {
-        self.known
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(hash)
+    fn seen(&self, hash: &str) -> Option<Seen> {
+        lock(&self.known).get(hash).copied()
     }
 }
 
@@ -559,26 +640,112 @@ mod tests {
             started.elapsed() < Duration::from_millis(100),
             "observe blocked"
         );
-        // After the timeout the path-only answer is recorded (worktree tail cut off).
-        let mut found = None;
-        for _ in 0..200 {
-            store.exec(|_| Ok(())).await.unwrap();
-            found = store
-                .read(crate::store::projects::projects)
-                .unwrap()
-                .get(&h)
-                .cloned();
-            if found.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
+        // After the timeout the path-only answer is recorded (worktree tail cut off)...
+        assert_eq!(
+            wait_label(&store, &h, |_| true).await.as_deref(),
+            Some("acme")
+        );
         assert!(
             started.elapsed() < PROBE_TIMEOUT * 2,
             "{:?}",
             started.elapsed()
         );
-        assert_eq!(found.unwrap().0, "acme");
+        assert_eq!(cache.seen(&h), Some(Seen::Done));
+        // ...and corrected once the slow lookup finishes (this fake finds a repo right there).
+        let fixed = wait_label(&store, &h, |l| l == "w1").await;
+        assert_eq!(fixed.as_deref(), Some("w1"));
+        assert_eq!(cache.probes.load(Ordering::SeqCst), 0, "slot freed");
+    }
+
+    /// The label stored for `h` once `ok` accepts it (about 5 s at most).
+    async fn wait_label(store: &Store, h: &str, ok: impl Fn(&str) -> bool) -> Option<String> {
+        for _ in 0..200 {
+            store.exec(|_| Ok(())).await.unwrap();
+            let got = store
+                .read(crate::store::projects::projects)
+                .unwrap()
+                .get(h)
+                .map(|(p, _)| p.clone());
+            if got.as_deref().is_some_and(&ok) {
+                return got;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        None
+    }
+
+    #[test]
+    fn probe_slots_are_capped_and_freed() {
+        let probes = Arc::new(AtomicUsize::new(0));
+        let slots: Vec<ProbeSlot> = (0..MAX_PROBES)
+            .map(|_| ProbeSlot::take(&probes).unwrap())
+            .collect();
+        assert!(ProbeSlot::take(&probes).is_none());
+        drop(slots);
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+        // Racing threads never take more than the cap.
+        let taken: Vec<Option<ProbeSlot>> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..32)
+                .map(|_| s.spawn(|| ProbeSlot::take(&probes)))
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(taken.iter().flatten().count(), MAX_PROBES);
+        drop(taken);
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_lookup_frees_its_slot_and_falls_back() {
+        fn boom(_: &Path) -> Option<DotGit> {
+            panic!("probe failed");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("pooltime.db")).unwrap());
+        let cache = ProjectCache::default();
+        let h = cache
+            .observe_with(&store, "/home/user/src/acme", 1, boom)
+            .unwrap();
+        assert_eq!(
+            wait_label(&store, &h, |_| true).await.as_deref(),
+            Some("acme")
+        );
+        assert_eq!(cache.probes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_is_forgotten_and_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("pooltime.db")).unwrap());
+        store
+            .exec(|c| Ok(c.execute_batch("ALTER TABLE cwd_projects RENAME TO gone")?))
+            .await
+            .unwrap();
+        let cache = ProjectCache::default();
+        let cwd = "/nonexistent-pooltime-test/src/acme";
+        let h = cache.observe_with(&store, cwd, 1, |_| None).unwrap();
+        for _ in 0..200 {
+            if cache.seen(&h).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            cache.seen(&h),
+            None,
+            "not marked known after a failed write"
+        );
+        // The table is back: the next request naming the directory labels it.
+        store
+            .exec(|c| Ok(c.execute_batch("ALTER TABLE gone RENAME TO cwd_projects")?))
+            .await
+            .unwrap();
+        cache.observe_with(&store, cwd, 2, |_| None).unwrap();
+        assert_eq!(
+            wait_label(&store, &h, |_| true).await.as_deref(),
+            Some("acme")
+        );
+        assert_eq!(cache.seen(&h), Some(Seen::Done));
     }
 
     #[tokio::test]
@@ -589,7 +756,7 @@ mod tests {
         let cwd = "/nonexistent-pooltime-test/src/acme";
         let h = cache.observe(&store, cwd, 100).unwrap();
         assert_eq!(Some(h.clone()), cwd_hash(cwd));
-        assert!(cache.knows(&h));
+        assert!(cache.seen(&h).is_some());
         // Seen again: same hash, no second lookup.
         assert_eq!(
             cache.observe(&store, "/nonexistent-pooltime-test/src/acme/", 101),

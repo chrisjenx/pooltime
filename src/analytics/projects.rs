@@ -606,7 +606,7 @@ mod tests {
                 name: "acme".into(),
                 path_hash: "1111aaaa22223333".into(),
             };
-            crate::store::projects::upsert(c, "c1", &acme, NOW - 600)?;
+            crate::store::projects::upsert(c, "c1", &acme, NOW - 600, true)?;
             let reset = Some(NOW + 86_400);
             for (ts, util) in [(NOW - 3600, 0.2), (NOW - 60, 0.25)] {
                 insert_sample(c, "acct-a", WINDOW_7D, &Point { ts, util, reset })?;
