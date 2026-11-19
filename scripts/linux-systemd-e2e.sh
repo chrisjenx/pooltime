@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Linux end-to-end check of the background service under a real systemd user manager:
 # `service install`, a streaming request in flight, `service restart` (and a plain
-# `systemctl --user reload`), no refused connection and no 503 meanwhile, the stream completes,
-# then `service uninstall`.
+# `systemctl --user reload`), the supervisor replacing itself in place (`SIGUSR2`, what
+# `pooltime update` sends: same MainPID), no refused connection and no 503 meanwhile, the stream
+# completes, then `service uninstall`.
 #
 #   scripts/linux-systemd-e2e.sh <pooltime binary>
 #
@@ -266,8 +267,26 @@ inner() {
 	done
 	[ "$(state_field restarts)" -gt "$restarts" ] || die "systemctl reload did not restart the workers"
 	[ "$(state_field last_restart.ok)" = True ] || die "the reload's handover failed"
+
+	say "supervisor upgrade in place (SIGUSR2, as pooltime update sends it)"
+	local main upgrades
+	main=$(systemctl --user show -p MainPID --value pooltime.service)
+	[ "$main" -gt 1 ] || die "no MainPID ($main)"
+	[ "$(state_field can_upgrade)" = True ] || die "the supervisor does not offer in-place upgrades"
+	upgrades=$(state_field upgrades)
+	kill -USR2 "$main"
+	for _ in $(seq 150); do
+		[ "$(state_field upgrades)" -gt "$upgrades" ] && break
+		sleep 0.2
+	done
+	[ "$(state_field upgrades)" -gt "$upgrades" ] || die "the supervisor did not report the upgrade"
+	[ "$(state_field last_upgrade.ok)" = True ] || die "the upgrade failed: $(state_field last_upgrade.error)"
+	[ "$(systemctl --user show -p MainPID --value pooltime.service)" = "$main" ] ||
+		die "MainPID changed: systemd saw the supervisor exit"
+	[ "$(state_field pid)" = "$main" ] || die "the state file names another supervisor pid"
+	systemctl --user is-active --quiet pooltime.service || die "the unit is no longer active"
 	grep -q message_stop "$work/stream.out" &&
-		die "the slow stream ended before both restarts were done: raise STREAM_PAUSE"
+		die "the slow stream ended before the restarts and the upgrade were done: raise STREAM_PAUSE"
 
 	say "waiting for the in-flight stream"
 	wait "$stream_pid" || die "the in-flight stream failed: $(cat "$work/stream.err")"

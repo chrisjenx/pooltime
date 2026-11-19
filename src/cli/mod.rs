@@ -14,6 +14,7 @@ pub mod service;
 pub mod setup;
 pub mod status;
 pub mod statusline;
+pub mod update;
 
 use std::ffi::OsString;
 use std::net::IpAddr;
@@ -92,6 +93,9 @@ pub enum Command {
         #[arg(long, value_name = "PROFILE_ID")]
         wrap: Option<String>,
     },
+    /// Install the latest release (Homebrew or the install script) and move the running service
+    /// onto it without closing the port.
+    Update(update::UpdateArgs),
 }
 
 /// `pooltime serve` flags. `--port`/`--host` override `config.toml` and `POOLTIME_PORT`/`POOLTIME_HOST`.
@@ -122,6 +126,14 @@ pub struct ServeFlags {
     /// Worker mode (set by the supervisor): the inherited control socket.
     #[arg(long, hide = true, requires = "listen_fd")]
     pub control_fd: Option<i32>,
+    /// Supervisor mode, set by a supervisor that re-executes itself in place (`pooltime
+    /// update`): the state it hands over (see `supervisor::resume`).
+    #[arg(long, hide = true, requires = "supervise")]
+    pub resume: Option<String>,
+    /// Say which supervisor hand-over formats this binary reads, then exit (a supervisor asks
+    /// this before re-executing into it).
+    #[arg(long, hide = true, conflicts_with_all = ["supervise", "listen_fd"])]
+    pub reexec_probe: bool,
 }
 
 /// Parse `args` (including argv[0]) and run; returns the process exit code.
@@ -140,6 +152,12 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
     // Runs on every status line refresh: no runtime, no network.
     if let Command::Statusline { wrap } = command {
         return Ok(statusline::run(&paths, wrap));
+    }
+    if let Command::Serve(ServeFlags {
+        reexec_probe: true, ..
+    }) = command
+    {
+        return Ok(reexec_probe(&paths));
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -172,9 +190,29 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
             Command::Doctor { no_version_check } => {
                 doctor::run(&paths, &doctor::Options::from_env(no_version_check)).await
             }
+            Command::Update(args) => update::run(&paths, args).await,
             Command::Statusline { .. } => unreachable!("handled before the runtime starts"),
         }
     })
+}
+
+/// `serve --reexec-probe`: a supervisor asks this before it re-executes into this binary. Fails
+/// (without quoting it: it may hold the proxy key) when `config.toml` does not load, since the
+/// new supervisor would then run on defaults.
+fn reexec_probe(paths: &Paths) -> i32 {
+    match crate::config::Config::load(paths).and_then(|c| c.validate().map(|()| c)) {
+        Ok(_) => {
+            println!("{}", crate::supervisor::resume::probe_line());
+            0
+        }
+        Err(_) => {
+            eprintln!(
+                "config.toml could not be loaded or is invalid; fix it (`pooltime doctor`) and \
+                 retry"
+            );
+            1
+        }
+    }
 }
 
 #[cfg(test)]

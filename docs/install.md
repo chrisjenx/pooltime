@@ -92,8 +92,10 @@ meanwhile). `pooltime service status` shows the supervisor and the worker genera
   (or `pooltime service restart`, which notices the old definition and reinstalls it). That
   restart still waits for in-flight requests like before; `pooltime doctor` warns until it is
   done.
-- The supervisor itself is only replaced by `pooltime service install` (a full restart that
-  drains first). It rarely changes; `service restart` says when it is older than the worker.
+- The supervisor itself is replaced by `pooltime update` without closing the port (see
+  [Upgrading](#upgrading)); a supervisor from before 1.3 only by `pooltime service install` (a
+  full restart that drains first). `pooltime doctor` and `service status` show the supervisor's
+  and worker's versions.
 - A changed `port` or `host` needs `pooltime service install`: the supervisor keeps the socket it
   bound.
 
@@ -109,7 +111,7 @@ meanwhile). `pooltime service status` shows the supervisor and the worker genera
   ```
 
 Both run `pooltime serve --supervise` with `POOLTIME_HOME` set; when installed by Homebrew they point at the
-stable `<prefix>/bin/pooltime` symlink, so `brew upgrade` needs only `pooltime service restart`.
+stable `<prefix>/bin/pooltime` symlink, so an upgrade takes effect without reinstalling the service.
 The service does not see your shell's `POOLTIME_PORT`/`POOLTIME_HOST`: put a non-default port in
 `config.toml` instead (see [Configuration](configuration.md)).
 
@@ -121,6 +123,44 @@ pooltime serve
 
 Stopping it (Ctrl-C / SIGTERM) drains in-flight requests for up to 10 minutes; a second signal
 stops it at once.
+
+## Upgrading
+
+```sh
+pooltime update --check   # installed, latest release and service versions; changes nothing
+pooltime update           # asks first; --yes (or -y) to skip the question, required without a terminal
+```
+
+`pooltime update` installs the latest [GitHub release](https://github.com/chrisjenx/pooltime/releases)
+the way this binary was installed:
+
+| Installed with | `pooltime update` runs |
+|---|---|
+| Homebrew (`<prefix>/Cellar/pooltime/...`) | `brew upgrade chrisjenx/tap/pooltime` |
+| the install script (a `pooltime` binary in a directory you can write, e.g. `~/.local/bin`) | that release's `install.sh` for the same directory: download, sha256 check, atomic replace |
+| `cargo install` (`~/.cargo/bin`) | nothing: it prints the `cargo install` command and exits 1 |
+| a build under a cargo `target/` directory, or anything else | nothing: it says what to do and exits 1 |
+
+Then, if the background service is running, it moves the service onto the new binary without
+closing the port: the supervisor (the process launchd/systemd started) replaces itself in place
+with the new binary (an `exec` in the same process, so the pid the service manager tracks stays
+the same), keeps the listening socket and its worker, starts a worker from the new binary and
+hands over to it as `service restart` does: in-flight requests and streams finish on the old
+worker, new ones go to the new one, nothing is refused. It prints the versions before and after.
+
+- Before replacing the supervisor, the new binary is asked whether it can take over (an older
+  binary cannot) and whether `config.toml` loads. If not, or if anything else goes wrong, the
+  running service keeps serving as it was and `pooltime update` prints why and exits 1.
+- Already on the latest release (say, after a manual `brew upgrade`)? `pooltime update` still
+  moves a service that runs an older version onto the installed binary.
+- A supervisor from before 1.3 cannot replace itself: `pooltime update` gives it new workers
+  (`service restart`) and tells you to run `pooltime service install` once.
+- No service running: only the binary is replaced.
+- The release check uses GitHub's API (`POOLTIME_RELEASES_API` points it elsewhere, as for
+  `doctor`); the install script honours `POOLTIME_RELEASE_BASE` (mirrors).
+
+The same in-place replacement can be triggered by hand with `kill -USR2 <supervisor pid>` (the pid
+is in `pooltime service status`); `SIGHUP` (`service restart`) keeps replacing only the workers.
 
 ## Data directory
 

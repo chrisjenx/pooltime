@@ -689,6 +689,47 @@ async fn doctor_reports_recent_error_rate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_checks_the_release_and_never_replaces_a_dev_build() {
+    const RELEASES: &str = "/repos/chrisjenx/pooltime/releases/latest";
+    let gh = FakeAnthropic::start().await;
+    gh.route(RELEASES, |_, _| {
+        Reply::json(200, &json!({"tag_name": "v99.0.0"}))
+    });
+    let m = Machine::new("http://127.0.0.1:9");
+    let api = format!("{}{RELEASES}", gh.url());
+    let env = [("POOLTIME_RELEASES_API", Some(api.as_str()))];
+
+    // --check: versions only, nothing changed (no service runs in this home).
+    let (ok, out) = tokio::task::block_in_place(|| m.run_env(&["update", "--check"], &env));
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(&format!("pooltime {}", env!("CARGO_PKG_VERSION"))),
+        "{out}"
+    );
+    assert!(out.contains("a development build"), "{out}");
+    assert!(
+        out.contains("latest release: 99.0.0 (run `pooltime update`)"),
+        "{out}"
+    );
+    assert!(out.contains("service:"), "{out}");
+
+    // The test binary lives under target/: it is never replaced, even with --yes.
+    let (ok, out) = tokio::task::block_in_place(|| m.run_env(&["update", "--yes"], &env));
+    assert!(!ok, "{out}");
+    assert!(out.contains("development build"), "{out}");
+    assert_eq!(gh.requests_to(RELEASES).len(), 2);
+
+    // Unreachable release API: an error, exit 1.
+    let closed = [(
+        "POOLTIME_RELEASES_API",
+        Some("http://127.0.0.1:9/releases/latest"),
+    )];
+    let (ok, out) = tokio::task::block_in_place(|| m.run_env(&["update", "--check"], &closed));
+    assert!(!ok, "{out}");
+    assert!(out.contains("latest release"), "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn doctor_version_check_opt_out() {
     const RELEASES: &str = "/repos/chrisjenx/pooltime/releases/latest";
     let fake = fake_upstream().await;
@@ -709,7 +750,7 @@ async fn doctor_version_check_opt_out() {
     let l = line_with(&out, "version:");
     assert!(l.starts_with('!'), "{out}");
     assert!(l.contains("99.0.0 available"), "{out}");
-    assert!(l.contains("brew upgrade pooltime"), "{out}");
+    assert!(l.contains("pooltime update"), "{out}");
     assert_eq!(gh.requests_to(RELEASES).len(), 1);
 
     // The flag opts out: no request at all.

@@ -101,6 +101,33 @@ pub struct SupervisorState {
     #[serde(default)]
     pub restarting: bool,
     pub last_restart: Option<RestartResult>,
+    /// This supervisor replaces itself in place on `SIGUSR2` (`pooltime update`); a supervisor
+    /// from before 1.3 leaves it out, and only `service install` replaces it.
+    #[serde(default)]
+    pub can_upgrade: bool,
+    /// Upgrades (`SIGUSR2`) finished so far, successful or not, counted across the re-exec:
+    /// `pooltime update` waits for this to go up.
+    #[serde(default)]
+    pub upgrades: u64,
+    /// An upgrade is under way (checking the new binary, waiting for a restart to finish, or the
+    /// new supervisor's first worker booting): another `SIGUSR2` now is ignored.
+    #[serde(default)]
+    pub upgrading: bool,
+    #[serde(default)]
+    pub last_upgrade: Option<UpgradeResult>,
+}
+
+/// How the last in-place upgrade of the supervisor went.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpgradeResult {
+    /// The supervisor runs the new binary and a worker generation from it is active.
+    pub ok: bool,
+    /// The supervisor's version before.
+    pub from_version: String,
+    /// The supervisor's version afterwards (the old one when the re-exec did not happen).
+    pub version: String,
+    /// Why it failed (never upstream text or credentials).
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +222,15 @@ mod tests {
             last_restart: Some(RestartResult {
                 ok: true,
                 generation: 2,
+                error: None,
+            }),
+            can_upgrade: true,
+            upgrades: 1,
+            upgrading: false,
+            last_upgrade: Some(UpgradeResult {
+                ok: true,
+                from_version: "0.9.0".into(),
+                version: "1.0.0".into(),
                 error: None,
             }),
         };

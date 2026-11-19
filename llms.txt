@@ -159,6 +159,10 @@ pooltime service status
 `doctor` exits 1 on any failure and prints the command that fixes each problem. Each account shows
 one state: ready, expiring, rate_limited, erroring, access_denied, billing, needs_login.
 
+To upgrade later: `pooltime update --check` reports the installed, latest and service versions;
+`pooltime update --yes` installs the latest release the way pooltime was installed (Homebrew or
+the install script) and moves the running service onto it without dropping a request.
+
 ## 7. Use
 
 Start `claude` in a connected profile; nothing else to configure. For the dashboard, tell the user
