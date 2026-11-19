@@ -4,6 +4,20 @@
 
 ### Added
 
+- `pooltime update`: installs the latest release the way pooltime was installed (`brew upgrade
+  chrisjenx/tap/pooltime` for Homebrew, the release's install script for a binary in a directory
+  you can write such as `~/.local/bin`; for `cargo install` and development builds it prints what
+  to run and exits 1), then moves the running service onto it without closing the port, the
+  supervisor included. `--check` reports the installed, latest and service versions and changes
+  nothing; `--yes` skips the question (required without a terminal). Already on the latest
+  release, it still moves a service that runs an older version.
+- The service's supervisor replaces itself in place on `SIGUSR2` (what `pooltime update` sends):
+  it checks the new binary, `exec`s it in the same process (the pid launchd/systemd track stays,
+  the listening socket and the worker are kept), then hands over to a worker from the new binary
+  like `service restart`. In-flight requests finish on the old worker, nothing is refused. If the
+  new binary cannot take over (an older one, or a `config.toml` that does not load) or the
+  `exec` fails, the running service keeps serving as it was and the error is reported.
+  `SIGHUP` / `service restart` still replace only the workers. Workers ignore `SIGUSR2`.
 - `pooltime accounts export <file>` and `pooltime accounts import <file>` move a pool to a new
   machine without signing every account in again. The export holds every account's sign-in,
   identity, priority and weights, plus `config.toml` (without the old machine's Claude Code
@@ -40,6 +54,12 @@
 - An empty pool's weekly burn read `-0.0 subs used`; it now reads `0.0`.
 - A desktop notification could fail to start with "text file busy" when the notifier program had
   just been written (seen in tests); starting it is now retried briefly.
+
+### Changed
+
+- `pooltime doctor`'s service line shows the supervisor's and worker's versions and warns when
+  either is older than the binary you run (with `pooltime update` as the fix). Its release check
+  now suggests `pooltime update`.
 
 ## 1.2.1 - 2026-11-15
 

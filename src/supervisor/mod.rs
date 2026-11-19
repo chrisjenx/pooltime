@@ -14,14 +14,21 @@
 //!   `force`), then the supervisor exits once they are gone. Workers ignore OS signals while
 //!   the supervisor is there, so a signal sent to the whole process group counts once.
 //!
-//! Deliberately small: no database, providers or HTTP. A running supervisor is not replaced by
-//! `service restart`, only by `service install` (a full restart), so its protocol with the
-//! workers ([`proto`]) must stay backward compatible.
+//! - `SIGUSR2` (`pooltime update`): replace the supervisor itself with the binary at the
+//!   configured path, in place: check the new binary, wait until no restart is under way,
+//!   `execve` it in this process (same pid, the port and the workers kept, see [`resume`]),
+//!   then the new supervisor starts a worker generation from it and hands off as on `SIGHUP`.
+//!   A new binary that fails its check, or an `exec` that fails, leaves everything as it was.
+//!
+//! Deliberately small: no database, providers or HTTP. `service restart` does not replace a
+//! running supervisor (only `SIGUSR2` or `service install` do), so its protocol with the workers
+//! ([`proto`]) must stay backward compatible.
 
 pub mod proto;
+pub mod resume;
 
 use std::io::{IsTerminal, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -36,7 +43,8 @@ use tokio::time::Instant;
 use crate::cli::ServeFlags;
 use crate::config::{Config, Paths};
 use crate::server::{health, shutdown};
-use proto::{FromWorker, RestartResult, SupervisorState, ToWorker};
+use proto::{FromWorker, RestartResult, SupervisorState, ToWorker, UpgradeResult};
+use resume::{Resume, ResumedWorker};
 
 /// How long a new worker may take to report `ready`.
 pub const BOOT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -46,6 +54,10 @@ pub const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const STABLE_AFTER: Duration = Duration::from_secs(60);
 /// Unexpected worker exits in a row before the supervisor gives up.
 pub const MAX_FAILURES: u32 = 5;
+/// How long the new binary may take to answer its probe before an upgrade.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long an upgrade waits for a restart under way to finish before giving up.
+pub const UPGRADE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// A draining worker still alive this long after its handoff is killed (its own drain budget,
 /// refresh drain and store flush come first).
 const DRAIN_BACKSTOP: Duration = Duration::from_secs(shutdown::DRAIN_TIMEOUT.as_secs() + 120);
@@ -73,44 +85,120 @@ pub fn worker_exe() -> PathBuf {
 
 /// Run the supervisor until it is stopped; returns the exit code.
 pub async fn run(paths: Paths, flags: ServeFlags) -> anyhow::Result<i32> {
-    paths
-        .ensure()
-        .context("creating the pooltime data directory")?;
-    let mut cfg = Config::load(&paths)?;
+    // The stop/restart/upgrade signals reach this (main) thread only: the runtime's threads
+    // block them from their start (see `cli::run`), and so does the log writer thread, spawned
+    // below while they are blocked here too. Unblocked once the handlers are in
+    // (`Supervisor::run`). A signal meanwhile stays pending instead of killing the process.
+    resume::block_signals();
+    let resume = flags.resume.as_deref().map(Resume::parse).transpose()?;
+    // Re-executed, this process holds the workers' control sockets: an error from here on must
+    // not end it (the workers would drain and a restarted supervisor could find the port taken).
+    // It carries on with what it has; stderr goes to the service manager's log.
+    if let Err(e) = paths.ensure() {
+        if resume.is_none() {
+            return Err(e).context("creating the pooltime data directory");
+        }
+        eprintln!("pooltime supervisor: preparing the data directory failed: {e:#}");
+    }
+    let mut cfg = match Config::load(&paths) {
+        Ok(c) => c,
+        // Re-executed: the workers and the port depend on this process, so a config.toml that
+        // broke since the probe must not stop it (the port and host are the socket's anyway).
+        Err(_) if resume.is_some() => {
+            eprintln!("pooltime supervisor: config.toml could not be loaded; using defaults");
+            Config::default()
+        }
+        Err(e) => return Err(e),
+    };
     if let Some(port) = flags.port {
         cfg.port = port;
     }
     if let Some(host) = flags.host {
         cfg.host = host;
     }
-    cfg.validate()?;
-    let _log = crate::logging::init(&paths, &cfg.retention, std::io::stderr().is_terminal())?;
+    if resume.is_none() {
+        cfg.validate()?;
+    }
+    let _log = match crate::logging::init(&paths, &cfg.retention, std::io::stderr().is_terminal()) {
+        Ok(g) => Some(g),
+        Err(e) if resume.is_some() => {
+            eprintln!("pooltime supervisor: no log file ({e:#}); logging to stderr only");
+            None
+        }
+        Err(e) => return Err(e),
+    };
     crate::logging::install_panic_hook();
 
-    health::preflight(&cfg).await?;
-    let listener = shutdown::bind(&cfg)
-        .await?
-        .into_std()
-        .context("preparing the listener")?;
+    let listener = match &resume {
+        // Without the socket no new worker can start, but the adopted ones keep serving on
+        // their own copies of it.
+        Some(r) => match take_listener(r.listen_fd) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                tracing::error!(error = %e, "the listening socket did not survive the re-exec; the adopted workers keep serving");
+                eprintln!("pooltime supervisor: {e:#}");
+                None
+            }
+        },
+        None => {
+            health::preflight(&cfg).await?;
+            Some(
+                shutdown::bind(&cfg)
+                    .await?
+                    .into_std()
+                    .context("preparing the listener")?,
+            )
+        }
+    };
     let exe = worker_exe();
-    tracing::info!(
-        host = %cfg.host, port = cfg.port,
-        version = env!("CARGO_PKG_VERSION"),
-        worker = %exe.display(),
-        "pooltime supervisor starting"
-    );
+    match &resume {
+        Some(r) => tracing::info!(
+            from = %r.from_version,
+            version = env!("CARGO_PKG_VERSION"),
+            workers = r.workers.len(),
+            worker = %exe.display(),
+            "pooltime supervisor re-executed in place"
+        ),
+        None => tracing::info!(
+            host = %cfg.host, port = cfg.port,
+            version = env!("CARGO_PKG_VERSION"),
+            worker = %exe.display(),
+            "pooltime supervisor starting"
+        ),
+    }
+    let binary = exe.display().to_string();
     let launcher = ProcessLauncher {
         exe,
-        listen_fd: listener.as_raw_fd(),
+        listen_fd: listener.as_ref().map_or(-1, |l| l.as_raw_fd()),
         i_stopped_bro: flags.i_stopped_bro,
     };
     let mut sup = Supervisor::new(paths.clone(), launcher);
+    sup.state.binary = Some(binary);
+    if let Some(r) = resume {
+        sup.adopt(r);
+    }
     let code = sup.run().await;
     drop(listener);
     let _ = std::fs::remove_file(proto::state_path(&paths));
     let code = code?;
     tracing::info!(code, "pooltime supervisor stopped");
     Ok(code)
+}
+
+/// The listening socket a re-executing supervisor left at `fd`.
+fn take_listener(fd: RawFd) -> anyhow::Result<std::net::TcpListener> {
+    use crate::server::handoff::{fd_is_socket, is_stream, set_cloexec};
+    if fd < 3 || !fd_is_socket(fd) || !is_stream(fd) {
+        anyhow::bail!("--resume: descriptor {fd} is not the listening socket");
+    }
+    // SAFETY: an open stream socket inherited across exec (checked above); nothing else in this
+    // process refers to it.
+    let listener = unsafe { std::net::TcpListener::from_raw_fd(fd) };
+    set_cloexec(fd).context("marking the listener close-on-exec")?;
+    listener
+        .local_addr()
+        .context("--resume: the inherited descriptor is not a TCP listener")?;
+    Ok(listener)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,12 +216,18 @@ enum Phase {
 /// The supervisor's end of one worker's control socket.
 trait Ctl: Send {
     fn send(&self, msg: ToWorker) -> std::io::Result<()>;
+    /// The descriptor handed across a re-exec.
+    fn raw_fd(&self) -> RawFd;
 }
 
 impl Ctl for UnixStream {
     fn send(&self, msg: ToWorker) -> std::io::Result<()> {
         let mut s: &UnixStream = self;
         s.write_all(msg.line().as_bytes())
+    }
+
+    fn raw_fd(&self) -> RawFd {
+        self.as_raw_fd()
     }
 }
 
@@ -146,6 +240,22 @@ trait Launcher {
         events: mpsc::UnboundedSender<Event>,
     ) -> std::io::Result<(u32, Box<dyn Ctl>)>;
     fn kill(&mut self, pid: u32);
+    /// Take over a worker a re-executed supervisor left behind.
+    fn adopt(
+        &mut self,
+        w: &ResumedWorker,
+        events: mpsc::UnboundedSender<Event>,
+    ) -> std::io::Result<Box<dyn Ctl>>;
+    /// Ask the binary workers run whether it can take over this supervisor; the answer arrives
+    /// as [`Event::Probed`].
+    fn probe(&mut self, events: mpsc::UnboundedSender<Event>);
+    /// The listening socket's descriptor.
+    fn listen_fd(&self) -> RawFd;
+    /// Replace this process with that binary, passing `state`. Returns only on failure.
+    fn reexec(&mut self, state: &Resume) -> std::io::Error;
+    /// Block (or unblock) the stop/restart/upgrade signals on the supervisor's thread, the only
+    /// one that takes them: blocked, they stay pending across the `exec`.
+    fn guard_signals(&mut self, on: bool);
 }
 
 struct Worker {
@@ -162,6 +272,8 @@ struct Worker {
 enum Event {
     Msg(u64, FromWorker),
     Exited(u64, String),
+    /// The new binary's probe: its version, or why it cannot take over.
+    Probed(Result<String, String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +284,23 @@ enum Why {
     Restart,
     /// After a worker died.
     Respawn,
+    /// The first generation of a supervisor that re-executed in place.
+    Upgrade,
+}
+
+impl Why {
+    /// Someone waits for this generation's outcome (`service restart`, `pooltime update`).
+    fn reported(self) -> bool {
+        matches!(self, Why::Restart | Why::Upgrade)
+    }
+}
+
+/// An upgrade (`SIGUSR2`) on its way to the `exec`.
+enum Upgrade {
+    /// The new binary is being asked.
+    Probing { deadline: Instant },
+    /// It can take over (it is this version): `exec` as soon as no restart is under way.
+    Ready { version: String, deadline: Instant },
 }
 
 struct Boot {
@@ -206,7 +335,17 @@ struct Supervisor<L: Launcher> {
     exit_code: i32,
     state: SupervisorState,
     published: Option<SupervisorState>,
+    upgrade: Option<Upgrade>,
+    /// Re-executed from this version; cleared once the upgrade's generation has its outcome.
+    resumed_from: Option<String>,
+    /// Signals are blocked for the `exec` due then: until that moment the loop keeps running,
+    /// so a signal taken just before the block is still acted on (and calls the `exec` off).
+    exec_at: Option<Instant>,
 }
+
+/// Between blocking the signals and the `exec`: long enough for the runtime to hand over a
+/// signal caught just before the block, and for the log writer to write the last lines.
+const EXEC_GRACE: Duration = Duration::from_millis(150);
 
 impl<L: Launcher> Supervisor<L> {
     fn new(paths: Paths, launcher: L) -> Supervisor<L> {
@@ -227,9 +366,57 @@ impl<L: Launcher> Supervisor<L> {
             state: SupervisorState {
                 pid: std::process::id(),
                 version: env!("CARGO_PKG_VERSION").into(),
+                can_upgrade: true,
                 ..SupervisorState::default()
             },
             published: None,
+            upgrade: None,
+            resumed_from: None,
+            exec_at: None,
+        }
+    }
+
+    /// Continue where the supervisor that re-executed into this one stopped: its workers, its
+    /// generation numbers and counters. [`Supervisor::run`] then starts a generation from the
+    /// new binary.
+    fn adopt(&mut self, r: Resume) {
+        self.next_gen = self.next_gen.max(r.next_gen);
+        self.state.restarts = r.restarts;
+        self.state.last_restart = r.last_restart;
+        self.state.upgrades = r.upgrades;
+        self.resumed_from = Some(r.from_version);
+        for w in &r.workers {
+            match self.launcher.adopt(w, self.tx.clone()) {
+                Ok(ctl) => {
+                    let since = Instant::now()
+                        .checked_sub(Duration::from_secs(w.age_secs))
+                        .unwrap_or_else(Instant::now);
+                    tracing::info!(
+                        generation = w.gen,
+                        pid = w.pid,
+                        active = w.active,
+                        "worker adopted"
+                    );
+                    self.workers.push(Worker {
+                        gen: w.gen,
+                        pid: w.pid,
+                        ctl,
+                        phase: if w.active {
+                            Phase::Active
+                        } else {
+                            Phase::Draining
+                        },
+                        version: w.version.clone(),
+                        since,
+                        killed: false,
+                    });
+                }
+                // Its control socket is closed now, so it hands off and drains on its own.
+                Err(e) => tracing::error!(
+                    generation = w.gen, pid = w.pid, error = %e,
+                    "could not adopt a worker; it drains on its own"
+                ),
+            }
         }
     }
 
@@ -237,8 +424,16 @@ impl<L: Launcher> Supervisor<L> {
         let mut hup = signal(SignalKind::hangup()).context("installing signal handlers")?;
         let mut term = signal(SignalKind::terminate()).context("installing signal handlers")?;
         let mut int = signal(SignalKind::interrupt()).context("installing signal handlers")?;
-        self.start(Why::Initial);
+        let mut usr2 = signal(SignalKind::user_defined2()).context("installing signal handlers")?;
+        // Blocked across a re-exec; delivered (if one came) now that the handlers are in.
+        resume::unblock_signals();
+        self.start(if self.resumed_from.is_some() {
+            Why::Upgrade
+        } else {
+            Why::Initial
+        });
         loop {
+            self.maybe_reexec();
             self.publish();
             if self.done() {
                 return Ok(self.exit_code);
@@ -246,6 +441,7 @@ impl<L: Launcher> Supervisor<L> {
             let deadline = self.next_deadline();
             tokio::select! {
                 _ = hup.recv() => self.on_restart(),
+                _ = usr2.recv() => self.on_upgrade(),
                 _ = term.recv() => self.on_stop("SIGTERM"),
                 _ = int.recv() => self.on_stop("SIGINT"),
                 Some(ev) = self.rx.recv() => self.on_event(ev),
@@ -267,6 +463,7 @@ impl<L: Launcher> Supervisor<L> {
         match ev {
             Event::Msg(gen, m) => self.on_message(gen, m),
             Event::Exited(gen, status) => self.on_exit(gen, &status),
+            Event::Probed(res) => self.on_probed(res),
         }
     }
 
@@ -316,8 +513,8 @@ impl<L: Launcher> Supervisor<L> {
                 tracing::error!(generation = gen, error = %why_text, "worker not started");
                 match why {
                     Why::Initial => self.fail(),
-                    Why::Restart => {
-                        self.finish_restart(false, Some(why_text));
+                    Why::Restart | Why::Upgrade => {
+                        self.finish_restart(why, false, Some(why_text));
                         self.crashed();
                     }
                     Why::Respawn => self.crashed(),
@@ -413,8 +610,8 @@ impl<L: Launcher> Supervisor<L> {
         w.since = Instant::now();
         self.tell(gen, ToWorker::Active);
         tracing::info!(generation = gen, "worker active");
-        if why == Why::Restart {
-            self.finish_restart(true, None);
+        if why.reported() {
+            self.finish_restart(why, true, None);
         }
     }
 
@@ -446,8 +643,12 @@ impl<L: Launcher> Supervisor<L> {
             tracing::error!(generation = gen, reason = ?b.why, error = %why_text, "worker failed to start");
             match b.why {
                 Why::Initial => self.fail(),
-                Why::Restart => {
-                    self.finish_restart(false, Some(format!("{why_text}; see `pooltime logs`")));
+                Why::Restart | Why::Upgrade => {
+                    self.finish_restart(
+                        b.why,
+                        false,
+                        Some(format!("{why_text}; see `pooltime logs`")),
+                    );
                     self.crashed();
                 }
                 Why::Respawn => self.crashed(),
@@ -464,8 +665,12 @@ impl<L: Launcher> Supervisor<L> {
         {
             let (_, why) = r.new.take().expect("checked");
             tracing::error!(generation = gen, %status, "the new worker exited during the handoff");
-            if why == Why::Restart {
-                self.finish_restart(false, Some(format!("the new worker exited ({status})")));
+            if why.reported() {
+                self.finish_restart(
+                    why,
+                    false,
+                    Some(format!("the new worker exited ({status})")),
+                );
             }
             self.crashed();
             return;
@@ -525,6 +730,13 @@ impl<L: Launcher> Supervisor<L> {
             self.respawn_at = None;
             self.start(Why::Respawn);
         }
+        if self.upgrade_deadline().is_some_and(|d| now >= d) {
+            let why = match self.upgrade {
+                Some(Upgrade::Probing { .. }) => "the new binary did not answer its check in time",
+                _ => "the service was busy restarting workers the whole time; try again",
+            };
+            self.finish_upgrade(false, Some(why.into()));
+        }
         for w in &self.workers {
             if w.phase == Phase::Draining
                 && !w.killed
@@ -561,6 +773,8 @@ impl<L: Launcher> Supervisor<L> {
             boot,
             self.release.as_ref().map(|r| r.deadline),
             self.respawn_at,
+            self.upgrade_deadline(),
+            self.exec_at,
         ]
         .into_iter()
         .flatten()
@@ -585,12 +799,147 @@ impl<L: Launcher> Supervisor<L> {
         self.start(Why::Restart);
     }
 
+    fn upgrade_deadline(&self) -> Option<Instant> {
+        match self.upgrade {
+            Some(Upgrade::Probing { deadline } | Upgrade::Ready { deadline, .. }) => Some(deadline),
+            None => None,
+        }
+    }
+
+    /// `SIGUSR2`: replace the supervisor with the binary at the configured path.
+    fn on_upgrade(&mut self) {
+        if self.stopping > 0 {
+            return;
+        }
+        if self.upgrade.is_some() || self.resumed_from.is_some() {
+            tracing::info!("SIGUSR2: an upgrade is already in progress");
+            return;
+        }
+        tracing::info!("SIGUSR2: checking the new binary before replacing the supervisor");
+        self.upgrade = Some(Upgrade::Probing {
+            deadline: Instant::now() + PROBE_TIMEOUT + Duration::from_secs(5),
+        });
+        self.launcher.probe(self.tx.clone());
+    }
+
+    fn on_probed(&mut self, res: Result<String, String>) {
+        if !matches!(self.upgrade, Some(Upgrade::Probing { .. })) {
+            return;
+        }
+        match res {
+            Ok(version) => {
+                tracing::info!(%version, "the new binary can take over the supervisor");
+                self.upgrade = Some(Upgrade::Ready {
+                    version,
+                    deadline: Instant::now() + UPGRADE_IDLE_TIMEOUT,
+                });
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "not replacing the supervisor");
+                self.finish_upgrade(false, Some(e));
+            }
+        }
+    }
+
+    /// `exec` the new binary once an upgrade is ready and nothing is half-way: no generation
+    /// booting or releasing (its messages would be lost across the `exec`), none to respawn.
+    fn maybe_reexec(&mut self) {
+        let ready = matches!(self.upgrade, Some(Upgrade::Ready { .. }));
+        let idle = ready
+            && self.stopping == 0
+            && !self.restarting()
+            && self.respawn_at.is_none()
+            && self.workers.iter().any(|w| w.phase == Phase::Active)
+            && self
+                .workers
+                .iter()
+                .all(|w| matches!(w.phase, Phase::Active | Phase::Draining));
+        if !idle {
+            self.disarm();
+            return;
+        }
+        // First block the signals and let the loop run a little: a signal the runtime caught
+        // before the block arrives meanwhile (a stop or restart then calls this off until it is
+        // done; one that comes later stays pending and is delivered to the new process).
+        let Some(at) = self.exec_at else {
+            self.launcher.guard_signals(true);
+            self.exec_at = Some(Instant::now() + EXEC_GRACE);
+            return;
+        };
+        if Instant::now() < at {
+            return;
+        }
+        let Some(Upgrade::Ready { version, .. }) = &self.upgrade else {
+            return;
+        };
+        let state = Resume {
+            proto: resume::PROTO,
+            listen_fd: self.launcher.listen_fd(),
+            next_gen: self.next_gen,
+            from_version: self.state.version.clone(),
+            restarts: self.state.restarts,
+            last_restart: self.state.last_restart.clone(),
+            upgrades: self.state.upgrades,
+            workers: self
+                .workers
+                .iter()
+                .map(|w| ResumedWorker {
+                    gen: w.gen,
+                    pid: w.pid,
+                    ctl_fd: w.ctl.raw_fd(),
+                    active: w.phase == Phase::Active,
+                    version: w.version.clone(),
+                    age_secs: w.since.elapsed().as_secs(),
+                })
+                .collect(),
+        };
+        tracing::info!(
+            from = %self.state.version, to = %version,
+            workers = state.workers.len(),
+            "re-executing the supervisor in place"
+        );
+        let err = self.launcher.reexec(&state);
+        self.disarm();
+        tracing::error!(error = %err, "could not re-execute the supervisor; it keeps running");
+        self.finish_upgrade(
+            false,
+            Some(format!("could not start the new supervisor: {err}")),
+        );
+    }
+
+    /// Unblock the signals if an `exec` was due.
+    fn disarm(&mut self) {
+        if self.exec_at.take().is_some() {
+            self.launcher.guard_signals(false);
+        }
+    }
+
+    /// Record an upgrade's outcome (`pooltime update` waits for `upgrades` to go up).
+    fn finish_upgrade(&mut self, ok: bool, error: Option<String>) {
+        self.upgrade = None;
+        let from = self
+            .resumed_from
+            .take()
+            .unwrap_or_else(|| self.state.version.clone());
+        self.state.upgrades += 1;
+        self.state.last_upgrade = Some(UpgradeResult {
+            ok,
+            from_version: from,
+            version: self.state.version.clone(),
+            error,
+        });
+    }
+
     /// The first stop signal tells every worker to `stop` (drain), any further one to `force`.
     /// Over the control socket, not as signals: a worker may get the same `SIGTERM` directly
     /// (process-group signal, `pkill`), and must not count it twice.
     fn on_stop(&mut self, name: &str) {
         self.stopping += 1;
         self.respawn_at = None;
+        if self.upgrade.is_some() || self.resumed_from.is_some() {
+            self.finish_upgrade(false, Some("the service is stopping".into()));
+        }
+        self.disarm();
         let msg = if self.stopping == 1 {
             ToWorker::Stop
         } else {
@@ -616,7 +965,17 @@ impl<L: Launcher> Supervisor<L> {
         }
     }
 
-    fn finish_restart(&mut self, ok: bool, error: Option<String>) {
+    fn finish_restart(&mut self, why: Why, ok: bool, error: Option<String>) {
+        if why == Why::Upgrade {
+            let upgrade_error = error.as_ref().map(|e| {
+                format!(
+                    "the supervisor now runs {}, but the first worker from it failed: {e}; the \
+                     previous worker keeps serving",
+                    self.state.version
+                )
+            });
+            self.finish_upgrade(ok, upgrade_error);
+        }
         if ok {
             self.failures = 0;
         }
@@ -652,6 +1011,7 @@ impl<L: Launcher> Supervisor<L> {
             .map(|w| w.pid)
             .collect();
         self.state.restarting = self.restarting();
+        self.state.upgrading = self.upgrade.is_some() || self.resumed_from.is_some();
         if self.published.as_ref() == Some(&self.state) {
             return;
         }
@@ -693,6 +1053,12 @@ impl Launcher for ProcessLauncher {
         let (ours, theirs) = UnixStream::pair()?;
         let control_fd = theirs.as_raw_fd();
         let listen_fd = self.listen_fd;
+        if listen_fd < 0 {
+            return Err(std::io::Error::other(
+                "the listening socket was lost in the re-exec; `pooltime service restart` \
+                 after the old workers exit, or `pooltime service install`",
+            ));
+        }
         let mut cmd = tokio::process::Command::new(&self.exe);
         cmd.arg("serve")
             .arg("--listen-fd")
@@ -752,6 +1118,142 @@ impl Launcher for ProcessLauncher {
             }
         }
     }
+
+    fn adopt(
+        &mut self,
+        w: &ResumedWorker,
+        events: mpsc::UnboundedSender<Event>,
+    ) -> std::io::Result<Box<dyn Ctl>> {
+        use crate::server::handoff::{fd_is_socket, set_cloexec};
+        let (gen, pid, fd) = (w.gen, w.pid, w.ctl_fd);
+        let reader = if fd >= 3 && fd_is_socket(fd) {
+            // SAFETY: an open socket inherited across exec (checked above), named once in the
+            // resume state; this is its only owner.
+            let ours = unsafe { UnixStream::from_raw_fd(fd) };
+            set_cloexec(fd)?;
+            let reader = ours.try_clone()?;
+            reader.set_nonblocking(true)?;
+            Ok((ours, tokio::net::UnixStream::from_std(reader)?))
+        } else {
+            Err(std::io::Error::other(format!(
+                "control descriptor {fd} is not a socket"
+            )))
+        };
+        // Not spawned by this process image, so no `Child` to wait on: reap it by pid (on
+        // SIGCHLD, and once a second in case one is missed). Done even when its control socket
+        // is unusable, so it never lingers as a zombie.
+        let (ctl, lines) = match reader {
+            Ok((ours, reader)) => (Ok(ours), Some(BufReader::new(reader).lines())),
+            Err(e) => (Err(e), None),
+        };
+        tokio::spawn(async move {
+            let mut sigchld = signal(SignalKind::child()).ok();
+            let mut lines = lines;
+            loop {
+                if let Some(status) = resume::reap(pid) {
+                    let _ = events.send(Event::Exited(gen, status));
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    l = async { lines.as_mut().expect("checked").next_line().await },
+                        if lines.is_some() => match l {
+                        Ok(Some(l)) => {
+                            if let Some(m) = FromWorker::parse(&l) {
+                                let _ = events.send(Event::Msg(gen, m));
+                            }
+                        }
+                        _ => lines = None,
+                    },
+                    _ = async {
+                        match sigchld.as_mut() {
+                            Some(s) => { s.recv().await; }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {}
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+        });
+        Ok(Box::new(ctl?))
+    }
+
+    fn probe(&mut self, events: mpsc::UnboundedSender<Event>) {
+        let exe = self.exe.clone();
+        tokio::spawn(async move {
+            let _ = events.send(Event::Probed(probe_binary(&exe).await));
+        });
+    }
+
+    fn listen_fd(&self) -> RawFd {
+        self.listen_fd
+    }
+
+    fn guard_signals(&mut self, on: bool) {
+        if on {
+            resume::block_signals();
+        } else {
+            resume::unblock_signals();
+        }
+    }
+
+    fn reexec(&mut self, state: &Resume) -> std::io::Error {
+        let fds = state.fds();
+        for fd in &fds {
+            if let Err(e) = inherit(*fd) {
+                restore_cloexec(&fds);
+                return e;
+            }
+        }
+        let argv = resume::argv(&self.exe, std::env::args_os().skip(1), &state.to_arg());
+        let err = resume::exec(&argv);
+        restore_cloexec(&fds);
+        err
+    }
+}
+
+fn restore_cloexec(fds: &[RawFd]) {
+    for fd in fds {
+        let _ = crate::server::handoff::set_cloexec(*fd);
+    }
+}
+
+/// Run `exe serve --reexec-probe`: the version it answers with, or why it cannot take over.
+async fn probe_binary(exe: &std::path::Path) -> Result<String, String> {
+    let mut cmd = tokio::process::Command::new(exe);
+    cmd.args(["serve", "--reexec-probe"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let out = match tokio::time::timeout(PROBE_TIMEOUT, cmd.output()).await {
+        Err(_) => {
+            return Err(format!(
+                "{} did not answer its check within {}s",
+                exe.display(),
+                PROBE_TIMEOUT.as_secs()
+            ))
+        }
+        Ok(Err(e)) => return Err(format!("could not run {}: {e}", exe.display())),
+        Ok(Ok(out)) => out,
+    };
+    if !out.status.success() {
+        // The probe's own messages, or an older binary's usage error: never secrets.
+        let why: String = String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("no message")
+            .chars()
+            .take(200)
+            .collect();
+        return Err(format!(
+            "{} cannot take over the supervisor ({}): {why}",
+            exe.display(),
+            out.status
+        ));
+    }
+    resume::check_probe(&String::from_utf8_lossy(&out.stdout))
 }
 
 #[cfg(test)]
@@ -792,11 +1294,19 @@ mod tests {
                 .push(format!("{} {}", self.0, msg.line().trim()));
             Ok(())
         }
+
+        fn raw_fd(&self) -> RawFd {
+            100 + self.0 as RawFd
+        }
     }
 
     #[derive(Default)]
     struct Fake {
         log: Log,
+        /// What the next `reexec` returns (it only ever returns on failure).
+        exec_error: Option<String>,
+        /// The state the last `reexec` was given.
+        execed: Option<Resume>,
     }
 
     impl Launcher for Fake {
@@ -811,6 +1321,39 @@ mod tests {
 
         fn kill(&mut self, pid: u32) {
             self.log.lock().unwrap().push(format!("kill {pid}"));
+        }
+
+        fn adopt(
+            &mut self,
+            w: &ResumedWorker,
+            _: mpsc::UnboundedSender<Event>,
+        ) -> std::io::Result<Box<dyn Ctl>> {
+            self.log.lock().unwrap().push(format!("{} adopt", w.gen));
+            if w.ctl_fd < 0 {
+                return Err(std::io::Error::other("closed"));
+            }
+            Ok(Box::new(FakeCtl(w.gen, self.log.clone())))
+        }
+
+        fn probe(&mut self, _: mpsc::UnboundedSender<Event>) {
+            self.log.lock().unwrap().push("probe".into());
+        }
+
+        fn listen_fd(&self) -> RawFd {
+            3
+        }
+
+        fn guard_signals(&mut self, on: bool) {
+            self.log
+                .lock()
+                .unwrap()
+                .push(if on { "block" } else { "unblock" }.into());
+        }
+
+        fn reexec(&mut self, state: &Resume) -> std::io::Error {
+            self.log.lock().unwrap().push("exec".into());
+            self.execed = Some(state.clone());
+            std::io::Error::other(self.exec_error.clone().unwrap_or_else(|| "fake".into()))
         }
     }
 
@@ -967,5 +1510,267 @@ mod tests {
         s.on_exit(1, "exit status: 1");
         assert!(s.done());
         assert_eq!(s.exit_code, 1);
+    }
+
+    #[tokio::test]
+    async fn upgrade_probes_waits_for_a_restart_to_finish_then_execs_with_every_worker() {
+        let (_d, mut s, log) = sup();
+        s.start(Why::Initial);
+        s.on_message(1, ready(1));
+        s.on_restart();
+        s.on_message(2, ready(2));
+        take(&log);
+
+        // SIGUSR2 while generation 1 is still releasing: probe now, exec later.
+        s.on_upgrade();
+        s.on_upgrade();
+        assert_eq!(take(&log), ["probe"], "a second SIGUSR2 starts nothing");
+        s.publish();
+        assert!(s.state.upgrading && s.state.can_upgrade);
+        s.on_probed(Ok("9.9.9".into()));
+        s.maybe_reexec();
+        assert!(take(&log).is_empty(), "a restart is under way: no exec yet");
+
+        s.on_message(1, FromWorker::Released);
+        assert_eq!(take(&log), ["2 active"]);
+        s.launcher.exec_error = Some("Exec format error".into());
+        s.maybe_reexec();
+        assert_eq!(
+            take(&log),
+            ["block"],
+            "signals blocked first; the exec waits a moment"
+        );
+        s.maybe_reexec();
+        assert!(take(&log).is_empty(), "not yet");
+        assert!(s.next_deadline().is_some());
+        s.exec_at = Some(Instant::now());
+        s.maybe_reexec();
+        assert_eq!(take(&log), ["exec", "unblock"]);
+        let r = s.launcher.execed.clone().unwrap();
+        assert_eq!(r.listen_fd, 3);
+        assert_eq!(r.next_gen, 3);
+        assert_eq!(r.restarts, 1);
+        assert_eq!(r.from_version, env!("CARGO_PKG_VERSION"));
+        let w: Vec<_> = r
+            .workers
+            .iter()
+            .map(|w| (w.gen, w.pid, w.ctl_fd, w.active))
+            .collect();
+        assert_eq!(w, [(1, 1001, 101, false), (2, 1002, 102, true)]);
+
+        // The exec failed: everything keeps running, the failure is recorded once.
+        let u = s.state.last_upgrade.clone().unwrap();
+        assert!(!u.ok);
+        assert!(u.error.unwrap().contains("Exec format error"));
+        assert_eq!(s.state.upgrades, 1);
+        s.maybe_reexec();
+        assert!(take(&log).is_empty());
+        s.publish();
+        assert!(!s.state.upgrading);
+        assert_eq!(s.state.generation, 2);
+    }
+
+    /// Drive an upgrade up to the moment the signals are blocked for the exec.
+    fn armed() -> (tempfile::TempDir, Supervisor<Fake>, Log) {
+        let (d, mut s, log) = sup();
+        s.start(Why::Initial);
+        s.on_message(1, ready(1));
+        s.on_upgrade();
+        s.on_probed(Ok("9.9.9".into()));
+        s.maybe_reexec();
+        assert_eq!(take(&log), ["1 spawn", "1 active", "probe", "block"]);
+        (d, s, log)
+    }
+
+    #[tokio::test]
+    async fn a_restart_signal_caught_before_the_block_calls_the_exec_off_until_it_is_done() {
+        let (_d, mut s, log) = armed();
+        // SIGHUP handed over by the runtime during the grace: the restart runs first.
+        s.on_restart();
+        s.exec_at = Some(Instant::now());
+        s.maybe_reexec();
+        assert_eq!(take(&log), ["2 spawn", "unblock"]);
+        s.on_message(2, ready(2));
+        s.on_message(1, FromWorker::Released);
+        take(&log);
+        // Idle again: blocked again, then the exec.
+        s.maybe_reexec();
+        s.exec_at = Some(Instant::now());
+        s.maybe_reexec();
+        assert_eq!(take(&log), ["block", "exec", "unblock"]);
+    }
+
+    #[tokio::test]
+    async fn a_stop_signal_caught_before_the_block_cancels_the_upgrade() {
+        let (_d, mut s, log) = armed();
+        s.on_stop("SIGTERM");
+        assert_eq!(take(&log), ["unblock", "1 stop"]);
+        s.maybe_reexec();
+        assert!(take(&log).is_empty(), "no exec");
+        let u = s.state.last_upgrade.clone().unwrap();
+        assert!(!u.ok && u.error.unwrap().contains("stopping"));
+    }
+
+    #[tokio::test]
+    async fn a_stop_while_the_resumed_supervisors_first_worker_boots_records_the_upgrade() {
+        let (_d, mut s, _log) = sup();
+        s.adopt(resumed(vec![rw(4, 8, true)]));
+        s.start(Why::Upgrade);
+        s.on_stop("SIGTERM");
+        assert_eq!(s.state.upgrades, 2);
+        let u = s.state.last_upgrade.clone().unwrap();
+        assert!(!u.ok, "{u:?}");
+        assert_eq!(u.from_version, "1.2.9");
+        assert!(u.error.unwrap().contains("stopping"));
+        s.publish();
+        assert!(!s.state.upgrading);
+        // Its boot ending afterwards records nothing more.
+        s.on_exit(5, "exit status: 0");
+        assert_eq!(s.state.upgrades, 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_probe_is_reported_and_changes_nothing() {
+        let (_d, mut s, log) = sup();
+        s.start(Why::Initial);
+        s.on_message(1, ready(1));
+        take(&log);
+        s.on_upgrade();
+        s.on_probed(Err("the new binary does not support it".into()));
+        s.maybe_reexec();
+        assert_eq!(take(&log), ["probe"]);
+        let u = s.state.last_upgrade.clone().unwrap();
+        assert!(!u.ok && u.error.unwrap().contains("does not support"));
+        // A late answer for an upgrade that is over is ignored.
+        s.on_probed(Ok("9.9.9".into()));
+        s.maybe_reexec();
+        assert!(take(&log).is_empty());
+        assert_eq!(s.state.upgrades, 1);
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_gives_up_when_the_service_never_settles_or_stops() {
+        let (_d, mut s, log) = sup();
+        s.start(Why::Initial);
+        s.on_message(1, ready(1));
+        s.on_restart(); // generation 2 boots and never gets ready
+        s.on_upgrade();
+        s.on_probed(Ok("9.9.9".into()));
+        if let Some(Upgrade::Ready { deadline, .. }) = s.upgrade.as_mut() {
+            *deadline = Instant::now();
+        }
+        s.on_timer();
+        let u = s.state.last_upgrade.clone().unwrap();
+        assert!(u.error.unwrap().contains("busy"));
+
+        s.on_upgrade();
+        s.on_stop("SIGTERM");
+        assert_eq!(s.state.upgrades, 2);
+        assert!(s
+            .state
+            .last_upgrade
+            .clone()
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("stopping"));
+        take(&log);
+        s.on_upgrade();
+        assert!(take(&log).is_empty(), "no upgrade while stopping");
+    }
+
+    fn resumed(workers: Vec<ResumedWorker>) -> Resume {
+        Resume {
+            proto: resume::PROTO,
+            listen_fd: 3,
+            next_gen: 5,
+            from_version: "1.2.9".into(),
+            restarts: 3,
+            last_restart: None,
+            upgrades: 1,
+            workers,
+        }
+    }
+
+    fn rw(gen: u64, ctl_fd: RawFd, active: bool) -> ResumedWorker {
+        ResumedWorker {
+            gen,
+            pid: 1000 + gen as u32,
+            ctl_fd,
+            active,
+            version: Some("1.2.9".into()),
+            age_secs: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resumed_supervisor_adopts_its_workers_and_hands_off_to_a_new_generation() {
+        let (_d, mut s, log) = sup();
+        s.adopt(resumed(vec![rw(3, 7, false), rw(4, 8, true)]));
+        s.start(Why::Upgrade);
+        assert_eq!(take(&log), ["3 adopt", "4 adopt", "5 spawn"]);
+        s.publish();
+        assert_eq!(
+            s.state.generation, 4,
+            "the adopted generation serves meanwhile"
+        );
+        assert_eq!(s.state.draining, [1003]);
+        assert!(s.state.upgrading);
+        // SIGHUP and SIGUSR2 meanwhile start nothing.
+        s.on_restart();
+        s.on_upgrade();
+        assert!(take(&log).is_empty());
+
+        s.on_message(5, ready(5));
+        assert_eq!(take(&log), ["4 handoff"]);
+        s.on_message(4, FromWorker::Released);
+        assert_eq!(take(&log), ["5 active"]);
+        s.publish();
+        assert_eq!(s.state.generation, 5);
+        assert_eq!(s.state.restarts, 4);
+        assert_eq!(s.state.upgrades, 2);
+        assert!(!s.state.upgrading);
+        let u = s.state.last_upgrade.clone().unwrap();
+        assert!(u.ok, "{u:?}");
+        assert_eq!(u.from_version, "1.2.9");
+        assert_eq!(u.version, env!("CARGO_PKG_VERSION"));
+
+        // The adopted ones exit like any other.
+        s.on_exit(3, "exit status: 0");
+        s.on_exit(4, "exit status: 0");
+        assert!(s.respawn_at.is_none());
+        s.publish();
+        assert!(s.state.draining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resumed_supervisor_whose_new_worker_fails_keeps_the_adopted_one() {
+        let (_d, mut s, log) = sup();
+        s.adopt(resumed(vec![rw(4, 8, true)]));
+        s.start(Why::Upgrade);
+        s.on_exit(5, "exit status: 1");
+        assert_eq!(take(&log), ["4 adopt", "5 spawn"]);
+        let u = s.state.last_upgrade.clone().unwrap();
+        assert!(!u.ok);
+        let e = u.error.unwrap();
+        assert!(
+            e.contains("now runs") && e.contains("previous worker keeps serving"),
+            "{e}"
+        );
+        assert!(!s.state.last_restart.clone().unwrap().ok);
+        assert!(s.respawn_at.is_none(), "generation 4 still serves");
+        s.publish();
+        assert_eq!(s.state.generation, 4);
+        assert!(!s.state.upgrading);
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_cannot_be_adopted_is_left_to_drain() {
+        let (_d, mut s, log) = sup();
+        s.adopt(resumed(vec![rw(4, -1, true)]));
+        s.start(Why::Upgrade);
+        s.on_message(5, ready(5));
+        assert_eq!(take(&log), ["4 adopt", "5 spawn", "5 active"]);
+        assert!(s.state.last_upgrade.clone().unwrap().ok);
     }
 }

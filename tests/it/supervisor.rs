@@ -558,6 +558,168 @@ async fn a_failed_restart_keeps_the_old_generation_serving() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigusr2_replaces_the_supervisor_in_place_mid_stream() {
+    // `pooltime update`: the supervisor execs the binary at its own path in its own process (the
+    // pid launchd / systemd track stays), keeps the port and its workers, then hands off to a
+    // worker from the new binary. Nothing is refused or cut on the way.
+    let fake = upstream(Duration::from_secs(5)).await;
+    let h = Home::new(&fake.url());
+    tokio::task::block_in_place(|| {
+        let mut sup = h.supervise();
+        let gen1 = h.health_pid();
+        wait_for("generation 1 to become active", || {
+            h.state()
+                .is_some_and(|s| s["generation"] == 1 && s["can_upgrade"] == true)
+        });
+
+        // A stray SIGUSR2 to a worker (`pkill -USR2 pooltime`) is ignored.
+        kill("-USR2", gen1);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(alive(gen1), "a worker ignores SIGUSR2");
+        assert_eq!(h.health_pid(), gen1);
+
+        let slow = slow_stream(&h, &fake);
+        let hammer = Hammer::start(h.addr());
+        std::thread::sleep(Duration::from_millis(200));
+        kill("-USR2", sup.pid());
+        wait_for("the supervisor to record the upgrade", || {
+            h.state().is_some_and(|s| s["upgrades"] == 1)
+        });
+        let st = h.state().unwrap();
+        assert_eq!(st["last_upgrade"]["ok"], true, "{st}\n{}", h.stderr());
+        assert_eq!(st["pid"].as_u64(), Some(u64::from(sup.pid())), "same pid");
+        assert!(
+            sup.child.try_wait().unwrap().is_none(),
+            "the service manager's process never exited"
+        );
+        assert_eq!(st["generation"], 2, "{st}");
+        assert_eq!(
+            st["restarts"], 1,
+            "the upgrade's handoff counts as a restart"
+        );
+        assert_eq!(st["upgrading"], false, "{st}");
+        let gen2 = st["worker_pid"].as_u64().unwrap();
+        assert_ne!(gen2, gen1);
+
+        // The stream that started before the upgrade completes on the adopted generation 1.
+        assert_intact(slow.join().unwrap(), "from-generation-one");
+        wait_gone(gen1);
+        let seen = hammer.finish();
+        assert!(
+            seen.failures.is_empty(),
+            "requests failed during the upgrade: {:?}\n{}",
+            seen.failures,
+            h.stderr()
+        );
+        assert_eq!(h.health_pid(), gen2);
+
+        // The re-executed supervisor still restarts on SIGHUP, and stops cleanly.
+        kill("-HUP", sup.pid());
+        wait_for("a restart after the upgrade", || {
+            h.state().is_some_and(|s| s["restarts"] == 2)
+        });
+        let st = h.state().unwrap();
+        assert_eq!(st["last_restart"]["ok"], true, "{st}");
+        let gen3 = st["worker_pid"].as_u64().unwrap();
+        wait_gone(gen2);
+        kill("-TERM", sup.pid());
+        assert_eq!(sup.wait_exit().code(), Some(0), "{}", h.stderr());
+        assert!(h.state().is_none(), "run/supervisor.json removed at exit");
+        wait_gone(gen3);
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_right_after_an_upgrade_signal_is_never_lost() {
+    // Whether SIGTERM lands during the probe, the moment before the exec or across it, the
+    // supervisor stops cleanly (exit 0, workers gone), never hangs or dies by the signal.
+    let fake = upstream(Duration::ZERO).await;
+    for delay in [0u64, 60, 250] {
+        let h = Home::new(&fake.url());
+        tokio::task::block_in_place(|| {
+            let mut sup = h.supervise();
+            let gen1 = h.health_pid();
+            wait_for("generation 1 to become active", || {
+                h.state().is_some_and(|s| s["generation"] == 1)
+            });
+            kill("-USR2", sup.pid());
+            std::thread::sleep(Duration::from_millis(delay));
+            kill("-TERM", sup.pid());
+            assert_eq!(
+                sup.wait_exit().code(),
+                Some(0),
+                "delay {delay} ms\n{}",
+                h.stderr()
+            );
+            wait_gone(gen1);
+        });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgrade_the_new_binary_refuses_keeps_everything_serving() {
+    // The new binary checks config.toml before it takes over: broken since the supervisor
+    // started, so it refuses, and the old supervisor and worker keep going.
+    let fake = upstream(Duration::ZERO).await;
+    let h = Home::new(&fake.url());
+    tokio::task::block_in_place(|| {
+        let sup = h.supervise();
+        let gen1 = h.health_pid();
+        wait_for("generation 1 to become active", || {
+            h.state().is_some_and(|s| s["generation"] == 1)
+        });
+        std::fs::write(h.pt().join("config.toml"), "port = \"not a number\"\n").unwrap();
+        let hammer = Hammer::start(h.addr());
+        kill("-USR2", sup.pid());
+        wait_for("the failed upgrade to be recorded", || {
+            h.state().is_some_and(|s| s["upgrades"] == 1)
+        });
+        let st = h.state().unwrap();
+        assert_eq!(st["last_upgrade"]["ok"], false, "{st}");
+        let why = st["last_upgrade"]["error"].as_str().unwrap();
+        assert!(why.contains("config.toml"), "{why}");
+        assert!(
+            !why.contains("not a number"),
+            "config text never quoted: {why}"
+        );
+        assert_eq!(st["generation"], 1, "{st}");
+        assert_eq!(st["restarts"], 0, "{st}");
+
+        // Config fixed, but the log directory cannot be written: refused too.
+        let cfg = std::fs::read_to_string(h.pt().join("config.toml")).unwrap();
+        assert!(cfg.contains("not a number"));
+        std::fs::write(h.pt().join("config.toml"), format!("port = {}\n", h.port)).unwrap();
+        let logs = h.pt().join("logs");
+        let mode = |m| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&logs, std::fs::Permissions::from_mode(m)).unwrap();
+            for f in std::fs::read_dir(&logs).unwrap() {
+                std::fs::set_permissions(
+                    f.unwrap().path(),
+                    std::fs::Permissions::from_mode(if m == 0o700 { 0o600 } else { 0o400 }),
+                )
+                .unwrap();
+            }
+        };
+        mode(0o500);
+        kill("-USR2", sup.pid());
+        wait_for("the second failed upgrade", || {
+            h.state().is_some_and(|s| s["upgrades"] == 2)
+        });
+        mode(0o700);
+        let st = h.state().unwrap();
+        assert_eq!(st["last_upgrade"]["ok"], false, "{st}");
+        let why = st["last_upgrade"]["error"].as_str().unwrap();
+        assert!(why.contains("log directory"), "{why}");
+        assert_eq!(st["generation"], 1, "{st}");
+        std::thread::sleep(Duration::from_millis(200));
+        let seen = hammer.finish();
+        assert!(seen.failures.is_empty(), "{:?}", seen.failures);
+        assert_eq!(h.health_pid(), gen1);
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_crashed_worker_is_replaced_while_clients_wait() {
     let fake = upstream(Duration::ZERO).await;
     let h = Home::new(&fake.url());
