@@ -1,13 +1,14 @@
 //! Account identity, stored credentials, the on-disk registry and runtime state.
 //!
 //! Layout: `accounts/<id>/account.toml` (meta), `credentials.json` (0600) and
-//! `lock` (flock target for refresh/write serialization).
+//! `lock` (flock target for refresh/write serialization). [`transfer`] is the export bundle.
 
 pub mod creds;
 pub mod id;
 pub mod identity;
 pub mod registry;
 pub mod status;
+pub mod transfer;
 
 pub use creds::{Credentials, CredsError};
 pub use id::{AccountId, InvalidAccountId};

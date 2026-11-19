@@ -14,6 +14,7 @@ pub mod service;
 pub mod setup;
 pub mod status;
 pub mod statusline;
+pub mod transfer;
 
 use std::ffi::OsString;
 use std::net::IpAddr;

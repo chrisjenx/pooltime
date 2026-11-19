@@ -95,4 +95,81 @@ pooltime accounts recheck work    # clear a billing block, refresh if needed, re
 pooltime accounts remove work     # asks first; --yes to skip
 ```
 
+## Move the pool to a new machine
+
+`accounts export` writes every account (its saved sign-in, identity, priority, weight and any
+temporary weight) plus `config.toml` and `models.toml` to one passphrase-encrypted file;
+`accounts import` adds them on the other machine, so you do not have to sign every account in
+again. (Not to be confused with `pooltime import bro`, which migrates from bro-cli.)
+
+> **The export file holds live refresh tokens.** Anyone with the file and the passphrase can use
+> your subscriptions. Pick a strong passphrase, move the file over a channel you trust, and
+> delete it (on both machines) once it is imported.
+
+On the old machine:
+
+```sh
+pooltime service uninstall                 # stop the pool first (see below)
+pooltime accounts export ~/pool.age        # asks for a passphrase twice (no echo)
+```
+
+On the new machine (with or without pooltime running):
+
+```sh
+pooltime accounts import ~/pool.age        # asks for the passphrase
+rm ~/pool.age
+pooltime connect --all                     # point this machine's Claude Code profiles at it
+```
+
+**Stop the old pool for good.** Refresh tokens rotate: when one machine refreshes an account's
+sign-in, the copy on the other machine stops working (and the other way round), so two pools
+sharing accounts log each other out. Stop the old pool before exporting (`pooltime service
+uninstall`, or Ctrl-C a foreground `pooltime serve`) so the exported sign-ins are the newest,
+and do not start it again; or remove the accounts there with `pooltime accounts remove <name>`
+after the import. Export prints this reminder too.
+
+What moves and what does not:
+
+| Moved | Left behind |
+|---|---|
+| every account's `account.toml` and `credentials.json` | `config.toml`'s `[[profiles]]` (Claude Code profile paths on the old machine): run `pooltime connect` on the new one |
+| routing priority, weight, temporary weights, expected identity | `run/` (pid, management key: generated anew) |
+| `config.toml` (port, tuning, proxy key, timeouts, retention, alerts) | `logs/` and `pooltime.db` (journal, usage history, rate-limit and error state: rebuilt as the pool runs) |
+| `models.toml` (model mappings) | |
+
+Import:
+
+- prints what the file holds (number of accounts per provider and their names), then a line per
+  account;
+- **skips** an account whose name already exists here, and keeps an existing `config.toml` /
+  `models.toml`. `--replace` overwrites them. If the export has no usable sign-in for an
+  account but this machine has one, `--replace` takes only the export's settings for it
+  (priority, weight, identity) and keeps the sign-in here;
+- does not restore a sign-in that had already expired (no refresh token left, or its login
+  expiry has passed): the account is added and listed with `pooltime accounts login <name>`;
+- restores `config.toml` but keeps this machine's `host`, `port` and `proxy_key` (Claude Code
+  profiles connected here point at that address and send that key), and always this machine's
+  `[[profiles]]`. `--replace-network-settings` takes the export's host, port and proxy key too.
+  It prints which settings changed, and checks the result as `pooltime serve` would (for
+  example a non-loopback `host` needs a `proxy_key`) before writing anything;
+- checks everything (the file, every account, `config.toml`, `models.toml`) before the first
+  write. If one account fails to import, the others still do, a replaced account is put back as
+  it was, and the command exits non-zero;
+- works whether or not the daemon runs. A running daemon picks the accounts up at once (they are
+  created through its management API, like `accounts add`); restart it (`pooltime service
+  restart`) if `config.toml` or `models.toml` were restored. If a pooltime from another
+  `POOLTIME_HOME` answers on this home's port, import stops before writing anything: set
+  `POOLTIME_PORT` to a free port or stop that pooltime.
+
+Passphrase: typed at the terminal by default (never echoed; twice for export). For scripts, use
+`--passphrase-file PATH` (its first line) or the `POOLTIME_EXPORT_PASSPHRASE` environment
+variable (a trailing line ending is dropped from either); it is never accepted as a
+command-line argument. An empty passphrase is refused.
+`export` writes the file with mode 0600, atomically, and refuses to replace an existing file
+without `--force`.
+
+The file is a standard [age](https://age-encryption.org) file encrypted with a passphrase
+(scrypt, then ChaCha20-Poly1305), so a wrong passphrase or any change to the file is detected and
+nothing is written. `age -d` can decrypt it too if you ever need to look inside.
+
 Next: [Re-login](relogin.md), [Profiles](profiles.md), [Dashboard](dashboard.md).

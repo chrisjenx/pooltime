@@ -9,6 +9,7 @@
 #[path = "../support/mod.rs"]
 mod support;
 
+mod accounts_transfer;
 mod analytics;
 mod claude_code;
 mod claude_code_connect;
