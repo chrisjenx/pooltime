@@ -168,7 +168,7 @@ impl Alerts {
         r: Option<&Runway>,
         now: OffsetDateTime,
     ) -> Option<Notification> {
-        let ev = runway_event(r?, local_offset(now))?;
+        let ev = runway_event(r?, now, local_offset(now))?;
         self.fire(&ev, now).await.ok().flatten()
     }
 
@@ -246,9 +246,11 @@ impl Alerts {
     }
 }
 
-/// The runway event of an at-risk forecast (times shown in `offset`); `None` when not at risk.
-fn runway_event(r: &Runway, offset: UtcOffset) -> Option<Event> {
-    if !r.at_risk {
+/// The runway event of an at-risk forecast at `now` (times shown in `offset`); `None` when not
+/// at risk, or while the rate covers less than a full day (a fresh install's first heavy session
+/// is not a trend).
+fn runway_event(r: &Runway, now: OffsetDateTime, offset: UtcOffset) -> Option<Event> {
+    if !r.at_risk || r.low_confidence {
         return None;
     }
     let cycle = r.cycle.map_or("unknown".to_string(), |c| c.to_string());
@@ -256,7 +258,7 @@ fn runway_event(r: &Runway, offset: UtcOffset) -> Option<Event> {
         subject: "pool".into(),
         keys: vec![format!("{RUNWAY_PREFIX}{cycle}")],
         near: r.cycle.map(|c| (RUNWAY_PREFIX, c)),
-        message: runway::message(r, offset)?,
+        message: runway::message(r, now, offset)?,
         action: OPEN,
     })
 }
@@ -606,6 +608,7 @@ mod tests {
             short_by_secs: Some(short_by),
             at_risk: true,
             warn_hours: 6,
+            low_confidence: false,
             cycle,
         }
     }
@@ -624,6 +627,12 @@ mod tests {
             let mut fine = at_risk(Some(cycle), 3600);
             fine.at_risk = false;
             assert!(a.evaluate_runway(Some(&fine), NOW).await.is_none());
+            // Under a day of history (a fresh install's first session): shown, never alerted,
+            // and nothing recorded, so it can still alert once the rate is trustworthy.
+            let mut young = at_risk(Some(cycle), 14 * 3600);
+            young.low_confidence = true;
+            assert!(a.evaluate_runway(Some(&young), NOW).await.is_none());
+            assert!(rows(&store).is_empty());
 
             let n = a
                 .evaluate_runway(Some(&at_risk(Some(cycle), 14 * 3600)), NOW)

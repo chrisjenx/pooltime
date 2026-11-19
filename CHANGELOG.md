@@ -14,9 +14,18 @@
 - Runway alert: a desktop notification when the pool is projected to run out at least
   `alerts.runway_warn_hours` (default 6; `0` turns it off) before the next reset, at most once
   per reset cycle: "At the current rate the pool runs out ~14h before the next reset (Thu 09:00)".
+  Only a shortfall within the next 7 days warns (one further out is shown only), and nothing
+  warns until there is a full day of usage history (the forecast is marked low confidence
+  until then).
 - `pooltime doctor` notes (`i voice`, never a failure) that Claude Code's `/voice` dictation is
   unavailable in pooled sessions (Claude Code turns it off while `ANTHROPIC_AUTH_TOKEN` is set,
   and voice audio goes to api.anthropic.com directly), and suggests the OS dictation instead.
+
+### Fixed
+
+- An empty pool's weekly burn read `-0.0 subs used`; it now reads `0.0`.
+- A desktop notification could fail to start with "text file busy" when the notifier program had
+  just been written (seen in tests); starting it is now retried briefly.
 
 ## 1.2.1 - 2026-11-15
 

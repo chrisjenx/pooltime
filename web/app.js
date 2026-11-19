@@ -501,11 +501,14 @@
   }
 
   // "Thu 09:00" in the browser's local time.
+  // With the date ("Thu 26 Nov 09:00") when more than 6 days away: a bare weekday reads as this week's.
   function weekdayTime(iso) {
     const d = new Date(iso);
     if (isNaN(d)) return "?";
-    return d.toLocaleDateString(undefined, { weekday: "short" }) + " " +
-      String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+    const far = d.getTime() - Date.now() > 6 * 86400 * 1000;
+    const wd = d.toLocaleDateString(undefined, { weekday: "short" });
+    const day = far ? wd + " " + d.getDate() + " " + d.toLocaleDateString(undefined, { month: "short" }) : wd;
+    return day + " " + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
   }
   function span(secs) {
     if (secs < 3600) return "<1h";
@@ -519,6 +522,7 @@
     const rate = typeof r.rate_per_hour === "number"
       ? " (" + r.rate_per_hour.toFixed(2) + " subs/h over the last " + Math.round(r.rate_window_hours || 0) + "h)"
       : "";
+    const low = r.low_confidence ? " · low confidence: only " + Math.round(r.rate_window_hours || 0) + "h of history" : "";
     let text;
     if (r.state === "lasts") text = "Runway: the 7-day quota lasts at the current rate" + rate;
     else if (r.state === "out") {
@@ -531,6 +535,7 @@
     } else {
       text = "Runway: at the current rate the pool runs out " + weekdayTime(r.exhausts_at) + " (no reset known)" + rate;
     }
+    text += low;
     return r.at_risk
       ? h("p", { class: "runway warn-text" }, h("strong", { text: "⚠ " + text }))
       : h("p", { class: "runway dim", text });

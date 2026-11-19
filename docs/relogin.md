@@ -103,12 +103,17 @@ How it is worked out:
   reset; the gap until that reset is how long it is short.
 
 The forecast says `lasts`, `short` (runs out before the next reset), `out` (no 7-day headroom
-left now) or `unknown`. A `short` or `out` forecast at least `alerts.runway_warn_hours` (6) short
-is at risk: a `⚠` in `pooltime status` and the dashboard, a `⚠ 7d out ~14h early` badge on the
-[status line](profiles.md#status-line), and one notification per reset cycle. After an account
-resets, a pool that is still at risk notifies again. `runway_warn_hours = 0` turns the warning
-off; the forecast is still shown. It is a straight-line projection of the last day: a heavier or
-lighter day ahead moves it.
+left now) or `unknown`. A `short` or `out` forecast at least `alerts.runway_warn_hours` (6) short,
+running out within the next 7 days, is at risk: a `⚠` in `pooltime status` and the dashboard, a
+`⚠ 7d out ~14h early` badge on the [status line](profiles.md#status-line), and one notification
+per reset cycle. After an account resets, a pool that is still at risk notifies again. A
+shortfall further out is shown but never warned about. Times more than 6 days away carry their
+date (`Wed 18 Nov 09:00`). `runway_warn_hours = 0` turns the warning off; the forecast is still
+shown. It is a straight-line projection of the last day: a heavier or lighter day ahead moves it.
+
+Until the pool has a full day of usage history (a fresh install), the forecast is marked
+`low confidence` (`low_confidence` in the API): it is shown, but there is no notification and no
+status line badge yet, so one heavy first session does not raise an alert.
 
 ## Expiry rules
 

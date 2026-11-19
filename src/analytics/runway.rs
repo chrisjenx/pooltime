@@ -21,7 +21,11 @@
 //!   next reset after that moment is how long the pool is **short**.
 //!
 //! [`Runway::at_risk`] is set when the pool is short by at least `alerts.runway_warn_hours`
-//! (`0` disables it), or out with no reset known. The daemon caches the forecast for
+//! (`0` disables it), or out with no reset known, and it runs out within [`AT_RISK_WITHIN_SECS`]
+//! (a shortfall further out is shown, never warned about: a straight line that far ahead is
+//! noise). While the rate covers less than the full [`RATE_WINDOW_SECS`] the forecast is
+//! [`Runway::low_confidence`]: shown, marked as such, but never alerted on (a heavy first session
+//! on a fresh install would otherwise extrapolate into an alert). The daemon caches the forecast for
 //! [`CACHE_TTL`] ([`current`]): the burn API, the alerts and the status cache share it.
 
 use std::sync::Arc;
@@ -43,6 +47,10 @@ pub const RATE_WINDOW_SECS: i64 = 24 * 3600;
 pub const MIN_SPAN_SECS: i64 = 3 * 3600;
 /// How far ahead the simulation looks (two full reset cycles).
 pub const HORIZON_SECS: i64 = 2 * WEEK;
+/// Only a shortfall within this of now is at risk.
+pub const AT_RISK_WITHIN_SECS: i64 = WEEK;
+/// Times further out than this are shown with their date.
+const DATED_AFTER_SECS: i64 = 6 * 86_400;
 /// Default `alerts.runway_warn_hours`.
 pub const DEFAULT_WARN_HOURS: u32 = 6;
 /// How long the daemon reuses a computed forecast.
@@ -238,6 +246,8 @@ pub struct Runway {
     pub at_risk: bool,
     /// `alerts.runway_warn_hours` (`0`: no warning).
     pub warn_hours: u32,
+    /// The rate covers less than the full trailing day: shown, never alerted on.
+    pub low_confidence: bool,
     /// The earliest upcoming reset of a usable account: identifies the reset cycle for alert
     /// dedupe.
     #[serde(skip)]
@@ -287,6 +297,7 @@ pub fn forecast(accounts: &[AccountNow], rate: Option<Rate>, now: i64, warn_hour
         short_by_secs: None,
         at_risk: false,
         warn_hours,
+        low_confidence: rate.is_some_and(|r| r.span < RATE_WINDOW_SECS),
         cycle,
     };
     // Out of headroom is known without a rate.
@@ -307,6 +318,7 @@ pub fn forecast(accounts: &[AccountNow], rate: Option<Rate>, now: i64, warn_hour
     out.next_reset = p.next_reset.and_then(at);
     out.short_by_secs = p.next_reset.map(|r| (r - ex).max(0));
     out.at_risk = warn_hours > 0
+        && ex - now <= AT_RISK_WITHIN_SECS
         && out
             .short_by_secs
             .is_none_or(|s| s >= i64::from(warn_hours) * 3600);
@@ -322,7 +334,9 @@ pub fn report(
     warn_hours: u32,
 ) -> anyhow::Result<Runway> {
     let now = now.unix_timestamp();
-    let rows = store.read(|c| usage_history::rows_since(c, WINDOW_7D, now - RATE_WINDOW_SECS))?;
+    // Only the rate needs history (the accounts' state is live): the trailing day, plus each
+    // account's reading going into it.
+    let rows = store.read(|c| usage_history::rows_from(c, WINDOW_7D, now - RATE_WINDOW_SECS))?;
     let rate = pool_rate(&rows, now, RATE_WINDOW_SECS);
     Ok(forecast(accounts, rate, now, warn_hours))
 }
@@ -368,12 +382,20 @@ pub async fn current(app: &Arc<AppState>, now: OffsetDateTime) -> Option<Runway>
     }
 }
 
-/// `Thu 09:00` in `offset`.
-pub fn fmt_when(t: OffsetDateTime, offset: UtcOffset) -> String {
-    let fd = time::macros::format_description!("[weekday repr:short] [hour]:[minute]");
-    t.to_offset(offset)
-        .format(&fd)
-        .unwrap_or_else(|_| "?".into())
+/// `Thu 09:00` in `offset`; `Thu 26 Nov 09:00` when more than 6 days after `now` (a bare weekday
+/// would read as this week's).
+pub fn fmt_when(t: OffsetDateTime, now: OffsetDateTime, offset: UtcOffset) -> String {
+    let t = t.to_offset(offset);
+    let r = if (t - now).whole_seconds() > DATED_AFTER_SECS {
+        t.format(time::macros::format_description!(
+            "[weekday repr:short] [day padding:none] [month repr:short] [hour]:[minute]"
+        ))
+    } else {
+        t.format(time::macros::format_description!(
+            "[weekday repr:short] [hour]:[minute]"
+        ))
+    };
+    r.unwrap_or_else(|_| "?".into())
 }
 
 /// `<1h`, `~14h`, `~3 days`.
@@ -388,14 +410,15 @@ pub fn fmt_span(secs: i64) -> String {
     }
 }
 
-/// The one-sentence summary of a `short` / `out` forecast (`None` otherwise), times in `offset`:
-/// "At the current rate the pool runs out ~14h before the next reset (Thu 09:00)".
-pub fn message(r: &Runway, offset: UtcOffset) -> Option<String> {
+/// The one-sentence summary of a `short` / `out` forecast at `now` (`None` otherwise), times in
+/// `offset`: "At the current rate the pool runs out ~14h before the next reset (Thu 09:00)".
+pub fn message(r: &Runway, now: OffsetDateTime, offset: UtcOffset) -> Option<String> {
     describe(
         r.state,
         r.exhausts_at,
         r.next_reset,
         r.short_by_secs,
+        now,
         offset,
     )
 }
@@ -406,23 +429,24 @@ pub fn describe(
     exhausts_at: Option<OffsetDateTime>,
     next_reset: Option<OffsetDateTime>,
     short_by_secs: Option<i64>,
+    now: OffsetDateTime,
     offset: UtcOffset,
 ) -> Option<String> {
     let ex = exhausts_at?;
     Some(match (state, next_reset, short_by_secs) {
         ("out", Some(n), _) => format!(
             "The pool is out of 7-day quota until the next reset ({})",
-            fmt_when(n, offset)
+            fmt_when(n, now, offset)
         ),
         ("out", None, _) => "The pool is out of 7-day quota (no reset known)".into(),
         ("short", Some(n), Some(s)) => format!(
             "At the current rate the pool runs out {} before the next reset ({})",
             fmt_span(s),
-            fmt_when(n, offset)
+            fmt_when(n, now, offset)
         ),
         ("short", _, _) => format!(
             "At the current rate the pool runs out of 7-day quota {} (no reset known)",
-            fmt_when(ex, offset)
+            fmt_when(ex, now, offset)
         ),
         _ => return None,
     })
@@ -461,6 +485,10 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    fn ts(t: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(t).unwrap()
     }
 
     #[test]
@@ -533,7 +561,7 @@ mod tests {
         assert!(close(r.headroom, 0.8));
         assert_eq!(r.cycle, Some(now + 3 * DAY));
         assert_eq!(
-            message(&r, UtcOffset::UTC).unwrap(),
+            message(&r, ts(MON), UtcOffset::UTC).unwrap(),
             "At the current rate the pool runs out ~32h before the next reset (Thu 00:00)"
         );
         // Under the threshold: short, but not at risk; 0 disables the warning.
@@ -546,7 +574,7 @@ mod tests {
         };
         let r = forecast(&pool, Some(slow), now, 6);
         assert_eq!((r.state, r.at_risk, r.exhausts_at), ("lasts", false, None));
-        assert_eq!(message(&r, UtcOffset::UTC), None);
+        assert_eq!(message(&r, ts(MON), UtcOffset::UTC), None);
     }
 
     #[test]
@@ -610,7 +638,7 @@ mod tests {
             "the dead account's reset is not a cycle"
         );
         assert_eq!(
-            message(&r, UtcOffset::UTC).unwrap(),
+            message(&r, ts(MON), UtcOffset::UTC).unwrap(),
             "The pool is out of 7-day quota until the next reset (Mon 20:00)"
         );
         // Out is known even without a rate.
@@ -625,7 +653,7 @@ mod tests {
         let r = forecast(&[acct("a", 1.0, None)], rate, now, 6);
         assert_eq!((r.state, r.short_by_secs, r.at_risk), ("out", None, true));
         assert_eq!(
-            message(&r, UtcOffset::UTC).unwrap(),
+            message(&r, ts(MON), UtcOffset::UTC).unwrap(),
             "The pool is out of 7-day quota (no reset known)"
         );
     }
@@ -663,11 +691,70 @@ mod tests {
         assert_eq!(fmt_span(14 * H + 20 * 60), "~14h");
         assert_eq!(fmt_span(47 * H), "~47h");
         assert_eq!(fmt_span(3 * DAY + H), "~3 days");
-        let t = OffsetDateTime::from_unix_timestamp(MON + 3 * DAY + 9 * H).unwrap();
-        assert_eq!(fmt_when(t, UtcOffset::UTC), "Thu 09:00");
+        let t = ts(MON + 3 * DAY + 9 * H);
+        assert_eq!(fmt_when(t, ts(MON), UtcOffset::UTC), "Thu 09:00");
         assert_eq!(
-            fmt_when(t, UtcOffset::from_hms(-10, 0, 0).unwrap()),
+            fmt_when(t, ts(MON), UtcOffset::from_hms(-10, 0, 0).unwrap()),
             "Wed 23:00"
         );
+        // More than 6 days out: the bare weekday would read as this week's, so the date too.
+        let far = ts(MON + 10 * DAY + 9 * H);
+        assert_eq!(fmt_when(far, ts(MON), UtcOffset::UTC), "Thu 19 Nov 09:00");
+        assert_eq!(
+            fmt_when(far, ts(MON + 5 * DAY), UtcOffset::UTC),
+            "Thu 09:00"
+        );
+    }
+
+    #[test]
+    fn far_shortfall_is_shown_but_not_at_risk() {
+        let now = MON;
+        // a: 0.4 left, resets in 2 days (then day 9); b: unused, resets in 13 days. At 0.012/h
+        // the pool is at 1.824 after a's first reset and runs out at day 8.33, 16 h before a's
+        // second reset: short, but more than 7 days out.
+        let pool = [
+            acct("a", 0.6, Some(now + 2 * DAY)),
+            acct("b", 0.0, Some(now + 13 * DAY)),
+        ];
+        let rate = Some(Rate {
+            per_sec: 0.012 / 3600.0,
+            span: DAY,
+        });
+        let r = forecast(&pool, rate, now, 6);
+        assert_eq!(r.state, "short", "{r:?}");
+        assert_eq!(r.short_by_secs, Some(16 * H), "{r:?}");
+        let ex = r.exhausts_at.unwrap().unix_timestamp();
+        assert!(ex - now > AT_RISK_WITHIN_SECS, "{r:?}");
+        assert!(r.short_by_secs.unwrap() >= 6 * H, "{r:?}");
+        assert!(
+            !r.at_risk,
+            "a shortfall more than 7 days out is informational"
+        );
+        // The message names the reset with its date.
+        let m = message(&r, ts(now), UtcOffset::UTC).unwrap();
+        assert!(
+            m.ends_with("~16h before the next reset (Wed 18 Nov 00:00)"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn under_a_day_of_history_is_low_confidence() {
+        let pool = [acct("a", 0.5, Some(MON + 3 * DAY))];
+        let rate = |span| {
+            Some(Rate {
+                per_sec: 0.05 / 3600.0,
+                span,
+            })
+        };
+        let young = forecast(&pool, rate(5 * H), MON, 6);
+        assert!(young.at_risk && young.low_confidence, "{young:?}");
+        assert_eq!(
+            serde_json::to_value(&young).unwrap()["low_confidence"],
+            true
+        );
+        assert!(!forecast(&pool, rate(DAY), MON, 6).low_confidence);
+        // Out is a fact, not an extrapolation.
+        assert!(!forecast(&[acct("a", 1.0, Some(MON + H))], None, MON, 6).low_confidence);
     }
 }

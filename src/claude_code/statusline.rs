@@ -6,7 +6,8 @@
 //!   `{written_at, port, pool: {available, total}, seven_day_used, seven_day_left, counts:
 //!   {needs_login, expiring_today, expiring, erroring}, runway}` (`seven_day_left` is kept for
 //!   older readers; the segment shows `seven_day_used`). `runway` is `{state, short_by_secs}`
-//!   only while the runway forecast is at risk ([`crate::analytics::runway`]), else `null`.
+//!   only while the runway forecast is at risk with a full day of history
+//!   ([`crate::analytics::runway`]), else `null`.
 //! - [`segment`] renders it without any network: `pool 6/8 · 7d 59% used · ⚠ 2 need login`, or
 //!   `pool down` when the cache is missing, unreadable or older than [`STALE_AFTER`]. An at-risk
 //!   runway adds `⚠ 7d out ~14h early` (`⚠ 7d out for ~20h` when already out).
@@ -72,7 +73,8 @@ pub fn cache_body(status: &Value, runway: Option<&Runway>, port: u16) -> Value {
             "erroring": erroring,
         },
         // Whole hours: the document (and so the file) changes only when the badge would.
-        "runway": runway.filter(|r| r.at_risk).map(|r| json!({
+        // Like the alert: not on under a day of history.
+        "runway": runway.filter(|r| r.at_risk && !r.low_confidence).map(|r| json!({
             "state": r.state,
             "short_by_secs": r.short_by_secs.map(|s| (s + 1800) / 3600 * 3600),
         })),
@@ -606,6 +608,8 @@ mod tests {
             cache_body(&status, Some(&r), 1)["runway"],
             json!({"state": "short", "short_by_secs": 15 * 3600})
         );
+        r.low_confidence = true;
+        assert!(cache_body(&status, Some(&r), 1)["runway"].is_null());
     }
 
     fn line(c: &str) -> Value {

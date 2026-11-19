@@ -5,9 +5,9 @@
 //! Answer: `{weeks:[{week, start, subs_used, per_account:[{account, consumed, plan?}]}],
 //! forecast:{week, subs_used_so_far, elapsed_fraction, projected, accounts}, idle_accounts:[id],
 //! runway}`. `plan` appears only when the account's stored credentials already name one.
-//! `runway` is the 7-day runway forecast ([`crate::analytics::runway::Runway`]: `{state, rate_per_hour,
-//! rate_window_hours, headroom, exhausts_at, next_reset, short_by_secs, at_risk, warn_hours}`),
-//! `null` when it could not be computed.
+//! `runway` is the 7-day runway forecast ([`crate::analytics::runway::Runway`]: `{state,
+//! rate_per_hour, rate_window_hours, headroom, exhausts_at, next_reset, short_by_secs, at_risk,
+//! warn_hours, low_confidence}`), `null` when it could not be computed.
 //! With `POOLTIME_FIXTURE_STATE` set it answers the fixture's `analytics.burn` document.
 
 use std::collections::HashMap;

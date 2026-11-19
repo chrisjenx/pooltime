@@ -129,6 +129,25 @@ fn is_executable(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// Spawn attempts on `ETXTBSY` before giving up.
+const SPAWN_TRIES: u32 = 5;
+
+/// `cmd.spawn()`, retried briefly on `ExecutableFileBusy` (`ETXTBSY`): a program file that was
+/// just written (an install, a test shim) can still be open for writing in a child another
+/// thread is forking at that moment (rust-lang/rust#114554).
+fn spawn_retrying(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let mut tries = 1;
+    loop {
+        match cmd.spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < SPAWN_TRIES => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20 * u64::from(tries)));
+            }
+            r => return r,
+        }
+    }
+}
+
 impl Notifier for SystemNotifier {
     fn notify(&self, n: &Notification) -> anyhow::Result<()> {
         let Some((program, args)) = self.command_for(n) else {
@@ -139,14 +158,13 @@ impl Notifier for SystemNotifier {
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let mut child = Command::new(&program)
-            .args(&args)
+        let mut cmd = Command::new(&program);
+        cmd.args(&args)
             .env("PATH", &self.search_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("running {name}"))?;
+            .stderr(Stdio::null());
+        let mut child = spawn_retrying(&mut cmd).with_context(|| format!("running {name}"))?;
         let deadline = Instant::now() + self.timeout;
         loop {
             if let Some(status) = child
@@ -225,6 +243,25 @@ mod tests {
         );
         std::fs::write(&p, script).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A program still open for writing (another thread's fork holding the fd) is busy; the
+    /// spawn waits it out. Only Linux reports `ETXTBSY` for this.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_retries_a_busy_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("prog");
+        let mut f = std::fs::File::create(&p).unwrap();
+        std::io::Write::write_all(&mut f, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            drop(f);
+        });
+        let mut child = spawn_retrying(&mut Command::new(&p)).unwrap();
+        assert!(child.wait().unwrap().success());
+        closer.join().unwrap();
     }
 
     fn args_of(out: &Path, name: &str) -> Option<Vec<String>> {

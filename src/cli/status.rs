@@ -195,20 +195,29 @@ pub fn burn_line(burn: &Value) -> Option<String> {
     })
 }
 
-/// The runway line from the burn document's `runway` (times in `offset`): `⚠ runway: At the
-/// current rate the pool runs out ~14h before the next reset (Thu 09:00)` (the `⚠` only when at
-/// risk), or `runway: lasts at the current rate (0.05 subs/h)`. `None` without a forecast.
-pub fn runway_line(burn: &Value, offset: UtcOffset) -> Option<String> {
+/// The runway line from the burn document's `runway` at `now` (times in `offset`): `⚠ runway: At
+/// the current rate the pool runs out ~14h before the next reset (Thu 09:00)` (the `⚠` only when
+/// at risk), or `runway: lasts at the current rate (0.05 subs/h)`; ` (low confidence: 5h of
+/// history)` while the rate covers less than a day. `None` without a forecast.
+pub fn runway_line(burn: &Value, now: OffsetDateTime, offset: UtcOffset) -> Option<String> {
     let r = &burn["runway"];
     let t = |k: &str| {
         r[k].as_str()
             .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
     };
     let state = r["state"].as_str()?;
+    let low = match (
+        r["low_confidence"].as_bool(),
+        r["rate_window_hours"].as_f64(),
+    ) {
+        (Some(true), Some(h)) => format!(" (low confidence: {h:.0}h of history)"),
+        (Some(true), None) => " (low confidence)".to_string(),
+        _ => String::new(),
+    };
     if state == "lasts" {
         let rate = r["rate_per_hour"].as_f64()?;
         return Some(format!(
-            "runway: lasts at the current rate ({rate:.2} subs/h)"
+            "runway: lasts at the current rate ({rate:.2} subs/h){low}"
         ));
     }
     let text = runway::describe(
@@ -216,6 +225,7 @@ pub fn runway_line(burn: &Value, offset: UtcOffset) -> Option<String> {
         t("exhausts_at"),
         t("next_reset"),
         r["short_by_secs"].as_i64(),
+        now,
         offset,
     )?;
     let warn = if r["at_risk"].as_bool() == Some(true) {
@@ -223,7 +233,7 @@ pub fn runway_line(burn: &Value, offset: UtcOffset) -> Option<String> {
     } else {
         ""
     };
-    Some(format!("{warn}runway: {text}"))
+    Some(format!("{warn}runway: {text}{low}"))
 }
 
 /// The whole summary.
@@ -249,9 +259,13 @@ pub fn render_with_burn(
         pct(used)
     );
     // Right under the pool line (before its blank separator).
+    let now = status["now"]
+        .as_str()
+        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+        .unwrap_or_else(OffsetDateTime::now_utc);
     let lines = [
         burn.and_then(burn_line),
-        burn.and_then(|b| runway_line(b, offset)),
+        burn.and_then(|b| runway_line(b, now, offset)),
     ];
     for line in lines.into_iter().flatten() {
         out.insert_str(out.len() - 1, &format!("{line}\n"));
@@ -386,8 +400,9 @@ mod tests {
 
     #[test]
     fn status_shows_the_runway() {
-        let s = json!({"version": "0.1.0", "pool": {"accounts": 2, "available": 2,
-            "seven_day_used_total": 1.2}, "accounts": []});
+        let s = json!({"version": "0.1.0", "now": "2026-11-11T09:00:00Z", "pool": {"accounts": 2,
+            "available": 2, "seven_day_used_total": 1.2}, "accounts": []});
+        let now = OffsetDateTime::parse("2026-11-11T09:00:00Z", &Rfc3339).unwrap();
         let mut burn = json!({"weeks": [], "idle_accounts": [], "forecast": {"week": "2026-W46",
             "subs_used_so_far": 1.2, "elapsed_fraction": 0.4, "projected": 3.0, "accounts": 2},
             "runway": {"state": "short", "rate_per_hour": 0.02, "rate_window_hours": 24.0,
@@ -405,19 +420,28 @@ mod tests {
         // Short but under the threshold: no warning sign.
         burn["runway"]["at_risk"] = json!(false);
         burn["runway"]["short_by_secs"] = json!(3600);
-        assert!(runway_line(&burn, UtcOffset::UTC)
+        assert!(runway_line(&burn, now, UtcOffset::UTC)
             .unwrap()
             .starts_with("runway: At the current rate the pool runs out ~1h before"));
         let out_now = json!({"runway": {"state": "out", "exhausts_at": "2026-11-11T19:00:00Z",
             "next_reset": "2026-11-12T09:00:00Z", "short_by_secs": 50400, "at_risk": true}});
         assert_eq!(
-            runway_line(&out_now, UtcOffset::from_hms(1, 0, 0).unwrap()).unwrap(),
+            runway_line(&out_now, now, UtcOffset::from_hms(1, 0, 0).unwrap()).unwrap(),
             "⚠ runway: The pool is out of 7-day quota until the next reset (Thu 10:00)"
         );
         let lasts = json!({"runway": {"state": "lasts", "rate_per_hour": 0.0123}});
         assert_eq!(
-            runway_line(&lasts, UtcOffset::UTC).unwrap(),
+            runway_line(&lasts, now, UtcOffset::UTC).unwrap(),
             "runway: lasts at the current rate (0.01 subs/h)"
+        );
+        // Under a day of history: marked; a reset more than 6 days out carries its date.
+        let young = json!({"runway": {"state": "short", "exhausts_at": "2026-11-17T19:00:00Z",
+            "next_reset": "2026-11-18T09:00:00Z", "short_by_secs": 50400, "at_risk": false,
+            "low_confidence": true, "rate_window_hours": 5.0}});
+        assert_eq!(
+            runway_line(&young, now, UtcOffset::UTC).unwrap(),
+            "runway: At the current rate the pool runs out ~14h before the next reset \
+             (Wed 18 Nov 09:00) (low confidence: 5h of history)"
         );
         // No forecast (too little history, an older daemon): no line.
         for b in [
@@ -425,7 +449,7 @@ mod tests {
             json!({"runway": null}),
             json!({}),
         ] {
-            assert_eq!(runway_line(&b, UtcOffset::UTC), None, "{b}");
+            assert_eq!(runway_line(&b, now, UtcOffset::UTC), None, "{b}");
         }
     }
 

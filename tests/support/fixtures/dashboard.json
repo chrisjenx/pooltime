@@ -1278,7 +1278,8 @@
         "next_reset": "2026-11-09T09:00:00Z",
         "short_by_secs": 50400,
         "at_risk": true,
-        "warn_hours": 6
+        "warn_hours": 6,
+        "low_confidence": false
       }
     }
   }
