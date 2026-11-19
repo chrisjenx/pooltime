@@ -114,8 +114,8 @@ to the supervisor becomes `stop` for every worker (again: `force`); if the contr
 
 The supervisor itself is replaced in place on `SIGUSR2` (`pooltime update`, `src/cli/update.rs`;
 `src/supervisor/resume.rs`): it runs `<bin> serve --reexec-probe` (the new binary must accept its
-hand-over format and load `config.toml`), waits until no restart is under way, clears
-`FD_CLOEXEC` on the listener and the workers' control sockets, blocks the stop/restart signals and
+hand-over format, load `config.toml` and write the log dir), waits until no restart is under way, clears
+`FD_CLOEXEC` on the listener and the workers' control sockets, blocks the stop/restart signals (only its main thread takes them) and
 `execve`s `<bin> serve --supervise ... --resume <json>` (fd numbers, worker pids and generations,
 counters). Same pid, so launchd/systemd see nothing; the workers stay its children. The new
 process adopts the workers (reaping them by pid), unblocks the signals and starts a generation

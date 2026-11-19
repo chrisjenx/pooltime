@@ -145,6 +145,8 @@ pub trait Sys: Send + Sync {
     fn supervisor(&self) -> Option<SupervisorState>;
     /// Whether the installed service definition runs the supervisor (`None`: not installed).
     fn service_supervised(&self) -> Option<bool>;
+    /// Whether `pid` is a running `pooltime serve --supervise` process.
+    fn is_supervisor(&self, pid: u32) -> bool;
     /// `SIGUSR2` to the supervisor.
     fn signal_upgrade(&self, pid: u32) -> anyhow::Result<()>;
     /// Wait until the supervisor has finished an upgrade after the first `after`.
@@ -282,7 +284,8 @@ pub async fn update(
         current
     };
 
-    // The service.
+    // The service, as it is now (the update above may have taken minutes).
+    let sup = if newer { sys.supervisor() } else { sup };
     let Some(sup) = sup else {
         if sys.service_supervised() == Some(false) {
             writeln!(out, "{}", super::service::OLD_DEFINITION)?;
@@ -317,6 +320,18 @@ pub async fn update(
         )?;
         return Ok(1);
     }
+    // The binary the service should now run.
+    let bin = installed_bin(&ctx.method, &ctx.exe);
+    let elsewhere = |runs_version: &str, binary: Option<&str>| {
+        format!(
+            "the service runs {}, which is {runs_version}, not the {target} at {}: point the \
+             service at it with `{} service install` (a full restart that waits for in-flight \
+             requests)",
+            binary.unwrap_or("another pooltime binary"),
+            bin.display(),
+            bin.display()
+        )
+    };
     if !sup.can_upgrade {
         let r = sys.restart_workers().await?;
         let worker = match &r {
@@ -328,6 +343,10 @@ pub async fn update(
             "service: restarted without closing the port; the worker runs {}",
             worker.as_deref().unwrap_or(&target_s)
         )?;
+        if let Some(w) = worker.as_deref().filter(|w| !runs(Some(w))) {
+            writeln!(out, "{}", elsewhere(w, sup.binary.as_deref()))?;
+            return Ok(1);
+        }
         writeln!(
             out,
             "note: the supervisor stays at {} (it predates in-place upgrades): run `pooltime \
@@ -344,6 +363,20 @@ pub async fn update(
         sup.worker_version.as_deref().unwrap_or("?")
     )?;
     out.flush()?;
+    // Signal only the supervisor that is running right now: the state file is re-read and its
+    // pid must still be a `pooltime serve --supervise` process (not a reused pid).
+    match sys.supervisor() {
+        Some(now) if now.pid == sup.pid && sys.is_supervisor(sup.pid) => {}
+        _ => {
+            writeln!(
+                out,
+                "the pooltime supervisor (pid {}) is gone or was replaced meanwhile; nothing was \
+                 signalled. Run `pooltime update` again.",
+                sup.pid
+            )?;
+            return Ok(1);
+        }
+    }
     sys.signal_upgrade(sup.pid)
         .context("signalling the pooltime supervisor")?;
     let Some(after) = sys.wait_upgrade(sup.upgrades).await else {
@@ -366,6 +399,21 @@ pub async fn update(
                 sup.worker_version.as_deref().unwrap_or("?"),
                 after.pid
             )?;
+            // It re-executed the binary at its own path, which may not be the one updated.
+            let off = [
+                Some(after.version.as_str()),
+                after.worker_version.as_deref(),
+            ]
+            .into_iter()
+            .find(|v| !runs(*v));
+            if let Some(v) = off {
+                writeln!(
+                    out,
+                    "{}",
+                    elsewhere(v.unwrap_or("unknown"), after.binary.as_deref())
+                )?;
+                return Ok(1);
+            }
             Ok(0)
         }
         Some(u) => {
@@ -440,6 +488,40 @@ fn dir_writable(dir: &Path) -> bool {
     };
     // SAFETY: access(2) on a NUL-terminated path we own.
     unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+}
+
+/// The command line of process `pid`, its arguments separated by spaces.
+fn command_line(pid: u32) -> Option<String> {
+    if cfg!(target_os = "linux") {
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        let args: Vec<String> = raw
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        return (!args.is_empty()).then(|| args.join(" "));
+    }
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !line.is_empty()).then_some(line)
+}
+
+/// A `pooltime serve --supervise` command line (any path to the binary, any further flags).
+fn looks_like_supervisor(cmdline: &str) -> bool {
+    let words: Vec<&str> = cmdline.split_whitespace().collect();
+    let Some(serve) = words.iter().position(|w| *w == "serve") else {
+        return false;
+    };
+    serve > 0
+        && words[serve - 1]
+            .rsplit('/')
+            .next()
+            .is_some_and(|n| n.starts_with("pooltime"))
+        && words[serve + 1..].contains(&"--supervise")
 }
 
 struct RealSys {
@@ -567,6 +649,10 @@ impl Sys for RealSys {
         backend.supervised(&env)
     }
 
+    fn is_supervisor(&self, pid: u32) -> bool {
+        command_line(pid).is_some_and(|c| looks_like_supervisor(&c))
+    }
+
     fn signal_upgrade(&self, pid: u32) -> anyhow::Result<()> {
         crate::service::signal_upgrade(pid)
     }
@@ -685,6 +771,8 @@ mod tests {
         supervised: Option<bool>,
         after: Option<SupervisorState>,
         answer: bool,
+        /// The pid in the state file belongs to some other process now.
+        not_supervisor: bool,
         calls: Mutex<Vec<String>>,
     }
 
@@ -722,6 +810,9 @@ mod tests {
         }
         fn service_supervised(&self) -> Option<bool> {
             self.supervised
+        }
+        fn is_supervisor(&self, pid: u32) -> bool {
+            !self.not_supervisor && self.sup.as_ref().is_some_and(|s| s.pid == pid)
         }
         fn signal_upgrade(&self, pid: u32) -> anyhow::Result<()> {
             self.call(format!("usr2 {pid}"));
@@ -978,6 +1069,67 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("it keeps serving"), "{out}");
+    }
+
+    #[test]
+    fn supervisor_command_lines() {
+        for yes in [
+            "/opt/homebrew/bin/pooltime serve --supervise",
+            "pooltime serve --supervise --i-stopped-bro",
+            "/home/u/.local/bin/pooltime serve --supervise --resume {\"proto\":1}",
+        ] {
+            assert!(looks_like_supervisor(yes), "{yes}");
+        }
+        for no in [
+            "/usr/bin/vim notes",
+            "pooltime serve",
+            "pooltime serve --listen-fd 3 --control-fd 4",
+            "/bin/sh -c echo serve --supervise",
+            "",
+        ] {
+            assert!(!looks_like_supervisor(no), "{no}");
+        }
+        assert!(command_line(std::process::id()).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_reused_pid_is_never_signalled() {
+        let sys = Fake {
+            latest: "v1.3.0".into(),
+            installed: Some("1.3.0".into()),
+            sup: Some(state("1.2.0", "1.2.0", true)),
+            not_supervisor: true,
+            ..Fake::default()
+        };
+        let (code, out) = go(&sys, &brew_ctx(), yes()).await;
+        assert_eq!(code, 1, "{out}");
+        assert!(out.contains("nothing was signalled"), "{out}");
+        assert!(!sys.calls().iter().any(|c| c.starts_with("usr2")));
+    }
+
+    #[tokio::test]
+    async fn a_service_on_another_binary_is_not_reported_as_updated() {
+        // The supervisor re-executed the binary it was installed with, which is not the one
+        // this update replaced.
+        let mut after = upgraded("1.2.0", "1.2.0");
+        after.binary = Some("/home/u/.local/bin/pooltime".into());
+        let sys = Fake {
+            latest: "v1.3.0".into(),
+            installed: Some("1.3.0".into()),
+            sup: Some(state("1.2.0", "1.2.0", true)),
+            after: Some(after),
+            ..Fake::default()
+        };
+        let (code, out) = go(&sys, &brew_ctx(), yes()).await;
+        assert_eq!(code, 1, "{out}");
+        assert!(
+            out.contains("the service runs /home/u/.local/bin/pooltime, which is 1.2.0, not the 1.3.0 at /opt/homebrew/bin/pooltime"),
+            "{out}"
+        );
+        assert!(
+            out.contains("/opt/homebrew/bin/pooltime service install"),
+            "{out}"
+        );
     }
 
     #[tokio::test]

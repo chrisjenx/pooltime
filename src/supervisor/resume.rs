@@ -10,10 +10,15 @@
 //!
 //! Before the `exec`, the new binary is asked `serve --reexec-probe`: it must answer with a
 //! protocol this supervisor speaks (an older binary does not know the flag and fails), and it
-//! checks that `config.toml` loads. A failed probe or `exec` leaves the old supervisor running
-//! as it was. The stop and restart signals are blocked across the `exec` (the mask survives
-//! it) and unblocked once the new process has its handlers, so none of them can kill it in
-//! between; a pending one is delivered then.
+//! checks that `config.toml` loads and the log directory is writable. A failed probe or `exec`
+//! leaves the old supervisor running as it was.
+//!
+//! Signals: in supervisor mode only the main thread (the supervisor's loop) takes the stop,
+//! restart and upgrade signals; every other thread blocks them from its start. Before the
+//! `exec` the main thread blocks them too, then the loop runs on for a moment so a signal the
+//! runtime caught just before is still acted on (it calls the `exec` off). From then on a
+//! signal stays pending in the kernel, survives the `exec` (pending signals and the mask do) and
+//! is delivered once the new process has its handlers and unblocks.
 
 use std::ffi::{CString, OsString};
 use std::os::fd::RawFd;
@@ -150,8 +155,8 @@ fn guarded() -> libc::sigset_t {
     }
 }
 
-/// Replace this process with `argv` (`argv[0]` is the program). Returns only on failure, with
-/// the calling thread's signal mask as it was.
+/// Replace this process with `argv` (`argv[0]` is the program); the signal mask is kept (block
+/// first with [`block_signals`]). Returns only on failure.
 pub fn exec(argv: &[OsString]) -> std::io::Error {
     let args: Result<Vec<CString>, _> = argv
         .iter()
@@ -168,21 +173,25 @@ pub fn exec(argv: &[OsString]) -> std::io::Error {
     };
     let mut ptrs: Vec<*const libc::c_char> = args.iter().map(|a| a.as_ptr()).collect();
     ptrs.push(std::ptr::null());
-    let set = guarded();
-    // SAFETY: pthread_sigmask on this thread with sets we own; execv with NUL-terminated
-    // strings and a null-terminated array that outlive the call (it does not return on
-    // success).
+    // SAFETY: execv with NUL-terminated strings and a null-terminated array that outlive the
+    // call (it does not return on success).
     unsafe {
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
         libc::execv(ptrs[0], ptrs.as_ptr());
-        let err = std::io::Error::last_os_error();
-        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-        err
+    }
+    std::io::Error::last_os_error()
+}
+
+/// Block the stop, restart and upgrade signals on the calling thread (threads it starts
+/// inherit the mask).
+pub fn block_signals() {
+    let set = guarded();
+    // SAFETY: pthread_sigmask on this thread with a set we own.
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
     }
 }
 
-/// Unblock what [`exec`] blocked (a no-op when nothing was): call once the handlers are in.
+/// Unblock what [`block_signals`] blocked (a no-op when nothing was).
 pub fn unblock_signals() {
     let set = guarded();
     // SAFETY: pthread_sigmask on this thread with a set we own.
@@ -310,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_exec_returns_and_restores_the_signal_mask() {
+    fn a_failed_exec_returns_and_the_signal_guard_toggles() {
         let mask = || {
             // SAFETY: reading this thread's mask into a set we own.
             unsafe {
@@ -320,9 +329,13 @@ mod tests {
             }
         };
         assert_eq!(mask(), 0);
+        block_signals();
+        assert_eq!(mask(), 1);
         let err = exec(&[OsString::from("/nonexistent/pooltime-test-binary")]);
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        assert_eq!(mask(), 0, "the mask is restored");
+        assert_eq!(mask(), 1, "exec leaves the mask alone");
+        unblock_signals();
+        assert_eq!(mask(), 0);
         assert_eq!(
             exec(&[OsString::from("a\0b")]).kind(),
             std::io::ErrorKind::InvalidInput

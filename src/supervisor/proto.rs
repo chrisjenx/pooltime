@@ -115,6 +115,9 @@ pub struct SupervisorState {
     pub upgrading: bool,
     #[serde(default)]
     pub last_upgrade: Option<UpgradeResult>,
+    /// The binary path new workers (and an upgrade) run.
+    #[serde(default)]
+    pub binary: Option<String>,
 }
 
 /// How the last in-place upgrade of the supervisor went.
@@ -233,6 +236,7 @@ mod tests {
                 version: "1.0.0".into(),
                 error: None,
             }),
+            binary: Some("/opt/homebrew/bin/pooltime".into()),
         };
         write_state(&paths, &st).unwrap();
         assert_eq!(read_state(&paths).as_ref(), Some(&st));

@@ -149,8 +149,11 @@ hands over to it as `service restart` does: in-flight requests and streams finis
 worker, new ones go to the new one, nothing is refused. It prints the versions before and after.
 
 - Before replacing the supervisor, the new binary is asked whether it can take over (an older
-  binary cannot) and whether `config.toml` loads. If not, or if anything else goes wrong, the
+  binary cannot), whether `config.toml` loads and whether the log directory can be written. If not, or if anything else goes wrong, the
   running service keeps serving as it was and `pooltime update` prints why and exits 1.
+- It only signals the supervisor that runs right now: the state file is read again and its pid
+  must still be a `pooltime serve --supervise` process. If the service runs a different binary
+  than the one updated (installed from another place), it says so, names both paths and exits 1.
 - Already on the latest release (say, after a manual `brew upgrade`)? `pooltime update` still
   moves a service that runs an older version onto the installed binary.
 - A supervisor from before 1.3 cannot replace itself: `pooltime update` gives it new workers

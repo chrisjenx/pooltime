@@ -159,9 +159,22 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
     {
         return Ok(reexec_probe(&paths));
     }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let supervise = matches!(&command, Command::Serve(f) if f.supervise);
+    if matches!(&command, Command::Serve(f) if f.listen_fd.is_some()) {
+        // A worker: the supervisor's upgrade signal (`pkill -USR2`, a process-group signal)
+        // must not kill it (the default action), so ignore it before anything else runs.
+        // SAFETY: setting a signal disposition to SIG_IGN, before any other thread exists.
+        unsafe {
+            libc::signal(libc::SIGUSR2, libc::SIG_IGN);
+        }
+    }
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if supervise {
+        // Only the supervisor's own (main) thread takes its signals; see `supervisor::resume`.
+        builder.on_thread_start(crate::supervisor::resume::block_signals);
+    }
+    let rt = builder.build()?;
     rt.block_on(async move {
         match command {
             Command::Serve(flags) if flags.supervise => crate::supervisor::run(paths, flags).await,
@@ -198,8 +211,13 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
 
 /// `serve --reexec-probe`: a supervisor asks this before it re-executes into this binary. Fails
 /// (without quoting it: it may hold the proxy key) when `config.toml` does not load, since the
-/// new supervisor would then run on defaults.
+/// new supervisor would then run on defaults, and when the data or log directory cannot be
+/// prepared or written (the new supervisor's first steps).
 fn reexec_probe(paths: &Paths) -> i32 {
+    if let Err(e) = crate::logging::check_writable(paths) {
+        eprintln!("the log directory cannot be written: {e:#}");
+        return 1;
+    }
     match crate::config::Config::load(paths).and_then(|c| c.validate().map(|()| c)) {
         Ok(_) => {
             println!("{}", crate::supervisor::resume::probe_line());

@@ -17,7 +17,7 @@
   like `service restart`. In-flight requests finish on the old worker, nothing is refused. If the
   new binary cannot take over (an older one, or a `config.toml` that does not load) or the
   `exec` fails, the running service keeps serving as it was and the error is reported.
-  `SIGHUP` / `service restart` still replace only the workers.
+  `SIGHUP` / `service restart` still replace only the workers. Workers ignore `SIGUSR2`.
 
 ### Changed
 

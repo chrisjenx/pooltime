@@ -146,16 +146,26 @@ with until `service install` (a full stop and start). Options:
 Safety:
 
 - **Probe first.** `<bin> serve --reexec-probe` must answer `pooltime-resume <formats>
-  <version>` with the format this supervisor writes, and fails if `config.toml` does not load.
+  <version>` with the format this supervisor writes, and fails if `config.toml` does not load
+  or the data / log directory cannot be prepared and written.
   An older binary does not know the flag and fails the probe: no `exec`. The resumed process
   still falls back to defaults if `config.toml` broke after the probe (the socket is bound
   already), rather than orphaning its workers.
 - **Only when idle.** No generation booting or releasing (their `ready` / `released` lines would
   be lost across the `exec`) and none to respawn; the upgrade waits up to 2 minutes for that.
-- **Signals.** `SIGHUP`/`SIGTERM`/`SIGINT`/`SIGUSR2` are blocked across the `exec` (the mask is
-  inherited; handlers are not) and unblocked once the new process has installed its handlers, so
-  a stop or restart that arrives in between is delivered then instead of killing it. Workers get
-  an empty mask from `std`'s spawn.
+- **Signals.** In supervisor mode only the main thread (the supervisor's loop) takes
+  `SIGHUP`/`SIGTERM`/`SIGINT`/`SIGUSR2`: the runtime's threads block them from their start, and
+  the log writer thread is spawned while the main thread blocks them too (until the handlers are
+  installed). Before the `exec` the main thread blocks them and the loop runs on for 150 ms, so a
+  signal the runtime caught just before is still handled (a stop cancels the upgrade, a restart
+  postpones it until it is done). After that a signal stays pending in the kernel, survives the
+  `exec` (pending signals and the mask do; handlers do not) and is delivered once the new process
+  has its handlers. Workers get an empty mask from `std`'s spawn and ignore `SIGUSR2`, so a
+  `pkill -USR2` or process-group signal does not kill them.
+- **No exit once re-executed.** The new process holds the workers' control sockets, so it does
+  not exit on a data-directory, log or listener error: it logs to stderr and keeps the adopted
+  workers serving (without the listener it cannot start new ones; the first one's failure is
+  reported).
 - **Failure.** A failed probe or `execve` leaves the old supervisor as it was (descriptors marked
   close-on-exec again, mask restored). A new first worker that fails leaves the adopted one
   serving. Every outcome is recorded in `run/supervisor.json` (`upgrades`, `last_upgrade`), which
