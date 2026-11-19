@@ -101,18 +101,19 @@ ALTER TABLE usage_samples ADD COLUMN last_hw REAL;
 ALTER TABLE usage_samples ADD COLUMN resets INTEGER;
 ";
 
-/// Schema v5 (usage attribution): the project a client session works in, one row per session
-/// (`session_hash` as in `journal_requests`). `project` is the repository or directory name only
-/// (never the path); `path_hash` is 16 hex chars of SHA-256 over the project's root path, so two
-/// projects with the same name stay apart. `first_seen`/`last_seen` are unix seconds. A row goes
-/// when the journal no longer holds a request of its session (retention).
+/// Schema v5 (usage attribution): each request keeps `cwd_hash`, 16 hex chars of SHA-256 over
+/// the working directory its body named (never the directory itself), and `cwd_projects` maps a
+/// working directory to its project, resolved off the request path. `project` is the repository
+/// or directory name only; `path_hash` is the same hash over the project's root path, so two
+/// projects with the same name stay apart. `first_seen` is unix seconds. A row goes when the
+/// journal no longer holds a request with its `cwd_hash` (retention).
 const V5: &str = "
-CREATE TABLE session_projects (
-    session_hash TEXT PRIMARY KEY,
-    project      TEXT NOT NULL,
-    path_hash    TEXT,
-    first_seen   INTEGER,
-    last_seen    INTEGER
+ALTER TABLE journal_requests ADD COLUMN cwd_hash TEXT;
+CREATE TABLE cwd_projects (
+    cwd_hash   TEXT PRIMARY KEY,
+    project    TEXT NOT NULL,
+    path_hash  TEXT,
+    first_seen INTEGER
 );
 ";
 

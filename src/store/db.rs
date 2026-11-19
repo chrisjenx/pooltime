@@ -214,7 +214,7 @@ mod tests {
             "alerts_sent",
             "journal_attempts",
             "journal_requests",
-            "session_projects",
+            "cwd_projects",
             "sessions",
             "timeline",
             "usage_samples",
@@ -340,15 +340,16 @@ mod tests {
     }
 
     #[test]
-    fn v4_database_upgrades_to_v5_session_projects() {
+    fn v4_database_upgrades_to_v5_cwd_projects() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pooltime.db");
         {
-            // A current database rolled back to v4: no `session_projects` yet, one request.
+            // A current database rolled back to v4: no `cwd_projects` or `cwd_hash`, one request.
             drop(Store::open(&path).unwrap());
             let c = rusqlite::Connection::open(&path).unwrap();
             c.execute_batch(
-                "DROP TABLE session_projects;
+                "DROP TABLE cwd_projects;
+                 ALTER TABLE journal_requests DROP COLUMN cwd_hash;
                  INSERT INTO journal_requests(id, ts, outcome, session_hash)
                      VALUES ('old', 1, 'completed', 'aaaaaaaaaaaaaaaa');",
             )
@@ -364,11 +365,15 @@ mod tests {
             .read(|c| {
                 Ok((
                     c.query_row("SELECT count(*) FROM journal_requests", [], |r| r.get(0))?,
-                    c.query_row("SELECT count(*) FROM session_projects", [], |r| r.get(0))?,
+                    c.query_row("SELECT count(*) FROM cwd_projects", [], |r| r.get(0))?,
                 ))
             })
             .unwrap();
         assert_eq!((requests, projects), (1, 0));
+        let cwd: Option<String> = store
+            .read(|c| Ok(c.query_row("SELECT cwd_hash FROM journal_requests", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(cwd, None);
     }
 
     #[test]

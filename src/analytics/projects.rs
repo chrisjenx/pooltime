@@ -1,11 +1,11 @@
 //! Usage by project and by session ("which repos/sessions eat quota") over the last 24 hours,
-//! 7 days or 30 days, from the request journal and the sessions' projects
-//! ([`super::attribution`]).
+//! 7 days or 30 days, from the request journal and the working directories' projects
+//! ([`super::attribution`]; [`attribute`] gives each request its project).
 //!
 //! Per project and per session: requests, tokens (input, output, cache read, cache write; `tokens`
-//! is their sum), `share` (of all tokens in the range) and the accounts that served them.
-//! Requests without a session, or whose session never named a working directory, count under
-//! the `unknown` project. Two projects with the same name are told apart by their `key` (the
+//! is their sum), `share` (of all tokens in the range) and the accounts that served them. A
+//! session line shows the latest project it worked on. Requests that named no working
+//! directory and whose session never did either count under the `unknown` project. Two projects with the same name are told apart by their `key` (the
 //! path hash): their `label` gets the key's first four characters.
 //!
 //! Quota estimate (`est_subs`, in subscriptions: 1.0 = one account's whole 7-day window): each
@@ -25,7 +25,7 @@ use time::OffsetDateTime;
 
 use super::attribution::UNKNOWN;
 use super::burn::consumed_between;
-use crate::store::projects::{usage_rows, UsageRow};
+use crate::store::projects::{projects as cwd_projects, usage_rows, UsageRow};
 use crate::store::usage_history::{self, WINDOW_7D};
 use crate::store::Store;
 
@@ -382,12 +382,43 @@ pub fn compute(
     }
 }
 
+/// Set each row's project from the working directory it named (`known`: `cwd_hash -> (project,
+/// path_hash)`). A row that named none takes the directory its session named last before it,
+/// else the session's first one (a session's title or quota-check requests carry no environment
+/// block). A directory without a project (`/`, or not resolved yet) stays `unknown`.
+pub fn attribute(rows: &mut [UsageRow], known: &HashMap<String, (String, Option<String>)>) {
+    let mut first: HashMap<String, String> = HashMap::new();
+    for r in rows.iter() {
+        if let (Some(s), Some(c)) = (&r.session_hash, &r.cwd_hash) {
+            first.entry(s.clone()).or_insert_with(|| c.clone());
+        }
+    }
+    let mut last: HashMap<String, String> = HashMap::new();
+    for r in rows.iter_mut() {
+        let cwd = match (&r.cwd_hash, &r.session_hash) {
+            (Some(c), Some(s)) => {
+                last.insert(s.clone(), c.clone());
+                Some(c.clone())
+            }
+            (Some(c), None) => Some(c.clone()),
+            (None, Some(s)) => last.get(s).or_else(|| first.get(s)).cloned(),
+            (None, None) => None,
+        };
+        if let Some((project, path_hash)) = cwd.and_then(|c| known.get(&c)) {
+            r.project = Some(project.clone());
+            r.path_hash.clone_from(path_hash);
+        }
+    }
+}
+
 /// The report for the `range` ending at `now`, from the store. A blocking read: call off the
 /// async threads.
 pub fn report(store: &Store, now: OffsetDateTime, range: Range) -> anyhow::Result<ProjectReport> {
     let now = now.unix_timestamp();
     let since = now - range.secs();
-    let rows = store.read(|c| usage_rows(c, since))?;
+    let mut rows = store.read(|c| usage_rows(c, since))?;
+    let known = store.read(cwd_projects)?;
+    attribute(&mut rows, &known);
     let history = store.read(|c| usage_history::rows_since(c, WINDOW_7D, since))?;
     let consumed = consumed_between(&history, since, now);
     Ok(compute(&rows, &consumed, range, now))
@@ -416,6 +447,7 @@ mod tests {
             output_tokens: tokens.1,
             cache_read: tokens.2,
             cache_write: tokens.3,
+            ..UsageRow::default()
         }
     }
 
@@ -559,6 +591,7 @@ mod tests {
                 input_tokens: Some(100),
                 output_tokens: Some(10),
                 session_hash: Some("s1".into()),
+                cwd_hash: Some("c1".into()),
                 ..RequestRow::default()
             };
             let att = AttemptRow {
@@ -573,7 +606,7 @@ mod tests {
                 name: "acme".into(),
                 path_hash: "1111aaaa22223333".into(),
             };
-            crate::store::projects::upsert(c, "s1", &acme, NOW - 600)?;
+            crate::store::projects::upsert(c, "c1", &acme, NOW - 600)?;
             let reset = Some(NOW + 86_400);
             for (ts, util) in [(NOW - 3600, 0.2), (NOW - 60, 0.25)] {
                 insert_sample(c, "acct-a", WINDOW_7D, &Point { ts, util, reset })?;
@@ -588,6 +621,62 @@ mod tests {
         let est = r.projects[0].est_subs.unwrap();
         assert!((est - 0.05).abs() < 1e-9, "{est}");
         assert!((r.quota.unwrap().consumed - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attribute_follows_the_directory_not_just_the_session() {
+        let r = |ts: i64, s: Option<&str>, c: Option<&str>| UsageRow {
+            ts,
+            session_hash: s.map(str::to_string),
+            cwd_hash: c.map(str::to_string),
+            ..UsageRow::default()
+        };
+        let known = HashMap::from([
+            (
+                "c-acme".to_string(),
+                ("acme".to_string(), Some("h1".to_string())),
+            ),
+            (
+                "c-wid".to_string(),
+                ("widgets".to_string(), Some("h2".to_string())),
+            ),
+        ]);
+        // One constant user id used from two directories.
+        let mut rows = vec![
+            r(1, Some("s"), None), // before any: the session's first directory
+            r(2, Some("s"), Some("c-acme")),
+            r(3, Some("s"), None), // follows the last named: acme
+            r(4, Some("s"), Some("c-wid")),
+            r(5, Some("s"), None),           // widgets
+            r(6, None, Some("c-wid")),       // no session, named directory
+            r(7, Some("s"), Some("c-root")), // `/` (no project row): unknown
+            r(8, None, None),
+        ];
+        attribute(&mut rows, &known);
+        let got: Vec<Option<&str>> = rows.iter().map(|r| r.project.as_deref()).collect();
+        assert_eq!(
+            got,
+            [
+                Some("acme"),
+                Some("acme"),
+                Some("acme"),
+                Some("widgets"),
+                Some("widgets"),
+                Some("widgets"),
+                None,
+                None
+            ]
+        );
+        let report = compute(&rows, &BTreeMap::new(), Range::Day, NOW);
+        let names: Vec<&str> = report.projects.iter().map(|p| p.project.as_str()).collect();
+        assert!(
+            names.contains(&"acme") && names.contains(&"widgets"),
+            "{names:?}"
+        );
+        assert_eq!(
+            report.sessions[0].project, "widgets",
+            "the latest known project"
+        );
     }
 
     #[test]

@@ -18,9 +18,9 @@
 //!
 //! Privacy: no bodies, prompts, upstream error messages, tokens or raw `metadata.user_id` are
 //! ever stored; the session is kept as [`crate::logging::hash_session`] (16 hex chars of
-//! SHA-256), the upstream request id only when it is made of token-safe characters. A session's
-//! project (usage attribution) goes to `session_projects` with the row: a directory name and a
-//! path hash, never the path ([`crate::analytics::attribution`]).
+//! SHA-256), the upstream request id only when it is made of token-safe characters. The working
+//! directory a body named is kept only as `cwd_hash` (the same 16-hex hash), never the path
+//! (usage attribution, [`crate::analytics::attribution`]).
 //!
 //! Timing: `ts` is unix seconds at request start; `ttfb_ms` is the time until the response
 //! headers were ready; `total_ms` runs until the row is finalised (the end of a streamed body);
@@ -74,6 +74,9 @@ pub struct RequestRow {
     pub cache_read: Option<i64>,
     pub cache_write: Option<i64>,
     pub session_hash: Option<String>,
+    /// Hash of the working directory the body named (usage attribution; not in API answers).
+    #[serde(skip)]
+    pub cwd_hash: Option<String>,
 }
 
 /// One `journal_attempts` row.
@@ -137,8 +140,8 @@ pub fn insert(
     )?;
     tx.execute(
         "INSERT OR REPLACE INTO journal_requests(id, ts, path, model, provider, status, outcome, reason,
-            ttfb_ms, total_ms, input_tokens, output_tokens, cache_read, cache_write, session_hash)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            ttfb_ms, total_ms, input_tokens, output_tokens, cache_read, cache_write, session_hash, cwd_hash)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         params![
             r.id,
             r.ts,
@@ -154,7 +157,8 @@ pub fn insert(
             r.output_tokens,
             r.cache_read,
             r.cache_write,
-            r.session_hash
+            r.session_hash,
+            r.cwd_hash
         ],
     )?;
     for a in attempts {
@@ -180,7 +184,7 @@ pub fn insert(
 
 const REQUEST_COLS: &str = "r.id, r.ts, r.path, r.model, r.provider, r.status, r.outcome, r.reason,
     r.ttfb_ms, r.total_ms, r.input_tokens, r.output_tokens, r.cache_read, r.cache_write,
-    r.session_hash";
+    r.session_hash, r.cwd_hash";
 
 fn request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestRow> {
     Ok(RequestRow {
@@ -199,6 +203,7 @@ fn request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestRow> {
         cache_read: row.get(12)?,
         cache_write: row.get(13)?,
         session_hash: row.get(14)?,
+        cwd_hash: row.get(15)?,
     })
 }
 
@@ -223,8 +228,8 @@ pub fn list(
     let rows = st.query_map([limit], |row| {
         Ok(RequestSummary {
             request: request_row(row)?,
-            attempts: row.get(15)?,
-            account: row.get(16)?,
+            attempts: row.get(16)?,
+            account: row.get(17)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -416,8 +421,6 @@ struct Draft {
     stream_outcome: Option<&'static str>,
     /// The provider whose response reached the client (wins over the last attempt's).
     served_provider: Option<String>,
-    /// The session's project (written to `session_projects` with the row).
-    project: Option<crate::analytics::attribution::Project>,
 }
 
 struct Live {
@@ -463,15 +466,8 @@ impl Drop for Live {
             row.provider = Some(last.provider.clone());
         }
         let attempts = std::mem::take(&mut d.attempts);
-        let project = d.project.take();
         let queued = self.store.submit(move |conn| {
             note_write(insert(conn, &row, &attempts).context("insert journal row"));
-            if let (Some(session), Some(p)) = (&row.session_hash, &project) {
-                note_write(
-                    super::projects::upsert(conn, session, p, row.ts)
-                        .context("record session project"),
-                );
-            }
             Ok(())
         });
         if let Err(e) = queued {
@@ -549,17 +545,12 @@ impl Journal {
 
     /// `metadata.user_id`, stored only as its hash.
     pub fn set_session(&self, user_id: &str) {
-        self.set_session_hash(crate::logging::hash_session(user_id));
+        self.with(|d, _| d.row.session_hash = Some(crate::logging::hash_session(user_id)));
     }
 
-    /// The session as [`crate::logging::hash_session`] of `metadata.user_id`.
-    pub fn set_session_hash(&self, hash: String) {
-        self.with(|d, _| d.row.session_hash = Some(hash));
-    }
-
-    /// The session's project (recorded with the row when the request has a session).
-    pub fn set_project(&self, project: crate::analytics::attribution::Project) {
-        self.with(|d, _| d.project = Some(project));
+    /// The hash of the working directory the request body named (usage attribution).
+    pub fn set_cwd_hash(&self, hash: String) {
+        self.with(|d, _| d.row.cwd_hash = Some(hash));
     }
 
     /// An attempt on `account` starts.

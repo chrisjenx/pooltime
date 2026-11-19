@@ -1,39 +1,48 @@
-//! `session_projects`: the project each client session works in (usage attribution), and the
-//! per-request rows the attribution report totals. See [`crate::analytics::attribution`] for how
-//! a project is found and [`crate::analytics::projects`] for the report.
+//! `cwd_projects`: the project of each working directory requests named (usage attribution), and
+//! the per-request rows the attribution report totals. See [`crate::analytics::attribution`] for
+//! how a project is found and [`crate::analytics::projects`] for the report.
+
+use std::collections::HashMap;
 
 use rusqlite::{params, Connection};
 
 use crate::analytics::attribution::Project;
 
-/// Record that session `session_hash` works in `project`, seen at `ts` (unix seconds). The latest
-/// label wins; `first_seen` is kept.
+/// Record that working directory `cwd_hash` belongs to `project`, first seen at `ts` (unix
+/// seconds). The latest label wins; `first_seen` is kept.
 pub fn upsert(
     conn: &Connection,
-    session_hash: &str,
+    cwd_hash: &str,
     project: &Project,
     ts: i64,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO session_projects(session_hash, project, path_hash, first_seen, last_seen)
-         VALUES (?1, ?2, ?3, ?4, ?4)
-         ON CONFLICT(session_hash) DO UPDATE SET
+        "INSERT INTO cwd_projects(cwd_hash, project, path_hash, first_seen)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(cwd_hash) DO UPDATE SET
              project = excluded.project,
              path_hash = excluded.path_hash,
-             first_seen = min(first_seen, excluded.first_seen),
-             last_seen = max(last_seen, excluded.last_seen)",
-        params![session_hash, project.name, project.path_hash, ts],
+             first_seen = min(first_seen, excluded.first_seen)",
+        params![cwd_hash, project.name, project.path_hash, ts],
     )?;
     Ok(())
 }
 
-/// Drop the sessions the journal no longer holds a request of (after journal pruning).
+/// Drop the working directories the journal no longer holds a request of (after journal
+/// pruning).
 pub fn prune_orphans(conn: &Connection) -> rusqlite::Result<usize> {
     conn.execute(
-        "DELETE FROM session_projects WHERE session_hash NOT IN
-             (SELECT session_hash FROM journal_requests WHERE session_hash IS NOT NULL)",
+        "DELETE FROM cwd_projects WHERE cwd_hash NOT IN
+             (SELECT cwd_hash FROM journal_requests WHERE cwd_hash IS NOT NULL)",
         [],
     )
+}
+
+/// Every known working directory's project: `cwd_hash -> (project, path_hash)`.
+pub fn projects(conn: &Connection) -> anyhow::Result<HashMap<String, (String, Option<String>)>> {
+    let mut st = conn.prepare("SELECT cwd_hash, project, path_hash FROM cwd_projects")?;
+    let rows = st.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
+    Ok(rows.collect::<Result<_, _>>()?)
 }
 
 /// One Messages request since the report's start, with what attribution needs.
@@ -41,7 +50,9 @@ pub fn prune_orphans(conn: &Connection) -> rusqlite::Result<usize> {
 pub struct UsageRow {
     pub ts: i64,
     pub session_hash: Option<String>,
-    /// The session's project (`None`: unknown).
+    /// The working directory the request named (hash), if any.
+    pub cwd_hash: Option<String>,
+    /// The request's project (`None`: unknown); filled in by the report.
     pub project: Option<String>,
     pub path_hash: Option<String>,
     /// The account that served it (the last attempt's), if any attempt ran.
@@ -55,13 +66,12 @@ pub struct UsageRow {
 /// Every `/v1/messages` request since `since` (unix seconds), oldest first.
 pub fn usage_rows(conn: &Connection, since: i64) -> anyhow::Result<Vec<UsageRow>> {
     let mut st = conn.prepare(
-        "SELECT r.ts, r.session_hash, sp.project, sp.path_hash,
+        "SELECT r.ts, r.session_hash, r.cwd_hash,
             (SELECT a.account FROM journal_attempts a WHERE a.request_id = r.id
              ORDER BY a.n DESC LIMIT 1),
             coalesce(r.input_tokens, 0), coalesce(r.output_tokens, 0),
             coalesce(r.cache_read, 0), coalesce(r.cache_write, 0)
          FROM journal_requests r
-         LEFT JOIN session_projects sp ON sp.session_hash = r.session_hash
          WHERE r.ts >= ?1 AND (r.path IS NULL OR r.path = '/v1/messages')
          ORDER BY r.ts, r.rowid",
     )?;
@@ -69,13 +79,13 @@ pub fn usage_rows(conn: &Connection, since: i64) -> anyhow::Result<Vec<UsageRow>
         Ok(UsageRow {
             ts: r.get(0)?,
             session_hash: r.get(1)?,
-            project: r.get(2)?,
-            path_hash: r.get(3)?,
-            account: r.get(4)?,
-            input_tokens: r.get(5)?,
-            output_tokens: r.get(6)?,
-            cache_read: r.get(7)?,
-            cache_write: r.get(8)?,
+            cwd_hash: r.get(2)?,
+            account: r.get(3)?,
+            input_tokens: r.get(4)?,
+            output_tokens: r.get(5)?,
+            cache_read: r.get(6)?,
+            cache_write: r.get(7)?,
+            ..UsageRow::default()
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -102,39 +112,41 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(store.exec(|c| {
-            upsert(c, "s1", &project("acme", "h1"), 100)?;
-            upsert(c, "s1", &project("acme2", "h2"), 200)?;
-            upsert(c, "s1", &project("acme2", "h2"), 150)?;
+            upsert(c, "c1", &project("acme", "h1"), 100)?;
+            upsert(c, "c1", &project("acme2", "h2"), 200)?;
             Ok(())
         }))
         .unwrap();
-        let row: (String, String, i64, i64) = store
+        let row: (String, String, i64) = store
             .read(|c| {
                 Ok(c.query_row(
-                    "SELECT project, path_hash, first_seen, last_seen FROM session_projects",
+                    "SELECT project, path_hash, first_seen FROM cwd_projects",
                     [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )?)
             })
             .unwrap();
-        assert_eq!(row, ("acme2".into(), "h2".into(), 100, 200));
+        assert_eq!(row, ("acme2".into(), "h2".into(), 100));
+        let all = store.read(projects).unwrap();
+        assert_eq!(all["c1"], ("acme2".to_string(), Some("h2".to_string())));
     }
 
     #[test]
-    fn usage_rows_join_the_session_project_and_serving_account() {
+    fn usage_rows_carry_the_cwd_and_serving_account() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("pooltime.db")).unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        let req = |id: &str, ts: i64, path: &str, session: Option<&str>| RequestRow {
+        let req = |id: &str, ts: i64, path: &str, cwd: Option<&str>| RequestRow {
             id: id.into(),
             ts,
             path: Some(path.into()),
             outcome: "completed".into(),
             input_tokens: Some(10),
             output_tokens: Some(2),
-            session_hash: session.map(str::to_string),
+            session_hash: Some("s1".into()),
+            cwd_hash: cwd.map(str::to_string),
             ..RequestRow::default()
         };
         let att = |n: u32, account: &str| AttemptRow {
@@ -145,32 +157,27 @@ mod tests {
             ..AttemptRow::default()
         };
         rt.block_on(store.exec(move |c| {
-            journal::insert(c, &req("old", 5, "/v1/messages", Some("s1")), &[])?;
+            journal::insert(c, &req("old", 5, "/v1/messages", Some("c1")), &[])?;
             journal::insert(
                 c,
-                &req("a", 20, "/v1/messages", Some("s1")),
+                &req("a", 20, "/v1/messages", Some("c1")),
                 &[att(1, "acct-a"), att(2, "acct-b")],
             )?;
             journal::insert(c, &req("b", 21, "/v1/messages", None), &[att(1, "acct-a")])?;
-            journal::insert(
-                c,
-                &req("c", 22, "/v1/messages/count_tokens", Some("s1")),
-                &[],
-            )?;
-            upsert(c, "s1", &project("acme", "h1"), 20)?;
+            journal::insert(c, &req("c", 22, "/v1/messages/count_tokens", None), &[])?;
+            upsert(c, "c1", &project("acme", "h1"), 20)?;
             upsert(c, "gone", &project("old", "h0"), 1)?;
             Ok(())
         }))
         .unwrap();
         let rows = store.read(|c| usage_rows(c, 10)).unwrap();
         assert_eq!(rows.len(), 2, "{rows:?}");
-        assert_eq!(rows[0].project.as_deref(), Some("acme"));
+        assert_eq!(rows[0].cwd_hash.as_deref(), Some("c1"));
         assert_eq!(rows[0].account.as_deref(), Some("acct-b"), "last attempt");
         assert_eq!((rows[0].input_tokens, rows[0].cache_read), (10, 0));
-        assert_eq!(rows[1].project, None);
-        assert_eq!(rows[1].session_hash, None);
+        assert_eq!(rows[1].cwd_hash, None);
 
         let pruned = rt.block_on(store.exec(|c| Ok(prune_orphans(c)?))).unwrap();
-        assert_eq!(pruned, 1, "the session without journal rows");
+        assert_eq!(pruned, 1, "the directory without journal rows");
     }
 }

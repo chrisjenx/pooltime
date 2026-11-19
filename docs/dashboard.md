@@ -71,10 +71,14 @@ The Projects view answers "which repos and sessions are eating quota". The same 
   directory in Claude Code's system prompt (its environment block). Subdirectories and
   worktrees (including `.claude/worktrees/<name>`) count as their repository. Without a git
   repository it is the directory itself. Two projects with the same name get a short suffix
-  (`acme (3f2a)`). **unknown** collects requests without a session id (`metadata.user_id`) or
-  whose session never named a working directory.
-- A session's first request that names a directory labels the whole session, including its other
-  requests (title generation, quota checks) that carry no environment block.
+  (`acme (3f2a)`). **unknown** collects requests that named no working directory and whose
+  session (`metadata.user_id`) never did either, and requests from `/`.
+- Each request counts for the directory it names, so one session id used from several
+  directories is split between them. A request that names none (title generation, quota checks)
+  counts for the directory its session named last before it, else the session's first one.
+- The project of a new directory is looked up in the background, never on the request's path;
+  a filesystem that does not answer within 2 seconds (a stalled network mount) gets the
+  path-only answer.
 - **Share** is of all tokens (input, output, cache read, cache write) in the range.
 - **Est. quota** is in subscriptions (1.000 = one account's whole 7-day window). Each account's
   sampled 7-day usage that rose within the range is split over the projects it served, in
@@ -87,8 +91,9 @@ The Projects view answers "which repos and sessions are eating quota". The same 
 - **Sessions** shows the 50 sessions with the most usage, by session hash (the same hash as in a
   request's attempt chain on the Requests view).
 
-Privacy: only the directory name and a hash of its path are stored (locally, in the
-`session_projects` table), never the path; they are pruned with the journal (see
+Privacy: only a hash of each request's working directory, and per directory the project name
+and a hash of its path are stored (locally: `journal_requests.cwd_hash` and the `cwd_projects`
+table), never the path; they are pruned with the journal (see
 [Retention](retention.md)).
 
 ## Reading the overview

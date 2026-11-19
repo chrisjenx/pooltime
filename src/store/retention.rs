@@ -31,8 +31,8 @@ pub struct PruneReport {
     pub journal_attempts: u64,
     pub timeline: u64,
     pub alerts_sent: u64,
-    /// Session project labels whose session has no journal request left.
-    pub session_projects: u64,
+    /// Working-directory project labels with no journal request left.
+    pub cwd_projects: u64,
     /// Hourly rows consumed by the daily rollup.
     pub usage_hourly_rolled_up: u64,
     pub usage_daily_created: u64,
@@ -152,8 +152,8 @@ fn prune_journal(
         rep.journal_attempts += attempts as u64;
         rep.journal_requests_by_size += requests as u64;
     }
-    // A session's project label lives as long as the journal holds one of its requests.
-    rep.session_projects = super::projects::prune_orphans(conn)? as u64;
+    // A working directory.s project label lives as long as the journal holds one of its requests.
+    rep.cwd_projects = super::projects::prune_orphans(conn)? as u64;
     Ok(())
 }
 
@@ -337,17 +337,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_drops_session_projects_with_their_last_request() {
+    async fn prune_drops_cwd_projects_with_their_last_request() {
         let (_d, store) = open();
         store
             .exec(|c| {
                 insert_request(c, "old", NOW - 31 * DAY, "m");
                 insert_request(c, "new", NOW - DAY, "m");
                 c.execute_batch(
-                    "UPDATE journal_requests SET session_hash = 's-old' WHERE id = 'old';
-                     UPDATE journal_requests SET session_hash = 's-new' WHERE id = 'new';
-                     INSERT INTO session_projects(session_hash, project, path_hash, first_seen, last_seen)
-                         VALUES ('s-old', 'acme', 'h1', 1, 1), ('s-new', 'widgets', 'h2', 1, 1);",
+                    "UPDATE journal_requests SET cwd_hash = 'c-old' WHERE id = 'old';
+                     UPDATE journal_requests SET cwd_hash = 'c-new' WHERE id = 'new';
+                     INSERT INTO cwd_projects(cwd_hash, project, path_hash, first_seen)
+                         VALUES ('c-old', 'acme', 'h1', 1), ('c-new', 'widgets', 'h2', 1);",
                 )?;
                 Ok(())
             })
@@ -356,15 +356,15 @@ mod tests {
         let rep = prune(&store, &RetentionCfg::default(), now())
             .await
             .unwrap();
-        assert_eq!(rep.session_projects, 1);
+        assert_eq!(rep.cwd_projects, 1);
         assert_eq!(
             count(
                 &store,
-                "SELECT count(*) FROM session_projects WHERE session_hash = 's-new'"
+                "SELECT count(*) FROM cwd_projects WHERE cwd_hash = 'c-new'"
             ),
             1
         );
-        assert_eq!(count(&store, "SELECT count(*) FROM session_projects"), 1);
+        assert_eq!(count(&store, "SELECT count(*) FROM cwd_projects"), 1);
     }
 
     #[tokio::test]

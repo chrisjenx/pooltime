@@ -171,18 +171,19 @@ async fn projects(addr: std::net::SocketAddr, query: &str) -> support::sockets::
     http_req(addr, "GET", &path, &[MGMT], b"").await
 }
 
-/// The 24-hour report once the journal holds `n` requests (rows are written off the request path).
-async fn report_with(addr: std::net::SocketAddr, n: u64) -> Value {
+/// The 24-hour report once the journal holds `n` requests and `p` projects (rows and project
+/// labels are written off the request path).
+async fn report_with(addr: std::net::SocketAddr, n: u64, p: usize) -> Value {
     for _ in 0..100 {
         let r = projects(addr, "?range=24h").await;
         assert_eq!(r.status, 200, "{}", r.text());
         let v = r.json();
-        if v["totals"]["requests"] == n {
+        if v["totals"]["requests"] == n && v["projects"].as_array().map(Vec::len) == Some(p) {
             return v;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("the journal never held {n} requests");
+    panic!("the journal never held {n} requests in {p} projects");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -203,7 +204,7 @@ async fn projects_endpoint_attributes_sessions_to_their_repository() {
     send(a, &session_body("session-two", Some(worktree))).await;
     send(a, &session_body("session-three", None)).await;
 
-    let v = report_with(a, 4).await;
+    let v = report_with(a, 4, 3).await;
     assert_eq!(v["range"], "24h");
     // No usage history in the test pool: tokens only, no invented quota.
     assert!(v["quota"].is_null(), "{v}");
@@ -240,8 +241,7 @@ async fn projects_endpoint_attributes_sessions_to_their_repository() {
     let stored: Vec<String> = pool
         .store
         .read(|c| {
-            let mut st =
-                c.prepare("SELECT session_hash || project || path_hash FROM session_projects")?;
+            let mut st = c.prepare("SELECT cwd_hash || project || path_hash FROM cwd_projects")?;
             let rows = st.query_map([], |r| r.get(0))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
@@ -277,6 +277,41 @@ async fn projects_endpoint_attributes_sessions_to_their_repository() {
     let week = projects(a, "?range=7d").await.json();
     assert_eq!(week["range"], "7d");
     assert_eq!(week["totals"]["requests"], 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_user_id_in_two_directories_counts_for_both() {
+    let fake = FakeAnthropic::start().await;
+    fake.route(MESSAGES, |_, _| Reply::json(200, &ok_message(30, 20)));
+    let pool = Pool::new();
+    let (policy, _) = fast_policy();
+    let provider: Arc<dyn Provider> = Arc::new(pool.provider(&fake, policy));
+    let booted = pool.boot(Boot::default().provider(provider)).await;
+    let a = booted.addr;
+    // A client that sends one constant user id from every directory.
+    send(a, &session_body("constant", Some("/home/user/src/acme"))).await;
+    send(
+        a,
+        &session_body("constant", Some("/home/user/src/widgets/../widgets")),
+    )
+    .await;
+    send(a, &session_body("constant", Some("/"))).await;
+    let v = report_with(a, 3, 3).await;
+    let mut names: Vec<&str> = v["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["project"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["acme", "unknown", "widgets"], "{v}");
+    let unknown = v["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["project"] == "unknown")
+        .unwrap();
+    assert_eq!(unknown["key"], "unknown", "`/` is the plain unknown bucket");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

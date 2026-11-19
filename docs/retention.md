@@ -8,7 +8,7 @@ limits are `[retention]` keys in `config.toml` (see [Configuration](configuratio
 | Log files (`logs/pooltime.log.<date>`, one per day) | 7 days, 50 MB | at daemon start and hourly while it runs: files older than `logs_days` go, then oldest first until the log files are under `logs_max_mb` (0 turns either limit off); the file being written (the newest date in its name) is never deleted (if it alone is over the cap, every other log file goes). The service manager's `daemon.out` / `daemon.err` are left alone |
 | Request journal (requests + attempts) | 30 days, 200 MB, 100,000 requests | hourly: rows older than `journal_days`, then oldest first while the database is over `journal_max_mb` or the journal over `journal_max_requests` (0 = no row cap) |
 | Account timeline (Events view) and alert records | 30 days | hourly, with the journal's `journal_days` |
-| Session projects (Projects view: a session's repository name and path hash) | as long as the journal holds a request of the session | hourly, right after the journal |
+| Directory projects (Projects view: a working directory's project name and path hash) | as long as the journal holds a request that named the directory | hourly, right after the journal |
 | Usage history (weekly burn) | hourly 30 days → daily 1 year → weekly 2 years | hourly: hourly rows older than `history_hourly_days` roll up into daily rows, daily rows older than `history_daily_days` into weekly, weekly rows older than `history_weekly_days` are deleted |
 
 After pruning, the database is compacted (`VACUUM`) once more than 10% of it is free pages.
