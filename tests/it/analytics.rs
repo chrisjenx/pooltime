@@ -82,6 +82,16 @@ async fn burn_endpoint_reports_pool_weeks_and_needs_key() {
         .unwrap()
         .iter()
         .any(|a| a == "gone"));
+    // The runway forecast rides along: `gone`'s old reading means the history covers the whole
+    // trailing day, so `work`'s 0.3 is a rate over 24 h; no account has a known 7-day window
+    // (no usage snapshot), so there is nothing to project.
+    let runway = &v["runway"];
+    assert_eq!(runway["state"], "unknown", "{v}");
+    assert_eq!(runway["rate_per_hour"], 0.0125, "{v}");
+    assert_eq!(runway["rate_window_hours"], 24.0, "{v}");
+    assert_eq!(runway["headroom"], 0.0, "{v}");
+    assert_eq!(runway["at_risk"], false, "{v}");
+    assert_eq!(runway["warn_hours"], 6, "{v}");
 
     let long = http_req(
         booted.addr,

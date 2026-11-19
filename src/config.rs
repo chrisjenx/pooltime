@@ -360,6 +360,9 @@ pub struct AlertsCfg {
     /// Desktop notifications for alert events (the daemon only). Off: events are still recorded
     /// and logged, nothing is shown.
     pub notify: bool,
+    /// Warn when the runway forecast has the pool out of 7-day quota at least this many hours
+    /// before capacity comes back (`0`: never).
+    pub runway_warn_hours: u32,
 }
 
 impl Default for AlertsCfg {
@@ -367,6 +370,7 @@ impl Default for AlertsCfg {
         AlertsCfg {
             warn_days: vec![3, 1],
             notify: true,
+            runway_warn_hours: crate::analytics::runway::DEFAULT_WARN_HOURS,
         }
     }
 }

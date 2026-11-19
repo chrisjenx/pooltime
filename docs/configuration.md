@@ -92,6 +92,7 @@ See [Retention](retention.md).
 |---|---|---|
 | `warn_days` | `[3, 1]` | notify this many days before a login expires; the first entry is also the `expiring` window |
 | `notify` | `true` | show desktop notifications (events are recorded either way) |
+| `runway_warn_hours` | `6` | warn (notification, `⚠` in `pooltime status` and the status line) when the runway forecast has the pool out of 7-day quota at least this many hours before capacity comes back; `0` turns the warning off (the forecast is still shown). See [Runway forecast](relogin.md#runway-forecast) |
 
 ## `[[profiles]]`
 

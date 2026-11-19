@@ -64,7 +64,10 @@ the `start_relogin` tool returns the sign-in link to open.
 The daemon raises a desktop notification, once per event (remembered across restarts):
 
 - a login expires within each `alerts.warn_days` threshold (default 3 days, then 1 day);
-- an account enters `needs_login`, `billing` or `erroring`.
+- an account enters `needs_login`, `billing` or `erroring`;
+- the [runway forecast](#runway-forecast) has the pool out of 7-day quota at least
+  `alerts.runway_warn_hours` (6) before the next reset, once per reset cycle: "At the current
+  rate the pool runs out ~14h before the next reset (Thu 09:00)".
 
 | Platform | Backend |
 |---|---|
@@ -75,6 +78,42 @@ Turn them off with `alerts.notify = false` in `config.toml` or `POOLTIME_ALERTS_
 events are still logged and shown on the dashboard. `pooltime doctor` reports which notifier would be
 used. The [status line](profiles.md#status-line) shows the same counts:
 `pool 6/8 · 7d 59% used · ⚠ 2 need login`.
+
+## Runway forecast
+
+Will the pool's weekly (7-day window) quota last until capacity comes back? `pooltime status`,
+the dashboard's weekly burn panel, the MCP `pool_usage` tool and `GET /api/v1/analytics/burn`
+(`runway`) answer it:
+
+```text
+⚠ runway: At the current rate the pool runs out ~14h before the next reset (Thu 09:00)
+```
+
+How it is worked out:
+
+- **Burn rate**: the 7-day usage the whole pool consumed over the last 24 hours (a full day, so
+  nights and bursts even out), in subscriptions per hour, one account = one subscription as in
+  the weekly burn. With less than 3 hours of usage history there is no forecast yet.
+- **Capacity**: each usable account's 7-day headroom now. Accounts that need login, have a
+  billing problem or are access-denied count for nothing. Each account's window resets at its own
+  reset time and comes back as a full subscription, then again every 7 days, so an account
+  resetting soon adds capacity.
+- **Projection**: the burn rate drains the account that resets soonest first (as routing does),
+  up to two weeks ahead. The pool runs out when every usable account is spent before the next
+  reset; the gap until that reset is how long it is short.
+
+The forecast says `lasts`, `short` (runs out before the next reset), `out` (no 7-day headroom
+left now) or `unknown`. A `short` or `out` forecast at least `alerts.runway_warn_hours` (6) short,
+running out within the next 7 days, is at risk: a `⚠` in `pooltime status` and the dashboard, a
+`⚠ 7d out ~14h early` badge on the [status line](profiles.md#status-line), and one notification
+per reset cycle. After an account resets, a pool that is still at risk notifies again. A
+shortfall further out is shown but never warned about. Times more than 6 days away carry their
+date (`Wed 18 Nov 09:00`). `runway_warn_hours = 0` turns the warning off; the forecast is still
+shown. It is a straight-line projection of the last day: a heavier or lighter day ahead moves it.
+
+Until the pool has a full day of usage history (a fresh install), the forecast is marked
+`low confidence` (`low_confidence` in the API): it is shown, but there is no notification and no
+status line badge yet, so one heavy first session does not raise an alert.
 
 ## Expiry rules
 

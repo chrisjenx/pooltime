@@ -85,6 +85,8 @@ pub struct AppState {
     pub(crate) model_usage: routing_preview::ModelUsageCache,
     /// Each client session's project (usage attribution), found once per session.
     pub projects: crate::analytics::attribution::ProjectCache,
+    /// The runway forecast cache ([`crate::analytics::runway::current`]).
+    pub(crate) runway: crate::analytics::runway::Cache,
 }
 
 impl AppState {
@@ -128,6 +130,7 @@ impl AppState {
             fixture_state: None,
             model_usage: Default::default(),
             projects: Default::default(),
+            runway: Default::default(),
         }
     }
 

@@ -52,6 +52,14 @@ key order and unknown fields are kept, the write is atomic, and if Claude Code c
 between, pooltime re-reads and retries instead of overwriting it. A symlinked `settings.json` is
 written through the link.
 
+### Voice dictation
+
+Claude Code's `/voice` dictation does not work in a connected profile: Claude Code turns voice
+off while `ANTHROPIC_AUTH_TOKEN` is set, and voice audio goes straight to api.anthropic.com, never
+to `ANTHROPIC_BASE_URL`, so the pool cannot carry it. Use the OS dictation instead (macOS: press
+Fn twice, or set it up in System Settings → Keyboard → Dictation). `pooltime doctor` notes this
+with an `i voice` line.
+
 ## Keeping profiles in sync
 
 While the pool runs it re-derives the pins of every connected profile every minute, so a new Claude
@@ -93,6 +101,8 @@ pool 6/8 · 7d 59% used · ⚠ 2 need login
 
 `6/8` is accounts ready of all; `7d 59% used` is the pool's 7-day usage (the same figure as the
 first line of `pooltime status`: the accounts' 7-day usage added up, over the number of accounts).
+While the [runway forecast](relogin.md#runway-forecast) is at risk it adds `⚠ 7d out ~14h early`
+(`⚠ 7d out for ~20h` when the pool is already out); otherwise nothing.
 
 It reads a cache file the daemon keeps current (`~/.pooltime/run/status-cache.json`; counts only)
 and never makes a network call. A cache older than 150 s prints `pool down`. `disconnect` puts the
@@ -109,7 +119,7 @@ pooltime connect default --mcp
 ```
 
 Adds `mcpServers.pooltime` (`http://127.0.0.1:<port>/mcp`) to the profile's `.claude.json`, with its
-own MCP token (`~/.pooltime/run/mcp.key`), never the management key. Tools: `pool_usage`,
+own MCP token (`~/.pooltime/run/mcp.key`), never the management key. Tools: `pool_usage` (7-day usage, weekly burn, runway forecast),
 `pool_health`, `start_relogin` (returns the sign-in link), `set_weight` (optionally until a time),
 `recent_errors`, `explain_request`, `explain_routing` (which account the next request for a model
 goes to, and why), `usage_by_project` (which projects and sessions used the pool over the last

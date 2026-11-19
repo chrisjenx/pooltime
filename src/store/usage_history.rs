@@ -311,7 +311,13 @@ fn accounts(c: &Connection, window: &str) -> anyhow::Result<Vec<String>> {
 /// `since`). Ordered by account, then time.
 pub fn rows_since(c: &Connection, window: &str, since: i64) -> anyhow::Result<Vec<HistRow>> {
     // A bucket starts at most a week before its last sample.
-    let from = since - WEEK;
+    rows_from(c, window, since - WEEK)
+}
+
+/// Every `window` row starting at or after `from`, plus each account's latest row before `from`
+/// (its reading going into `from`; a bucket straddling `from` is that row, since buckets do not
+/// overlap). Ordered by account, then time. The runway's trailing-day read.
+pub fn rows_from(c: &Connection, window: &str, from: i64) -> anyhow::Result<Vec<HistRow>> {
     // Per account, so both halves are ranges on the (account, window, ts) index.
     let sql = format!(
         "SELECT {COLUMNS} FROM usage_samples WHERE account = ?1 AND window = ?2 AND ts >= ?3

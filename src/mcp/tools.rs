@@ -48,8 +48,10 @@ pub(super) fn list() -> Value {
             "name": "pool_usage",
             "description": "Subscription usage: each account's 7-day usage as the share used (0-1, \
                 seven_day_used; seven_day_left is its complement) and windows, the pool total \
-                used (seven_day_used_total, in subscriptions), this week's burn and the \
-                forecast for the week.",
+                used (seven_day_used_total, in subscriptions), this week's burn, the \
+                forecast for the week, and the runway: whether the 7-day quota lasts at the \
+                current burn rate or when it runs out (exhausts_at) against the next reset \
+                (next_reset, short_by_secs, at_risk).",
             "inputSchema": {"type": "object", "properties": {}},
         },
         {
@@ -297,6 +299,7 @@ async fn pool_usage(app: &Arc<AppState>) -> Result<Value, String> {
         "this_week": this_week,
         "forecast": burn["forecast"],
         "idle_accounts": burn["idle_accounts"],
+        "runway": burn["runway"],
     }))
 }
 
