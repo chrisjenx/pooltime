@@ -3,8 +3,11 @@
 //! configured accounts. `weeks` defaults to 12 and is capped at 104. Needs the management key.
 //!
 //! Answer: `{weeks:[{week, start, subs_used, per_account:[{account, consumed, plan?}]}],
-//! forecast:{week, subs_used_so_far, elapsed_fraction, projected, accounts}, idle_accounts:[id]}`.
-//! `plan` appears only when the account's stored credentials already name one.
+//! forecast:{week, subs_used_so_far, elapsed_fraction, projected, accounts}, idle_accounts:[id],
+//! runway}`. `plan` appears only when the account's stored credentials already name one.
+//! `runway` is the 7-day runway forecast ([`crate::analytics::runway::Runway`]: `{state, rate_per_hour,
+//! rate_window_hours, headroom, exhausts_at, next_reset, short_by_secs, at_risk, warn_hours}`),
+//! `null` when it could not be computed.
 //! With `POOLTIME_FIXTURE_STATE` set it answers the fixture's `analytics.burn` document.
 
 use std::collections::HashMap;
@@ -17,7 +20,7 @@ use time::OffsetDateTime;
 use super::mgmt::{bad, blocking, internal, ok};
 use super::AppState;
 use crate::analytics::burn::{self, DEFAULT_WEEKS, MAX_WEEKS};
-use crate::analytics::{local_offset, pool_of};
+use crate::analytics::{local_offset, pool_of, runway};
 
 fn weeks_of(q: &HashMap<String, String>) -> Result<u32, String> {
     match q.get("weeks").map(String::as_str) {
@@ -51,7 +54,11 @@ pub(crate) async fn burn(
     .await;
     match res {
         Ok(Ok(r)) => match serde_json::to_value(r) {
-            Ok(v) => ok(v),
+            Ok(mut v) => {
+                let runway = runway::current(&app, now).await;
+                v["runway"] = serde_json::to_value(runway).unwrap_or(serde_json::Value::Null);
+                ok(v)
+            }
             Err(e) => {
                 tracing::error!(error = %e, "serializing the weekly burn failed");
                 internal("could not encode the weekly burn")

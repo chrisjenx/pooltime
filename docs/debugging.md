@@ -19,6 +19,11 @@ state and expiry, the error rate per account over 24 h, upstream reachability, t
 clock skew, the notifier, file permissions and storage. `--no-version-check` (or
 `POOLTIME_NO_VERSION_CHECK=1`) skips the GitHub release lookup.
 
+With a profile connected it also prints `i voice: Claude Code's /voice is unavailable in pooled
+sessions ...`: Claude Code turns `/voice` off while `ANTHROPIC_AUTH_TOKEN` is set, and voice audio
+goes to api.anthropic.com directly, not through the pool. Use the OS dictation instead (macOS:
+press Fn twice; System Settings → Keyboard → Dictation). It is information only, never a failure.
+
 ## 2. Find the request
 
 - **Dashboard → Requests**: recent requests, newest first; tick "Errors only"; click a row for its

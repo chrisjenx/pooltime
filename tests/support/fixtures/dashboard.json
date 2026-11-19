@@ -1268,7 +1268,18 @@
       "idle_accounts": [
         "old-laptop",
         "spare"
-      ]
+      ],
+      "runway": {
+        "state": "short",
+        "rate_per_hour": 0.0421,
+        "rate_window_hours": 24.0,
+        "headroom": 2.13,
+        "exhausts_at": "2026-11-08T19:00:00Z",
+        "next_reset": "2026-11-09T09:00:00Z",
+        "short_by_secs": 50400,
+        "at_risk": true,
+        "warn_hours": 6
+      }
     }
   }
 }

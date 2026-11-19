@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Runway forecast: will the pool's weekly (7-day window) quota last until capacity comes back?
+  From the pool's burn rate over the last 24 hours and each usable account's 7-day headroom and
+  own reset time (an account resetting soon adds capacity), pooltime projects when every usable
+  account is spent and compares that with the next reset. `pooltime status` shows a `runway:`
+  line, the dashboard's weekly burn panel shows it too, the MCP `pool_usage` tool and
+  `GET /api/v1/analytics/burn` return it as `runway`, and while it is at risk the status line
+  segment adds `⚠ 7d out ~14h early`. See [Runway forecast](docs/relogin.md#runway-forecast).
+- Runway alert: a desktop notification when the pool is projected to run out at least
+  `alerts.runway_warn_hours` (default 6; `0` turns it off) before the next reset, at most once
+  per reset cycle: "At the current rate the pool runs out ~14h before the next reset (Thu 09:00)".
+- `pooltime doctor` notes (`i voice`, never a failure) that Claude Code's `/voice` dictation is
+  unavailable in pooled sessions (Claude Code turns it off while `ANTHROPIC_AUTH_TOKEN` is set,
+  and voice audio goes to api.anthropic.com directly), and suggests the OS dictation instead.
+
 ## 1.2.1 - 2026-11-15
 
 ### Fixed

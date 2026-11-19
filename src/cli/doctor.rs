@@ -16,6 +16,10 @@
 //!   rows of the pool's `/v1/models` listing (see [`live_rows`]); with no live rows they are not
 //!   compared. Stale pins are `!` (the pool re-syncs connected profiles every minute). A foreign
 //!   base URL is shown as its origin only.
+//! - **voice**: with at least one connected profile, one `i` line: Claude Code's `/voice`
+//!   dictation is unavailable in pooled sessions (Claude Code turns it off while
+//!   `ANTHROPIC_AUTH_TOKEN` is set, and voice audio goes to api.anthropic.com directly, never to
+//!   `ANTHROPIC_BASE_URL`), with the OS dictation to use instead. Never a problem.
 //! - **statusline <id>**, per recorded profile whose `statusLine` is our wrapper: the binary it
 //!   runs exists and is executable (`✗`), the snapshot holding the original status line is
 //!   readable (`!`), and the data dir it reads is this one (`!`).
@@ -253,6 +257,7 @@ pub async fn checks(paths: &Paths, opts: &Options) -> Vec<Check> {
         pool,
         catalog.as_deref(),
     ));
+    out.extend(voice_check(paths, &cfg.profiles, cfg!(target_os = "macos")));
     out.extend(statusline_checks(
         paths,
         &cfg.profiles,
@@ -551,6 +556,27 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 fn is_executable(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// The `/voice` note (see the module docs), when any recorded profile is connected.
+fn voice_check(paths: &Paths, profiles: &[ProfileRef], macos: bool) -> Option<Check> {
+    profiles
+        .iter()
+        .any(|r| is_connected(&profile_of(r), paths))
+        .then(|| {
+            let os = if macos {
+                "use macOS dictation instead (press Fn twice; System Settings → Keyboard → Dictation)"
+            } else {
+                "use your desktop's dictation instead"
+            };
+            Check::new(
+                Level::Info,
+                "voice",
+                "Claude Code's /voice is unavailable in pooled sessions (off while \
+                 ANTHROPIC_AUTH_TOKEN is set; its audio goes to api.anthropic.com, not the pool)",
+            )
+            .hint(os)
+        })
 }
 
 /// One line per recorded profile whose `statusLine` is our wrapper. `default_home` is the data
@@ -1689,6 +1715,33 @@ mod tests {
         );
         checks.push(cache);
         assert_eq!(exit_code(&checks), 0);
+    }
+
+    #[test]
+    fn voice_note_only_for_connected_profiles() {
+        let (_d, paths, r) = connected();
+        let c = voice_check(&paths, std::slice::from_ref(&r), true).unwrap();
+        assert_eq!(c.level, Level::Info);
+        assert_eq!(
+            c.to_string(),
+            "i voice: Claude Code's /voice is unavailable in pooled sessions (off while \
+             ANTHROPIC_AUTH_TOKEN is set; its audio goes to api.anthropic.com, not the pool) — \
+             use macOS dictation instead (press Fn twice; System Settings → Keyboard → Dictation)"
+        );
+        assert!(!c.to_string().contains('\n'), "one line");
+        assert_eq!(exit_code(&[c]), 0);
+        let linux = voice_check(&paths, std::slice::from_ref(&r), false).unwrap();
+        assert!(linux
+            .to_string()
+            .ends_with("use your desktop's dictation instead"));
+        // Nothing connected: no note.
+        assert!(voice_check(&paths, &[], true).is_none());
+        let other = tempfile::tempdir().unwrap();
+        let unconnected = ProfileRef {
+            id: "u".into(),
+            settings_dir: other.path().to_path_buf(),
+        };
+        assert!(voice_check(&paths, &[unconnected], true).is_none());
     }
 
     #[test]
