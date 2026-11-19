@@ -650,6 +650,13 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+        // (marked done right after its write lands)
+        for _ in 0..100 {
+            if cache.seen(&h) == Some(Seen::Done) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(cache.seen(&h), Some(Seen::Done));
         // ...and corrected once the slow lookup finishes (this fake finds a repo right there).
         let fixed = wait_label(&store, &h, |l| l == "w1").await;
@@ -745,6 +752,12 @@ mod tests {
             wait_label(&store, &h, |_| true).await.as_deref(),
             Some("acme")
         );
+        for _ in 0..100 {
+            if cache.seen(&h) == Some(Seen::Done) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(cache.seen(&h), Some(Seen::Done));
     }
 
