@@ -1,4 +1,4 @@
-//! The seven MCP tools. Each one calls the `/api/v1` handler the dashboard and CLI use (in
+//! The eight MCP tools. Each one calls the `/api/v1` handler the dashboard and CLI use (in
 //! process, no auth layer: the MCP token already admitted the call) and reshapes its answer.
 //! Outputs are JSON text and never carry tokens, refresh details, emails or keys; accounts
 //! appear by id.
@@ -12,6 +12,7 @@
 //! | `recent_errors {limit?}` | `GET /api/v1/requests?errors_only=true` |
 //! | `explain_request {id}` | `GET /api/v1/requests/{id}` |
 //! | `explain_routing {model?}` | `GET /api/v1/routing/preview?model=` |
+//! | `usage_by_project {range?}` | `GET /api/v1/analytics/projects?range=` (top 10 sessions) |
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -123,6 +124,19 @@ pub(super) fn list() -> Value {
                         Claude model of the past week"}},
             },
         },
+        {
+            "name": "usage_by_project",
+            "description": "Which projects (git repositories / working directories) and Claude \
+                Code sessions used the pool: per project and per session the requests, tokens \
+                (input, output, cache read/write), share of all tokens, the accounts that served \
+                them and an estimate of the 7-day quota used (est_subs, in subscriptions). Most \
+                usage first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"range": {"type": "string", "enum": ["24h", "7d", "30d"],
+                    "default": "24h", "description": "Time range"}},
+            },
+        },
     ]})
 }
 
@@ -145,6 +159,7 @@ pub(super) async fn call(app: &Arc<AppState>, params: &Value) -> Result<Value, (
         "recent_errors" => recent_errors(app, &args).await,
         "explain_request" => explain_request(app, &args).await,
         "explain_routing" => explain_routing(app, &args).await,
+        "usage_by_project" => usage_by_project(app, &args).await,
         other => return Err((INVALID_PARAMS, format!("Unknown tool: {other}"))),
     };
     Ok(match out {
@@ -449,6 +464,34 @@ async fn explain_routing(app: &Arc<AppState>, args: &Map<String, Value>) -> Resu
     Ok(v)
 }
 
+/// Sessions `usage_by_project` lists (the endpoint keeps more).
+const SESSIONS_SHOWN: usize = 10;
+
+async fn usage_by_project(app: &Arc<AppState>, args: &Map<String, Value>) -> Result<Value, String> {
+    let range = match args.get("range") {
+        None | Some(Value::Null) => "24h".to_string(),
+        Some(Value::String(r)) => r.clone(),
+        Some(_) => return Err("range must be 24h, 7d or 30d".into()),
+    };
+    let mut v =
+        answer(analytics_api::projects(State(app.clone()), query(&[("range", range)])).await)
+            .await?;
+    if let Some(s) = v["sessions"].as_array_mut() {
+        s.truncate(SESSIONS_SHOWN);
+    }
+    if let Value::Object(o) = &mut v {
+        o.insert(
+            "note".into(),
+            json!(
+                "share is of all tokens in the range; est_subs estimates the 7-day quota used \
+                 (1.0 = one subscription's week), splitting each account's sampled usage by \
+                 the projects' weighted tokens on it, null without usage history"
+            ),
+        );
+    }
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -496,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_list_is_exactly_the_scoped_seven() {
+    fn tool_list_is_exactly_the_scoped_eight() {
         let v = list();
         let names: Vec<&str> = v["tools"]
             .as_array()
@@ -513,7 +556,8 @@ mod tests {
                 "set_weight",
                 "recent_errors",
                 "explain_request",
-                "explain_routing"
+                "explain_routing",
+                "usage_by_project"
             ]
         );
     }

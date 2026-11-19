@@ -75,7 +75,7 @@ fn account<'a>(v: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no account {name} in {v}"))
 }
 
-const TOOLS: [&str; 7] = [
+const TOOLS: [&str; 8] = [
     "pool_usage",
     "pool_health",
     "start_relogin",
@@ -83,6 +83,7 @@ const TOOLS: [&str; 7] = [
     "recent_errors",
     "explain_request",
     "explain_routing",
+    "usage_by_project",
 ];
 
 #[tokio::test]

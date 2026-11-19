@@ -321,6 +321,16 @@ table.routing tr.next td:first-child { box-shadow: inset 3px 0 0 var(--ok); padd
 td.scorecell { width: 14%; min-width: 90px; }
 .bar.score > span { background: var(--ok); }
 
+/* ---- usage by project ---- */
+
+table.usage td, table.usage th { padding-right: 12px; }
+th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
+th.sortable:hover, th.sortable[aria-sort="ascending"], th.sortable[aria-sort="descending"] { color: var(--text); }
+th.sortable:focus-visible { outline: 2px solid var(--info); outline-offset: -2px; }
+td.sharecell { width: 14%; min-width: 120px; }
+.share { display: flex; align-items: center; gap: 8px; }
+.share .bar { flex: 1; }
+
 /* ---- requests / events ---- */
 
 tr.clickable { cursor: pointer; }

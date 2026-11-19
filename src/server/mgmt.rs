@@ -11,8 +11,8 @@
 //! read a response, and the Host/Origin guard refuses it before auth is even consulted.
 //!
 //! The debugging views (`/requests`, `/timeline`, `/stats`, `/debug`) live in
-//! [`super::journal_api`], the weekly burn (`/analytics/burn`) in [`super::analytics_api`]; both
-//! need the key for reads too.
+//! [`super::journal_api`], the weekly burn (`/analytics/burn`) and usage by project
+//! (`/analytics/projects`) in [`super::analytics_api`]; all need the key for reads too.
 //!
 //! # Errors
 //! Same envelope as the inference side, `{"type":"error","error":{"type","message"}}`, so
@@ -241,6 +241,11 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/v1/analytics/burn",
             write(get(super::analytics_api::burn), "GET"),
+        )
+        // Usage by project and session: key or session required (local project names).
+        .route(
+            "/api/v1/analytics/projects",
+            write(get(super::analytics_api::projects), "GET"),
         )
         .route(
             "/api/v1/debug",

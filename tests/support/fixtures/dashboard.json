@@ -1281,6 +1281,30 @@
         "warn_hours": 6,
         "low_confidence": false
       }
+    },
+    "projects": {
+      "range": "24h",
+      "since": "2026-11-06T12:00:00Z",
+      "now": "2026-11-07T12:00:00Z",
+      "totals": {"requests": 1843, "input_tokens": 412000, "output_tokens": 1265000, "cache_read": 98400000, "cache_write": 6120000, "tokens": 106197000},
+      "quota": {"consumed": 0.9412, "unattributed": 0.0213},
+      "projects": [
+        {"key": "3f2a9c41d07b6e15", "project": "acme", "requests": 1012, "input_tokens": 231000, "output_tokens": 742000, "cache_read": 61200000, "cache_write": 3480000, "tokens": 65653000, "share": 0.6182, "est_subs": 0.5731,
+         "accounts": [{"account": "personal", "requests": 702, "tokens": 45100000}, {"account": "team-1", "requests": 310, "tokens": 20553000}], "sessions": 6, "first_seen": "2026-11-06T12:04:00Z", "last_seen": "2026-11-07T11:58:00Z"},
+        {"key": "8c19e2b07a4d3f66", "project": "widgets", "requests": 588, "input_tokens": 142000, "output_tokens": 401000, "cache_read": 30100000, "cache_write": 2110000, "tokens": 32753000, "share": 0.3084, "est_subs": 0.2903,
+         "accounts": [{"account": "team-2", "requests": 588, "tokens": 32753000}], "sessions": 3, "first_seen": "2026-11-06T15:20:00Z", "last_seen": "2026-11-07T11:41:00Z"},
+        {"key": "unknown", "project": "unknown", "requests": 243, "input_tokens": 39000, "output_tokens": 122000, "cache_read": 7100000, "cache_write": 530000, "tokens": 7791000, "share": 0.0734, "est_subs": 0.0565,
+         "accounts": [{"account": "personal", "requests": 140, "tokens": 4600000}, {"account": "team-2", "requests": 103, "tokens": 3191000}], "sessions": 2, "first_seen": "2026-11-06T13:00:00Z", "last_seen": "2026-11-07T10:15:00Z"}
+      ],
+      "sessions": [
+        {"key": "a1b2c3d4e5f60718", "project": "acme", "requests": 420, "input_tokens": 98000, "output_tokens": 310000, "cache_read": 25800000, "cache_write": 1400000, "tokens": 27608000, "share": 0.26, "est_subs": 0.2411,
+         "accounts": [{"account": "personal", "requests": 420, "tokens": 27608000}], "first_seen": "2026-11-07T08:02:00Z", "last_seen": "2026-11-07T11:58:00Z"},
+        {"key": "0f1e2d3c4b5a6978", "project": "widgets", "requests": 301, "input_tokens": 70000, "output_tokens": 205000, "cache_read": 15500000, "cache_write": 1050000, "tokens": 16825000, "share": 0.1584, "est_subs": 0.1491,
+         "accounts": [{"account": "team-2", "requests": 301, "tokens": 16825000}], "first_seen": "2026-11-07T06:30:00Z", "last_seen": "2026-11-07T11:41:00Z"},
+        {"key": "5566778899aabbcc", "project": "acme", "requests": 270, "input_tokens": 61000, "output_tokens": 190000, "cache_read": 16000000, "cache_write": 900000, "tokens": 17151000, "share": 0.1615, "est_subs": 0.1402,
+         "accounts": [{"account": "team-1", "requests": 270, "tokens": 17151000}], "first_seen": "2026-11-06T18:10:00Z", "last_seen": "2026-11-07T09:30:00Z"}
+      ],
+      "sessions_total": 11
     }
   }
 }

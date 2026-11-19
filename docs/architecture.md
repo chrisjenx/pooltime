@@ -33,8 +33,8 @@ runs).
 | `models/` | model table (`models.toml`), id resolution, family mappings to Codex routes |
 | `claude_code/` | Claude Code profiles: discover, connect/disconnect, guarded JSON writes, pins, snapshots, status line wrapper, MCP registration |
 | `store/` | SQLite (one writer thread): migrations, request journal, account timeline, usage history, retention |
-| `analytics/` | usage sampler, weekly burn report and runway forecast |
-| `mcp/` | MCP JSON-RPC transport and the seven tools |
+| `analytics/` | usage sampler, weekly burn report, runway forecast, usage attribution (a session's project) and usage by project/session |
+| `mcp/` | MCP JSON-RPC transport and the eight tools |
 | `service/` | launchd and systemd unit rendering and control; `service restart` |
 | `supervisor/` | `serve --supervise`: owns the port, runs worker generations, hands over on `SIGHUP`, respawns crashed workers; `proto` (control messages, `run/supervisor.json`) |
 | `import/` | `bro.rs`: plan and apply a bro-cli import |

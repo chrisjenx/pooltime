@@ -109,6 +109,62 @@ fn labels(start: i64, offset: UtcOffset) -> (String, String) {
     )
 }
 
+/// Walk the history `rows` (sorted by account, then time) and hand every consumption delta to
+/// `f(account, from, to, consumed)`: it accrued linearly over `[from, to]` (`from == to`: at that
+/// instant, e.g. inside a downsampled bucket). Every row yields at least one call, possibly with
+/// `consumed == 0`, so `f` sees every account.
+fn for_each_delta(rows: &[HistRow], mut f: impl FnMut(&str, i64, i64, f64)) {
+    // (account, last reading, high-water mark after it)
+    let mut prev: Option<(&str, usage_history::Point, f64)> = None;
+    for r in rows {
+        let h = match prev.filter(|(pa, _, _)| *pa == r.account) {
+            Some((_, last, hw)) => {
+                let s = step(&last, hw, &r.first);
+                f(&r.account, s.from, r.first.ts, s.consumed);
+                s.hw
+            }
+            // The first reading of an account consumes nothing (when it was used is unknown).
+            None => {
+                f(&r.account, r.first.ts, r.first.ts, 0.0);
+                r.first.util
+            }
+        };
+        let (inner, end_hw) = r.inner(h);
+        if inner > 0.0 {
+            let at = r.anchor();
+            f(&r.account, at, at, inner);
+        }
+        prev = Some((r.account.as_str(), r.last, end_hw));
+    }
+}
+
+/// Per account, the 7-day window consumption (fractions of one subscription) that accrued in
+/// `[from, to]` (unix seconds), from history `rows` as [`usage_history::rows_since`] returns them.
+/// A delta straddling an end counts in proportion to its overlap; accounts that consumed
+/// nothing are left out.
+pub fn consumed_between(rows: &[HistRow], from: i64, to: i64) -> BTreeMap<String, f64> {
+    let mut out: BTreeMap<String, f64> = BTreeMap::new();
+    for_each_delta(rows, |account, t0, t1, c| {
+        if c <= 0.0 {
+            return;
+        }
+        let part = if t1 <= t0 {
+            if (from..=to).contains(&t1) {
+                c
+            } else {
+                0.0
+            }
+        } else {
+            let overlap = (t1.min(to) - t0.max(from)).max(0);
+            c * overlap as f64 / (t1 - t0) as f64
+        };
+        if part > 0.0 {
+            *out.entry(account.to_string()).or_default() += part;
+        }
+    });
+    out
+}
+
 /// Total the history `rows` (sorted by account, then time, as [`usage_history::rows_since`]
 /// returns them) into the last `weeks` local ISO weeks ending with the one holding `now`.
 pub fn compute(rows: &[HistRow], now: i64, offset: UtcOffset, weeks: u32) -> BurnReport {
@@ -119,40 +175,25 @@ pub fn compute(rows: &[HistRow], now: i64, offset: UtcOffset, weeks: u32) -> Bur
 
     // account -> week start -> consumed
     let mut per: BTreeMap<String, HashMap<i64, f64>> = BTreeMap::new();
-    // (account, last reading, high-water mark after it)
-    let mut prev: Option<(&str, usage_history::Point, f64)> = None;
-    for r in rows {
-        let acc = per.entry(r.account.clone()).or_default();
+    for_each_delta(rows, |account, mut t0, t1, c| {
+        let acc = per.entry(account.to_string()).or_default();
         let mut add = |ws: i64, c: f64| *acc.entry(ws).or_default() += c;
-        let h = match prev.filter(|(pa, _, _)| *pa == r.account) {
-            Some((_, last, hw)) => {
-                let s = step(&last, hw, &r.first);
-                let (c, mut t0, t1) = (s.consumed, s.from, r.first.ts);
-                if c > 0.0 {
-                    if t1 <= t0 {
-                        add(week_start(t1, off), c);
-                    } else {
-                        // Split linearly by time across the week boundaries in [t0, t1].
-                        let span = (t1 - t0) as f64;
-                        while t0 < t1 {
-                            let ws = week_start(t0, off);
-                            let end = (ws + WEEK).min(t1);
-                            add(ws, c * (end - t0) as f64 / span);
-                            t0 = end;
-                        }
-                    }
-                }
-                s.hw
-            }
-            // The first reading of an account consumes nothing (when it was used is unknown).
-            None => r.first.util,
-        };
-        let (inner, end_hw) = r.inner(h);
-        if inner > 0.0 {
-            add(week_start(r.anchor(), off), inner);
+        if c <= 0.0 {
+            return;
         }
-        prev = Some((r.account.as_str(), r.last, end_hw));
-    }
+        if t1 <= t0 {
+            add(week_start(t1, off), c);
+        } else {
+            // Split linearly by time across the week boundaries in [t0, t1].
+            let span = (t1 - t0) as f64;
+            while t0 < t1 {
+                let ws = week_start(t0, off);
+                let end = (ws + WEEK).min(t1);
+                add(ws, c * (end - t0) as f64 / span);
+                t0 = end;
+            }
+        }
+    });
 
     let weeks: Vec<WeekBurn> = (0..i64::from(weeks))
         .map(|i| {
@@ -285,6 +326,25 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn consumed_between_clips_deltas_to_the_range() {
+        let reset = MON + 5 * DAY;
+        let rows = sorted(vec![
+            raw("a", MON, 0.1, reset),
+            raw("a", MON + 10 * H, 0.3, reset), // +0.2 over [0h, 10h]
+            raw("a", MON + 20 * H, 0.25, reset), // dip: nothing
+            raw("a", MON + 30 * H, 0.5, reset), // +0.2 over [20h, 30h] (high-water 0.3)
+            raw("b", MON + 25 * H, 0.9, reset), // first reading: nothing
+        ]);
+        let got = consumed_between(&rows, MON + 5 * H, MON + 25 * H);
+        // Half of the first delta, half of the last one.
+        assert!(close(got["a"], 0.1 + 0.1), "{got:?}");
+        assert!(!got.contains_key("b"), "{got:?}");
+        let all = consumed_between(&rows, MON - DAY, MON + DAY * 2);
+        assert!(close(all["a"], 0.4), "{all:?}");
+        assert!(consumed_between(&rows, MON + 40 * H, MON + 50 * H).is_empty());
     }
 
     #[test]

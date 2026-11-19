@@ -18,7 +18,9 @@
 //!
 //! Privacy: no bodies, prompts, upstream error messages, tokens or raw `metadata.user_id` are
 //! ever stored; the session is kept as [`crate::logging::hash_session`] (16 hex chars of
-//! SHA-256), the upstream request id only when it is made of token-safe characters.
+//! SHA-256), the upstream request id only when it is made of token-safe characters. The working
+//! directory a body named is kept only as `cwd_hash` (the same 16-hex hash), never the path
+//! (usage attribution, [`crate::analytics::attribution`]).
 //!
 //! Timing: `ts` is unix seconds at request start; `ttfb_ms` is the time until the response
 //! headers were ready; `total_ms` runs until the row is finalised (the end of a streamed body);
@@ -72,6 +74,9 @@ pub struct RequestRow {
     pub cache_read: Option<i64>,
     pub cache_write: Option<i64>,
     pub session_hash: Option<String>,
+    /// Hash of the working directory the body named (usage attribution; not in API answers).
+    #[serde(skip)]
+    pub cwd_hash: Option<String>,
 }
 
 /// One `journal_attempts` row.
@@ -135,8 +140,8 @@ pub fn insert(
     )?;
     tx.execute(
         "INSERT OR REPLACE INTO journal_requests(id, ts, path, model, provider, status, outcome, reason,
-            ttfb_ms, total_ms, input_tokens, output_tokens, cache_read, cache_write, session_hash)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+            ttfb_ms, total_ms, input_tokens, output_tokens, cache_read, cache_write, session_hash, cwd_hash)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         params![
             r.id,
             r.ts,
@@ -152,7 +157,8 @@ pub fn insert(
             r.output_tokens,
             r.cache_read,
             r.cache_write,
-            r.session_hash
+            r.session_hash,
+            r.cwd_hash
         ],
     )?;
     for a in attempts {
@@ -178,7 +184,7 @@ pub fn insert(
 
 const REQUEST_COLS: &str = "r.id, r.ts, r.path, r.model, r.provider, r.status, r.outcome, r.reason,
     r.ttfb_ms, r.total_ms, r.input_tokens, r.output_tokens, r.cache_read, r.cache_write,
-    r.session_hash";
+    r.session_hash, r.cwd_hash";
 
 fn request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestRow> {
     Ok(RequestRow {
@@ -197,6 +203,7 @@ fn request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestRow> {
         cache_read: row.get(12)?,
         cache_write: row.get(13)?,
         session_hash: row.get(14)?,
+        cwd_hash: row.get(15)?,
     })
 }
 
@@ -221,8 +228,8 @@ pub fn list(
     let rows = st.query_map([limit], |row| {
         Ok(RequestSummary {
             request: request_row(row)?,
-            attempts: row.get(15)?,
-            account: row.get(16)?,
+            attempts: row.get(16)?,
+            account: row.get(17)?,
         })
     })?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -539,6 +546,11 @@ impl Journal {
     /// `metadata.user_id`, stored only as its hash.
     pub fn set_session(&self, user_id: &str) {
         self.with(|d, _| d.row.session_hash = Some(crate::logging::hash_session(user_id)));
+    }
+
+    /// The hash of the working directory the request body named (usage attribution).
+    pub fn set_cwd_hash(&self, hash: String) {
+        self.with(|d, _| d.row.cwd_hash = Some(hash));
     }
 
     /// An attempt on `account` starts.

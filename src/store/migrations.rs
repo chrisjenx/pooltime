@@ -1,7 +1,7 @@
 use anyhow::{bail, Context};
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Schema v1. Timestamps are unix seconds. `utilization` is a 0-1 fraction.
 /// `usage_samples.granularity` is `hourly` (raw) | `daily` | `weekly`.
@@ -101,6 +101,24 @@ ALTER TABLE usage_samples ADD COLUMN last_hw REAL;
 ALTER TABLE usage_samples ADD COLUMN resets INTEGER;
 ";
 
+/// Schema v5 (usage attribution): each request keeps `cwd_hash`, 16 hex chars of SHA-256 over
+/// the working directory its body named (never the directory itself), and `cwd_projects` maps a
+/// working directory to its project, resolved off the request path. `project` is the repository
+/// or directory name only; `path_hash` is the same hash over the project's root path, so two
+/// projects with the same name stay apart. `first_seen` is unix seconds; `resolved` is 1 when the
+/// label came from a filesystem lookup (0: from the path alone, which a lookup may replace). A
+/// row goes when the journal no longer holds a request with its `cwd_hash` (retention).
+const V5: &str = "
+ALTER TABLE journal_requests ADD COLUMN cwd_hash TEXT;
+CREATE TABLE cwd_projects (
+    cwd_hash   TEXT PRIMARY KEY,
+    project    TEXT NOT NULL,
+    path_hash  TEXT,
+    first_seen INTEGER,
+    resolved   INTEGER NOT NULL DEFAULT 0
+);
+";
+
 /// Bring the database to [`SCHEMA_VERSION`]. Each step runs in one transaction
 /// together with its `user_version` bump.
 pub(super) fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
@@ -130,6 +148,12 @@ pub(super) fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
         let tx = conn.transaction()?;
         tx.execute_batch(V4).context("apply schema v4")?;
         tx.pragma_update(None, "user_version", 4)?;
+        tx.commit()?;
+    }
+    if current < 5 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(V5).context("apply schema v5")?;
+        tx.pragma_update(None, "user_version", 5)?;
         tx.commit()?;
     }
     Ok(())

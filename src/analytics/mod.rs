@@ -3,9 +3,13 @@
 //! - [`sampler`] records each account's 7-day utilization into `usage_samples` as it changes.
 //! - [`burn`] totals the history per local ISO week ([`burn::report`], shared by the management
 //!   API, `pooltime status` and MCP).
+//! - [`attribution`] finds the project a client session works on; [`projects`] totals usage per
+//!   project and per session ([`projects::report`], for the same three surfaces).
 //! - [`runway`] forecasts whether the pool's 7-day quota lasts until capacity comes back.
 
+pub mod attribution;
 pub mod burn;
+pub mod projects;
 pub mod runway;
 pub mod sampler;
 

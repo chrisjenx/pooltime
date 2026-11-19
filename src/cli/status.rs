@@ -7,6 +7,7 @@
 //! pool 2/3 ready · 7d 77% used
 //! this week: 1.4 subs used · on pace for ~2.6 of 3
 //! ⚠ runway: At the current rate the pool runs out ~14h before the next reset (Thu 09:00)
+//! top projects 24h: acme 62% · widgets 30% · unknown 8%
 //!
 //! ACCOUNT  PROVIDER   STATUS       7D USED  PRIO  WEIGHT  EMAIL
 //! gamma    anthropic  needs_login  -        0     1       -
@@ -30,6 +31,9 @@
 //! ([`crate::analytics::runway`]) says whether the pool's 7-day quota lasts at the current burn
 //! rate, or when it runs out against the next reset (local time; `⚠` when at least
 //! `alerts.runway_warn_hours` short); it is left out while there is too little usage history.
+//! The "top projects" line (`GET /api/v1/analytics/projects?range=24h`, share of tokens over the
+//! last 24 hours, at most three projects) is left out when that call fails or nothing was
+//! requested in that time.
 
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -236,6 +240,39 @@ pub fn runway_line(burn: &Value, now: OffsetDateTime, offset: UtcOffset) -> Opti
     Some(format!("{warn}runway: {text}{low}"))
 }
 
+/// Projects named in [`projects_line`].
+const TOP_PROJECTS: usize = 3;
+
+/// `top projects 24h: acme 62% · widgets 30% · unknown 8%` from
+/// `GET /api/v1/analytics/projects?range=24h` (share of tokens, the report's order: most usage
+/// first); `None` without any project.
+pub fn projects_line(report: &Value) -> Option<String> {
+    let projects = report["projects"].as_array()?;
+    let parts: Vec<String> = projects
+        .iter()
+        .take(TOP_PROJECTS)
+        .filter_map(|p| {
+            let name = p["project"].as_str()?;
+            let share = p["share"].as_f64()?;
+            Some(format!("{name} {}", pct(Some(share))))
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let more = projects.len().saturating_sub(TOP_PROJECTS);
+    let tail = if more > 0 {
+        format!(" (+{more} more)")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "top projects {}: {}{tail}",
+        report["range"].as_str().unwrap_or("24h"),
+        parts.join(" · ")
+    ))
+}
+
 /// The whole summary.
 pub fn render(status: &Value, addr: &str) -> String {
     render_with_burn(status, None, addr, UtcOffset::UTC)
@@ -246,6 +283,18 @@ pub fn render(status: &Value, addr: &str) -> String {
 pub fn render_with_burn(
     status: &Value,
     burn: Option<&Value>,
+    addr: &str,
+    offset: UtcOffset,
+) -> String {
+    render_full(status, burn, None, addr, offset)
+}
+
+/// [`render_with_burn`] plus the top-projects line when `projects` (the usage-by-project answer)
+/// has any.
+pub fn render_full(
+    status: &Value,
+    burn: Option<&Value>,
+    projects: Option<&Value>,
     addr: &str,
     offset: UtcOffset,
 ) -> String {
@@ -270,6 +319,9 @@ pub fn render_with_burn(
     for line in lines.into_iter().flatten() {
         out.insert_str(out.len() - 1, &format!("{line}\n"));
     }
+    if let Some(line) = projects.and_then(projects_line) {
+        out.insert_str(out.len() - 1, &format!("{line}\n"));
+    }
     out.push_str(&accounts_table(status));
     let alerts = alerts(status);
     if !alerts.is_empty() {
@@ -289,11 +341,17 @@ pub async fn run(client: &Client, json: bool) -> anyhow::Result<i32> {
             .await
             .ok()
             .flatten();
+        let projects = client
+            .get_authed_opt("/api/v1/analytics/projects?range=24h")
+            .await
+            .ok()
+            .flatten();
         print!(
             "{}",
-            render_with_burn(
+            render_full(
                 &status,
                 burn.as_ref(),
+                projects.as_ref(),
                 &client.addr.to_string(),
                 local_offset(OffsetDateTime::now_utc()),
             )
@@ -451,6 +509,30 @@ mod tests {
         ] {
             assert_eq!(runway_line(&b, now, UtcOffset::UTC), None, "{b}");
         }
+    }
+
+    #[test]
+    fn status_shows_top_projects_line() {
+        let s = json!({"version": "x", "pool": {"accounts": 1, "available": 1}, "accounts": []});
+        let p = |n: usize| {
+            let projects: Vec<Value> = ["acme", "widgets", "unknown", "misc"][..n]
+                .iter()
+                .zip([0.62, 0.3, 0.06, 0.02])
+                .map(|(name, share)| json!({"project": name, "share": share}))
+                .collect();
+            json!({"range": "24h", "projects": projects})
+        };
+        let out = render_full(&s, None, Some(&p(4)), "x", UtcOffset::UTC);
+        assert!(
+            out.contains("top projects 24h: acme 62% · widgets 30% · unknown 6% (+1 more)\n\n"),
+            "{out}"
+        );
+        assert_eq!(
+            projects_line(&p(1)).as_deref(),
+            Some("top projects 24h: acme 62%")
+        );
+        assert_eq!(projects_line(&p(0)), None);
+        assert!(!render_full(&s, None, Some(&p(0)), "x", UtcOffset::UTC).contains("top projects"));
     }
 
     #[test]

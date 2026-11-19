@@ -88,7 +88,8 @@ pooltime update                       # latest release, service moved onto it wi
 No telemetry: pooltime talks only to the providers' APIs (and GitHub's release API from
 `pooltime doctor`). It never logs or stores prompts, responses, tokens or
 upstream error messages; the dashboard, management API and MCP listen on 127.0.0.1 and require a
-local key for changes.
+local key for changes. For usage by project it keeps, locally, hashes of the working
+directories requests name and each one's repository or directory name, never the path itself.
 
 ## License
 

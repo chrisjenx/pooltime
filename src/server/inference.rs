@@ -106,6 +106,14 @@ pub async fn messages(State(app): State<Arc<AppState>>, req: Request) -> Respons
     if let Some(u) = &session_user_id {
         journal.set_session(u);
     }
+    // Usage attribution: the working directory the body names, recorded as a hash. Its project
+    // is resolved in the background (never on this request's path).
+    if let Some(cwd) = crate::analytics::attribution::working_dir(&json) {
+        let ts = OffsetDateTime::now_utc().unix_timestamp();
+        if let Some(h) = app.projects.observe(&app.store, cwd, ts) {
+            journal.set_cwd_hash(h);
+        }
+    }
     let req = InboundRequest {
         raw_body,
         json,
