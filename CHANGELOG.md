@@ -9,9 +9,14 @@
   (1.3+, running that binary, listening where `config.toml` says), it moves the service onto this
   binary without closing the port: the supervisor replaces itself (`SIGUSR2`, as `pooltime
   update` does) when its version differs, a new worker takes over when only the worker's does,
-  and nothing happens (it says so) when both already match. It prints the versions and checks
-  them; a refused upgrade exits 1 with the service still serving, never falling back to a stop
-  and start. See [Install](docs/install.md#background-service).
+  and when both already match it still replaces itself in place, so a rebuilt or reinstalled
+  binary of the same version is what runs. It prints the versions and checks them, including
+  that the upgraded supervisor listens on the `host`/`port` in `config.toml`; a refused upgrade
+  or a mismatch exits 1 with the service still serving, never falling back to a stop and start.
+  See [Install](docs/install.md#background-service).
+- `service install` no longer does a full restart just to apply `config.toml` edits: the new
+  worker it starts reads them (as after `pooltime service restart`, the usual way to apply
+  them). Only a changed `host` or `port` still needs, and gets, a full restart.
 - When a full restart is needed (changed definition, binary path, host or port, a supervisor
   from before 1.3), `service install` says why and warns that new requests get errors while the
   old daemon drains; on a terminal it asks first, and without one it needs `--yes`. A fresh

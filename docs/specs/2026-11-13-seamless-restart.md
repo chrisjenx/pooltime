@@ -182,7 +182,8 @@ decides first (`src/service/install.rs`, a pure `plan` over what it observed):
 
 - **Nothing running:** write the definition, load and start it (as before; no question).
 - **Seamless,** when all of these hold: the definition it would write is byte-identical to the
-  installed file; on systemd, `NeedDaemonReload=no` (the loaded unit is that file); the service's
+  installed file; what the manager loaded is that file (systemd: `NeedDaemonReload=no`; launchd:
+  the arguments, `POOLTIME_HOME` and log paths in `launchctl print`); the service's
   main pid (`launchctl print` / `MainPID`) is the supervisor in `run/supervisor.json`, which has
   `can_upgrade`, runs the binary path the definition names (`binary`), and listens where
   `config.toml` (without shell `POOLTIME_*` overrides, as the service reads it) asks: the state
@@ -191,12 +192,22 @@ decides first (`src/service/install.rs`, a pure `plan` over what it observed):
   binary: `SIGUSR2` when the supervisor's version differs (the same in-place upgrade as
   `pooltime update`, shared in `src/service/upgrade.rs`: re-read the state file, check the pid is
   still `pooltime serve --supervise`, wait for `upgrades` to go up, check both versions), a
-  `SIGHUP` handover when only the worker's differs, nothing when both match. A refusal or a
-  mismatch is reported with exit 1 and never falls back to a stop and start.
+  `SIGHUP` handover when only the worker's differs, and `SIGUSR2` again when both match (a
+  rebuilt or reinstalled binary keeps its version; the supervisor accepts a same-version
+  upgrade, so what runs is always the installed binary). After an upgrade the new supervisor's
+  `listen` (from the socket it inherited) must equal the configured address: this settles what
+  the 1.3.0 connection check cannot (`0.0.0.0` vs `127.0.0.1`, another listener on a new port).
+  A refusal or a mismatch is reported with exit 1 and never falls back to a stop and start.
 - **Full restart** otherwise (or with `--restart`): the old path, after saying why and warning that
   new requests get errors while the old daemon drains. On a terminal it asks (default no); without
   one it needs `--yes`. `setup` installs only when nothing is installed, and `service restart`'s
   one-time reinstall of a pre-supervisor definition calls the backend directly, so neither asks.
 
 Any doubt counts as a change: a systemd unit whose state `systemctl show` cannot report, a
-supervisor whose pid or binary does not match, a config that does not load.
+`launchctl print` without a comparable job, a supervisor whose pid or binary does not match, a
+config that does not load.
+
+**Limits.** launchd: plist keys `launchctl print` does not show comparably (`KeepAlive`,
+`ThrottleInterval`, `ExitTimeOut`) edited by hand and not reloaded go unnoticed. systemd: drop-ins
+and `EnvironmentFile=` contents are not compared (`NeedDaemonReload` covers drop-in files changed
+on disk, not what an environment file says); after changing them, `install --restart`.

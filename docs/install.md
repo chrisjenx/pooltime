@@ -108,20 +108,33 @@ binary without closing the port, as `pooltime update` does:
 - the supervisor runs another version: it replaces itself in place (same pid) and hands over to a
   worker from this binary;
 - only the worker runs another version: a new worker takes over, as with `service restart`;
-- both already run this version: nothing happens, and it says so (`pooltime service restart`
-  starts fresh workers anyway).
+- both already run this version: the supervisor still replaces itself in place, so the service
+  runs the installed binary (a rebuilt or reinstalled binary keeps its version); it says
+  "reloaded onto the installed binary".
+
+After an in-place replacement the new supervisor reports the address of the socket it kept; if
+that is not the `host`/`port` in `config.toml` it says so and exits 1 (run `pooltime service
+install --restart`). Edits to the rest of `config.toml` are picked up by the new worker either
+way; `pooltime service restart` is the usual way to apply them.
 
 It prints the versions before and after and checks the result; if the supervisor refuses the
 upgrade (or ends up on another version) it says why and exits 1, with the service still serving:
 it never falls back to a stop and start by itself.
 
 Anything else (a changed definition or binary path, a changed host or port, a supervisor from
-before 1.3, a systemd unit changed on disk but not loaded) needs a **full restart**: the service
+before 1.3, a definition changed on disk but not reloaded) needs a **full restart**: the service
 stops, finishes its in-flight requests (up to 10 minutes) while new requests get errors, and
 starts again from the new definition. `service install` says why and warns first; on a terminal it
 asks (`[y/N]`), and without one it changes nothing unless you pass `--yes`. `--restart` forces a
 full restart even when the in-place path would do. Nothing running: it installs and starts the
 service without asking.
+
+What "unchanged" can see: the definition file itself; on macOS, the loaded job's arguments,
+`POOLTIME_HOME` and log paths as `launchctl print` shows them (other plist keys edited by hand and
+not reloaded are not noticed); on Linux, systemd's `NeedDaemonReload` for the unit file. systemd
+drop-ins (`pooltime.service.d/*.conf`) and files they pull in (`EnvironmentFile=`) are yours:
+`service install` neither writes nor compares them, so after changing them run `systemctl --user
+daemon-reload` and `pooltime service install --restart`.
 
 - **macOS**: a LaunchAgent at `~/Library/LaunchAgents/dev.pooltime.daemon.plist` (label
   `dev.pooltime.daemon`), loaded into your GUI session. It restarts the daemon if it exits.

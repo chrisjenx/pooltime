@@ -91,12 +91,12 @@ fn target(env: &Env) -> String {
 }
 
 fn is_loaded(env: &Env, r: &dyn Runner) -> bool {
-    loaded(env, r) == Some(true)
+    is_job_loaded(env, r) == Some(true)
 }
 
 /// `launchctl print`: `Some(true)` loaded, `Some(false)` not; `None` when it could not tell
 /// (it did not run, or a signal ended it), which a wait for the job to go must not read as gone.
-fn loaded(env: &Env, r: &dyn Runner) -> Option<bool> {
+fn is_job_loaded(env: &Env, r: &dyn Runner) -> Option<bool> {
     let out = r.run("launchctl", &["print", &target(env)]).ok()?;
     out.code?;
     Some(out.success)
@@ -144,7 +144,7 @@ fn unload_waiting(env: &Env, r: &dyn Runner, interrupts: &Interrupts) -> anyhow:
     if out.success {
         let mut warned = 0;
         let gone = env.timing.wait_until_gone_with(
-            || loaded(env, r) != Some(false),
+            || is_job_loaded(env, r) != Some(false),
             |waited| {
                 let n = interrupts.count();
                 if n > warned {
@@ -181,7 +181,7 @@ fn unload_waiting(env: &Env, r: &dyn Runner, interrupts: &Interrupts) -> anyhow:
     if not_loaded(&out) {
         return Ok(Unloaded::NotLoaded);
     }
-    if loaded(env, r) != Some(false) {
+    if is_job_loaded(env, r) != Some(false) {
         // Not an error yet: `install` still tries to load the new definition (and says what to
         // do if launchd refuses); `uninstall` reports it and keeps the plist.
         let why = out.stderr.trim();
@@ -279,16 +279,97 @@ pub fn status(env: &Env, r: &dyn Runner) -> anyhow::Result<Status> {
     })
 }
 
-/// The job's pid (`pid = N` in `launchctl print`); `None` when it is not loaded or not running.
-pub fn main_pid(env: &Env, r: &dyn Runner) -> Option<u32> {
-    let out = r.run("launchctl", &["print", &target(env)]).ok()?;
-    if !out.success {
-        return None;
+/// What `launchctl print` says about the loaded job: the parts of it `service install` compares
+/// with the plist it would write.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Job {
+    pub pid: Option<u32>,
+    /// `arguments = { ... }`; `None` when the block is missing.
+    pub arguments: Option<Vec<String>>,
+    /// `environment = { KEY => value ... }` (the job's own, not the inherited or default one).
+    pub environment: Vec<(String, String)>,
+    pub stdout_path: Option<String>,
+    pub stderr_path: Option<String>,
+}
+
+/// Parse `launchctl print <job>`: top-level lines are indented by one tab, the entries of a
+/// block by two.
+pub fn parse_print(out: &str) -> Job {
+    let mut job = Job::default();
+    let mut block: Option<&str> = None;
+    for line in out.lines() {
+        if let Some(b) = block {
+            if line == "\t}" {
+                block = None;
+                continue;
+            }
+            let Some(entry) = line.strip_prefix("\t\t") else {
+                continue;
+            };
+            match b {
+                "arguments" => job
+                    .arguments
+                    .get_or_insert_with(Vec::new)
+                    .push(entry.into()),
+                "environment" => {
+                    if let Some((k, v)) = entry.split_once(" => ") {
+                        job.environment.push((k.into(), v.into()));
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let Some(top) = line.strip_prefix('\t').filter(|l| !l.starts_with('\t')) else {
+            continue;
+        };
+        if let Some(name) = top.strip_suffix(" = {") {
+            block = Some(match name {
+                "arguments" => {
+                    job.arguments.get_or_insert_with(Vec::new);
+                    "arguments"
+                }
+                "environment" => "environment",
+                _ => "other",
+            });
+        } else if let Some(p) = top.strip_prefix("pid = ") {
+            job.pid = p.trim().parse().ok();
+        } else if let Some(p) = top.strip_prefix("stdout path = ") {
+            job.stdout_path = Some(p.into());
+        } else if let Some(p) = top.strip_prefix("stderr path = ") {
+            job.stderr_path = Some(p.into());
+        }
     }
-    out.stdout
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("pid = "))
-        .and_then(|p| p.trim().parse().ok())
+    job
+}
+
+/// Whether the loaded `job` runs what [`render_launchd_plist`] writes for `bin`: the same
+/// arguments, `POOLTIME_HOME` and log paths. The other keys (`KeepAlive`, `ThrottleInterval`,
+/// `ExitTimeOut`, ...) are not shown by `launchctl print` in a comparable form: a plist edited
+/// by hand there and not reloaded is not noticed.
+pub fn job_matches(job: &Job, bin: &Path, paths: &Paths) -> bool {
+    let bin = stable_bin(bin).to_string_lossy().into_owned();
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    job.arguments.as_deref() == Some(&[bin, "serve".into(), "--supervise".into()][..])
+        && job
+            .environment
+            .iter()
+            .any(|(k, v)| k == "POOLTIME_HOME" && *v == s(&paths.home))
+        && job.stdout_path.as_deref() == Some(s(&paths.logs.join("daemon.out")).as_str())
+        && job.stderr_path.as_deref() == Some(s(&paths.logs.join("daemon.err")).as_str())
+}
+
+/// The job's pid, and whether the loaded job differs from what the plist for `bin` would load
+/// (also when `launchctl print` fails or shows nothing comparable).
+pub fn loaded(env: &Env, r: &dyn Runner, bin: &Path) -> (Option<u32>, bool) {
+    let Ok(out) = r.run("launchctl", &["print", &target(env)]) else {
+        return (None, true);
+    };
+    if !out.success {
+        return (None, true);
+    }
+    let job = parse_print(&out.stdout);
+    (job.pid, !job_matches(&job, bin, &env.paths))
 }
 
 /// Kill and restart the loaded agent in place (the supervisor too: in-flight requests drain
@@ -303,4 +384,87 @@ pub fn restart(env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
 pub fn reload(env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
     run_checked(r, "launchctl", &["kill", "SIGHUP", &target(env)])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PRINT: &str = "gui/501/dev.pooltime.daemon = {
+\tactive count = 2
+\tpath = /Users/u/Library/LaunchAgents/dev.pooltime.daemon.plist
+\tstate = running
+
+\tprogram = /opt/homebrew/bin/pooltime
+\targuments = {
+\t\t/opt/homebrew/bin/pooltime
+\t\tserve
+\t\t--supervise
+\t}
+
+\tstdout path = /Users/u/.pooltime/logs/daemon.out
+\tstderr path = /Users/u/.pooltime/logs/daemon.err
+\tinherited environment = {
+\t\tSSH_AUTH_SOCK => /var/run/x/Listeners
+\t}
+
+\tdefault environment = {
+\t\tPATH => /usr/bin:/bin:/usr/sbin:/sbin
+\t}
+
+\tenvironment = {
+\t\tPOOLTIME_HOME => /Users/u/.pooltime
+\t\tXPC_SERVICE_NAME => dev.pooltime.daemon
+\t}
+
+\tpid = 4242
+\tevent channels = {
+\t\t\"com.apple.x\" = {
+\t\t\tpid = 9
+\t\t}
+\t}
+}
+";
+
+    #[test]
+    fn the_loaded_job_is_compared_with_the_plist() {
+        let job = parse_print(PRINT);
+        assert_eq!(job.pid, Some(4242));
+        assert_eq!(
+            job.arguments.as_deref(),
+            Some(
+                &[
+                    "/opt/homebrew/bin/pooltime".to_string(),
+                    "serve".into(),
+                    "--supervise".into()
+                ][..]
+            )
+        );
+        let paths = Paths::under(Path::new("/Users/u/.pooltime"));
+        let bin = Path::new("/opt/homebrew/Cellar/pooltime/1.4.0/bin/pooltime");
+        assert!(job_matches(&job, bin, &paths));
+        // Another binary, data dir or argument list: changed.
+        assert!(!job_matches(
+            &job,
+            Path::new("/usr/local/bin/pooltime"),
+            &paths
+        ));
+        assert!(!job_matches(&job, bin, &Paths::under(Path::new("/tmp/pt"))));
+        let plain = parse_print(&PRINT.replace("\t\t--supervise\n", ""));
+        assert!(!job_matches(&plain, bin, &paths));
+        // POOLTIME_HOME only inherited (not the job's own): changed.
+        let inherited = PRINT
+            .replace("\t\tPOOLTIME_HOME => /Users/u/.pooltime\n", "")
+            .replace(
+                "SSH_AUTH_SOCK => /var/run/x/Listeners",
+                "POOLTIME_HOME => /Users/u/.pooltime",
+            );
+        assert!(!job_matches(&parse_print(&inherited), bin, &paths));
+        // Nothing comparable (an unknown print format): changed.
+        assert!(!job_matches(
+            &parse_print("state = running\npid = 1\n"),
+            bin,
+            &paths
+        ));
+    }
 }

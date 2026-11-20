@@ -27,8 +27,8 @@ pub enum ServiceCmd {
     ///
     /// Over a running service whose definition is unchanged and whose supervisor can replace
     /// itself (1.3+), this moves it onto this binary without closing the port: the supervisor
-    /// replaces itself in place if its version differs, or a new worker takes over if only the
-    /// worker's does, or nothing happens if both already run this version. Otherwise (a changed
+    /// replaces itself in place (also when both already run this version, so a rebuilt binary is
+    /// what runs), or a new worker takes over if only the worker's version differs. Otherwise (a changed
     /// definition, binary path, host or port, an older supervisor, or `--restart`) the definition
     /// is replaced and the service stopped and started: in-flight requests drain for up to 10
     /// minutes and new ones get errors meanwhile, so it asks first (`--yes` skips the question
@@ -329,16 +329,6 @@ fn seamless(
         )
     };
     match how {
-        Seamless::Current => {
-            writeln!(
-                out,
-                "the service already runs pooltime {version} from {bin} (supervisor pid {}, \
-                 generation {}); nothing to do. `pooltime service restart` starts fresh workers \
-                 anyway",
-                sup.pid, sup.generation
-            )?;
-            Ok(0)
-        }
         Seamless::Handover => {
             writeln!(
                 out,
@@ -381,14 +371,23 @@ fn seamless(
             }
             Ok(0)
         }
-        Seamless::Upgrade => {
-            writeln!(
-                out,
-                "moving the service onto {version} without closing the port (supervisor {}, \
-                 worker {})...",
-                sup.version,
-                sup.worker_version.as_deref().unwrap_or("?")
-            )?;
+        Seamless::Upgrade | Seamless::Reload => {
+            if how == Seamless::Reload {
+                writeln!(
+                    out,
+                    "the service already runs pooltime {version}; reloading it onto the \
+                     installed binary {bin} without closing the port (a rebuild keeps the \
+                     version)..."
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "moving the service onto {version} without closing the port (supervisor {}, \
+                     worker {})...",
+                    sup.version,
+                    sup.worker_version.as_deref().unwrap_or("?")
+                )?;
+            }
             out.flush()?;
             match upgrade::upgrade_in_place(live, sup)? {
                 Upgrade::Vanished => {
@@ -417,6 +416,21 @@ fn seamless(
                     if let Some(v) = upgrade::off_target(&after, &target) {
                         writeln!(out, "{}", off(v.as_deref(), after.binary.as_deref()))?;
                         return Ok(1);
+                    }
+                    // The new supervisor kept the old socket: it must be the configured one.
+                    if let Err(e) =
+                        plan::check_listen(after.listen.as_deref(), plan::configured_listen(env))
+                    {
+                        writeln!(out, "{e}")?;
+                        return Ok(1);
+                    }
+                    if how == Seamless::Reload {
+                        writeln!(
+                            out,
+                            "reloaded onto the installed binary: supervisor pid {} and the port \
+                             kept, generation {} serves",
+                            after.pid, after.generation
+                        )?;
                     }
                     Ok(0)
                 }

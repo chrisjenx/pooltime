@@ -367,12 +367,12 @@ impl Backend {
         }
     }
 
-    /// The loaded service's main pid, and whether the manager holds an older copy of the
-    /// definition than the file (systemd's `NeedDaemonReload`; launchd re-reads it only on load,
-    /// which the supervisor's binary path check covers).
-    pub fn loaded(self, env: &Env, r: &dyn Runner) -> (Option<u32>, bool) {
+    /// The loaded service's main pid, and whether what the manager loaded differs from the
+    /// definition for `bin` (launchd: the job's arguments, `POOLTIME_HOME` and log paths as
+    /// `launchctl print` shows them; systemd: `NeedDaemonReload`, the file changed since loaded).
+    pub fn loaded(self, env: &Env, r: &dyn Runner, bin: &Path) -> (Option<u32>, bool) {
         match self {
-            Backend::Launchd => (launchd::main_pid(env, r), false),
+            Backend::Launchd => launchd::loaded(env, r, bin),
             Backend::Systemd => systemd::loaded(r),
         }
     }

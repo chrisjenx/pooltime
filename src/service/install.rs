@@ -2,7 +2,8 @@
 //! closing the port when it can, or stop and start it (the old way) when it must.
 //!
 //! The seamless path needs all of: the service runs; the definition this binary would write is
-//! byte-identical to the installed one (and, on systemd, the one the manager has loaded); the
+//! byte-identical to the installed one (and to what the manager has loaded: systemd's
+//! `NeedDaemonReload`, launchd's arguments, environment and log paths); the
 //! service's main process is a supervisor that can replace itself in place (1.3+), named in
 //! `run/supervisor.json`, running the binary path the definition names, and listening on the
 //! address `config.toml` asks for. Anything else (or `--restart`) is a full restart. The decision
@@ -56,8 +57,10 @@ pub enum Seamless {
     /// The supervisor runs this version but its worker does not: a new worker generation
     /// (`SIGHUP`, as `service restart`).
     Handover,
-    /// Everything already runs this version: nothing to do.
-    Current,
+    /// Both already run this version, but possibly an older build of it (a rebuilt or
+    /// reinstalled binary keeps its version): the supervisor replaces itself in place anyway
+    /// (`SIGUSR2`), so what runs is the installed binary.
+    Reload,
 }
 
 /// Decide what `service install` does, for this binary's `version`; `force` is `--restart`.
@@ -76,7 +79,10 @@ pub fn plan(o: &Observed, version: &str, force: bool) -> Plan {
         });
     }
     if o.stale {
-        return Plan::Full("systemd has not loaded the unit file on disk".into());
+        return Plan::Full(
+            "the loaded service differs from the definition on disk (changed and not reloaded)"
+                .into(),
+        );
     }
     let Some(sup) = &o.supervisor else {
         return Plan::Full(
@@ -120,7 +126,7 @@ pub fn plan(o: &Observed, version: &str, force: bool) -> Plan {
     } else if sup.worker_version.as_deref() != Some(version) {
         Plan::Seamless(Seamless::Handover)
     } else {
-        Plan::Seamless(Seamless::Current)
+        Plan::Seamless(Seamless::Reload)
     }
 }
 
@@ -136,7 +142,7 @@ pub fn observe(
     let installed = std::fs::read_to_string(backend.definition_path(env)).ok();
     let running = backend.status(env, r)?.running;
     let (main_pid, stale) = if running {
-        backend.loaded(env, r)
+        backend.loaded(env, r, &bin)
     } else {
         (None, false)
     };
@@ -153,16 +159,48 @@ pub fn observe(
     })
 }
 
+/// The address `config.toml` asks for, as the service reads it (no shell `POOLTIME_*`
+/// overrides); `None` when it does not load.
+pub fn configured_listen(env: &Env) -> Option<SocketAddr> {
+    let cfg = Config::load_with_env(&env.paths, |_| None).ok()?;
+    Some(SocketAddr::new(cfg.host, cfg.port))
+}
+
+/// After an in-place upgrade the new supervisor records the address of the socket it inherited
+/// (`listen`): it must be the configured one. A 1.3.0 supervisor was only checked by a
+/// connection to the configured address beforehand, which cannot tell `0.0.0.0` from
+/// `127.0.0.1` or the service from another listener; this settles it.
+pub fn check_listen(listen: Option<&str>, want: Option<SocketAddr>) -> Result<(), String> {
+    const FIX: &str = "run `pooltime service install --restart`";
+    let Some(want) = want else {
+        return Err(format!(
+            "config.toml could not be read to check the address the service listens on; fix it \
+             (`pooltime doctor`), then {FIX} if its host or port changed"
+        ));
+    };
+    let Some(listen) = listen else {
+        return Err(format!(
+            "the supervisor did not report the address it listens on (see `pooltime logs`); if \
+             config.toml's host or port ({want}) changed, {FIX}"
+        ));
+    };
+    if listen.parse::<SocketAddr>().ok() == Some(want) {
+        return Ok(());
+    }
+    Err(format!(
+        "the service still listens on {listen} but config.toml says {want}; {FIX}"
+    ))
+}
+
 /// Whether the supervisor listens where `config.toml` (as the service reads it: no shell
 /// `POOLTIME_*` overrides) asks. A supervisor from 1.3.0 does not record its address: then the
 /// configured one must accept a connection.
 fn listen_matches(env: &Env, sup: &SupervisorState) -> Option<bool> {
-    let cfg = Config::load_with_env(&env.paths, |_| None).ok()?;
-    let want = SocketAddr::new(cfg.host, cfg.port);
+    let want = configured_listen(env)?;
     match sup.listen.as_deref() {
         Some(addr) => Some(addr.parse::<SocketAddr>().ok()? == want),
         None => {
-            let probe = crate::server::health::probe_addr(cfg.host, cfg.port);
+            let probe = crate::server::health::probe_addr(want.ip(), want.port());
             Some(TcpStream::connect_timeout(&probe, Duration::from_secs(1)).is_ok())
         }
     }
@@ -209,7 +247,7 @@ mod tests {
         let o = running(sup(V, "1.3.0"));
         assert_eq!(plan(&o, V, false), Plan::Seamless(Seamless::Handover));
         let o = running(sup(V, V));
-        assert_eq!(plan(&o, V, false), Plan::Seamless(Seamless::Current));
+        assert_eq!(plan(&o, V, false), Plan::Seamless(Seamless::Reload));
         // A worker of unknown version gets a handover too.
         let mut s = sup(V, V);
         s.worker_version = None;
@@ -217,6 +255,24 @@ mod tests {
             plan(&running(s), V, false),
             Plan::Seamless(Seamless::Handover)
         );
+    }
+
+    #[test]
+    fn the_upgraded_supervisor_must_listen_where_the_config_says() {
+        let want: SocketAddr = "127.0.0.1:3460".parse().unwrap();
+        assert_eq!(check_listen(Some("127.0.0.1:3460"), Some(want)), Ok(()));
+        let err = check_listen(Some("0.0.0.0:3460"), Some(want)).unwrap_err();
+        assert!(
+            err.contains("still listens on 0.0.0.0:3460 but config.toml says 127.0.0.1:3460"),
+            "{err}"
+        );
+        assert!(err.contains("service install --restart"), "{err}");
+        let err = check_listen(Some("127.0.0.1:3999"), Some(want)).unwrap_err();
+        assert!(err.contains("still listens on 127.0.0.1:3999"), "{err}");
+        let err = check_listen(None, Some(want)).unwrap_err();
+        assert!(err.contains("did not report the address"), "{err}");
+        let err = check_listen(Some("127.0.0.1:3460"), None).unwrap_err();
+        assert!(err.contains("could not be read"), "{err}");
     }
 
     #[test]
@@ -257,7 +313,7 @@ mod tests {
                 stale: true,
                 ..base()
             },
-            "not loaded the unit file",
+            "loaded service differs",
         );
         full(
             Observed {
