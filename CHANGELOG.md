@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `pooltime service install` over a running service no longer stops it when it does not have to.
+  If the definition it would write is unchanged and the supervisor can replace itself in place
+  (1.3+, running that binary, listening where `config.toml` says), it moves the service onto this
+  binary without closing the port: the supervisor replaces itself (`SIGUSR2`, as `pooltime
+  update` does) when its version differs, a new worker takes over when only the worker's does,
+  and nothing happens (it says so) when both already match. It prints the versions and checks
+  them; a refused upgrade exits 1 with the service still serving, never falling back to a stop
+  and start. See [Install](docs/install.md#background-service).
+- When a full restart is needed (changed definition, binary path, host or port, a supervisor
+  from before 1.3), `service install` says why and warns that new requests get errors while the
+  old daemon drains; on a terminal it asks first, and without one it needs `--yes`. A fresh
+  install (nothing running) never asks. `--restart` forces the full restart.
+- `run/supervisor.json` records the supervisor's listening address (`listen`).
+
 ## 1.3.0 - 2026-11-19
 
 ### Added

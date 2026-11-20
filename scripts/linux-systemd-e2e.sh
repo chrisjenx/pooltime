@@ -2,8 +2,9 @@
 # Linux end-to-end check of the background service under a real systemd user manager:
 # `service install`, a streaming request in flight, `service restart` (and a plain
 # `systemctl --user reload`), the supervisor replacing itself in place (`SIGUSR2`, what
-# `pooltime update` sends: same MainPID), no refused connection and no 503 meanwhile, the stream
-# completes, then `service uninstall`.
+# `pooltime update` sends: same MainPID), a second `service install` over the running service
+# (unchanged unit: same MainPID, nothing stops), no refused connection and no 503 meanwhile, the
+# stream completes, then `service uninstall`.
 #
 #   scripts/linux-systemd-e2e.sh <pooltime binary>
 #
@@ -284,6 +285,16 @@ inner() {
 	[ "$(systemctl --user show -p MainPID --value pooltime.service)" = "$main" ] ||
 		die "MainPID changed: systemd saw the supervisor exit"
 	[ "$(state_field pid)" = "$main" ] || die "the state file names another supervisor pid"
+	systemctl --user is-active --quiet pooltime.service || die "the unit is no longer active"
+
+	say "service install again (unchanged unit, current supervisor: nothing stops)"
+	local gen2
+	gen2=$(state_field generation)
+	"$pt" service install </dev/null | tee "$work/install2.out"
+	grep -q "nothing to do" "$work/install2.out" || die "a second service install did not leave the service running"
+	[ "$(systemctl --user show -p MainPID --value pooltime.service)" = "$main" ] ||
+		die "MainPID changed: the second service install restarted the service"
+	[ "$(state_field generation)" = "$gen2" ] || die "the second service install started a new generation"
 	systemctl --user is-active --quiet pooltime.service || die "the unit is no longer active"
 	grep -q message_stop "$work/stream.out" &&
 		die "the slow stream ended before the restarts and the upgrade were done: raise STREAM_PAUSE"

@@ -35,7 +35,7 @@ runs).
 | `store/` | SQLite (one writer thread): migrations, request journal, account timeline, usage history, retention |
 | `analytics/` | usage sampler, weekly burn report, runway forecast, usage attribution (a session's project) and usage by project/session |
 | `mcp/` | MCP JSON-RPC transport and the eight tools |
-| `service/` | launchd and systemd unit rendering and control; `service restart` |
+| `service/` | launchd and systemd unit rendering and control; `service restart`; `service install`'s in-place vs full-restart decision (`install`); the shared in-place supervisor upgrade (`upgrade`) |
 | `supervisor/` | `serve --supervise`: owns the port, runs worker generations, hands over on `SIGHUP`, respawns crashed workers; `proto` (control messages, `run/supervisor.json`) |
 | `import/` | `bro.rs`: plan and apply a bro-cli import |
 | `upstream.rs` | HTTP client with header-wait, per-read idle and per-attempt deadlines; no decompression |
@@ -121,6 +121,12 @@ counters). Same pid, so launchd/systemd see nothing; the workers stay its childr
 process adopts the workers (reaping them by pid), unblocks the signals and starts a generation
 from the new binary with the usual handoff. A failed probe or `exec` leaves the old supervisor
 running; `run/supervisor.json` records `upgrades` / `last_upgrade` for the CLI.
+
+`pooltime service install` over a running service uses the same in-place upgrade
+(`src/service/upgrade.rs`) when the definition it would write is unchanged and the supervisor can
+take it (`src/service/install.rs` decides: same file, same loaded unit, main pid = the supervisor,
+same binary path and listen address); otherwise it is a full stop and start, which it warns about
+and asks before ([design](specs/2026-11-13-seamless-restart.md#service-install-over-a-running-service)).
 
 ## Data
 

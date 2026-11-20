@@ -29,7 +29,7 @@ use super::accounts::{self, Mode, SignInFlags};
 use super::client::{self, Client};
 use super::doctor::{self, Check, Level};
 use super::import::{self, BroArgs, ImportCmd};
-use super::service::{self as service_cli, ServiceCmd};
+use super::service::{self as service_cli, InstallArgs, ServiceCmd};
 use super::{connect, open};
 use crate::accounts::Registry;
 use crate::claude_code::{discover, is_connected};
@@ -278,7 +278,12 @@ async fn service_step(paths: &Paths, args: &SetupArgs, interactive: bool) -> (Ch
         .hint("`pooltime service install`, or re-run setup with `--service`");
         return (c, false);
     }
-    match service_cli::run_with(backend, &env, &SystemRunner, ServiceCmd::Install) {
+    // Only reached when no service is installed, so there is nothing to stop or ask about.
+    let install = ServiceCmd::Install(InstallArgs {
+        yes: true,
+        ..InstallArgs::default()
+    });
+    match service_cli::run_with(backend, &env, &SystemRunner, install) {
         Ok(0) => (Check::new(Level::Ok, label, "installed and started"), true),
         Ok(_) => (
             Check::new(Level::Fail, label, "install failed (see above)"),

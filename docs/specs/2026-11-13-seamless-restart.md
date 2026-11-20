@@ -173,3 +173,30 @@ Safety:
   file; `pooltime update` falls back to `service restart` for it.
 - **Compatibility.** The `--resume` format is versioned (`proto`); a binary lists every format it
   reads, so a newer binary keeps accepting the older format.
+
+## `service install` over a running service
+
+`service install` used to stop the job (draining, new requests refused) and start a new one every
+time, even when the definition it wrote was the same and only the binary had changed. It now
+decides first (`src/service/install.rs`, a pure `plan` over what it observed):
+
+- **Nothing running:** write the definition, load and start it (as before; no question).
+- **Seamless,** when all of these hold: the definition it would write is byte-identical to the
+  installed file; on systemd, `NeedDaemonReload=no` (the loaded unit is that file); the service's
+  main pid (`launchctl print` / `MainPID`) is the supervisor in `run/supervisor.json`, which has
+  `can_upgrade`, runs the binary path the definition names (`binary`), and listens where
+  `config.toml` (without shell `POOLTIME_*` overrides, as the service reads it) asks: the state
+  file's new `listen` field, or for a 1.3.0 supervisor that does not record it, the configured
+  address accepting a connection. Then nothing is written, and the service moves onto this
+  binary: `SIGUSR2` when the supervisor's version differs (the same in-place upgrade as
+  `pooltime update`, shared in `src/service/upgrade.rs`: re-read the state file, check the pid is
+  still `pooltime serve --supervise`, wait for `upgrades` to go up, check both versions), a
+  `SIGHUP` handover when only the worker's differs, nothing when both match. A refusal or a
+  mismatch is reported with exit 1 and never falls back to a stop and start.
+- **Full restart** otherwise (or with `--restart`): the old path, after saying why and warning that
+  new requests get errors while the old daemon drains. On a terminal it asks (default no); without
+  one it needs `--yes`. `setup` installs only when nothing is installed, and `service restart`'s
+  one-time reinstall of a pre-supervisor definition calls the backend directly, so neither asks.
+
+Any doubt counts as a change: a systemd unit whose state `systemctl show` cannot report, a
+supervisor whose pid or binary does not match, a config that does not load.

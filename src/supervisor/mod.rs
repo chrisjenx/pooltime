@@ -167,6 +167,10 @@ pub async fn run(paths: Paths, flags: ServeFlags) -> anyhow::Result<i32> {
         ),
     }
     let binary = exe.display().to_string();
+    let listen = listener
+        .as_ref()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.to_string());
     let launcher = ProcessLauncher {
         exe,
         listen_fd: listener.as_ref().map_or(-1, |l| l.as_raw_fd()),
@@ -174,6 +178,7 @@ pub async fn run(paths: Paths, flags: ServeFlags) -> anyhow::Result<i32> {
     };
     let mut sup = Supervisor::new(paths.clone(), launcher);
     sup.state.binary = Some(binary);
+    sup.state.listen = listen;
     if let Some(r) = resume {
         sup.adopt(r);
     }

@@ -279,6 +279,18 @@ pub fn status(env: &Env, r: &dyn Runner) -> anyhow::Result<Status> {
     })
 }
 
+/// The job's pid (`pid = N` in `launchctl print`); `None` when it is not loaded or not running.
+pub fn main_pid(env: &Env, r: &dyn Runner) -> Option<u32> {
+    let out = r.run("launchctl", &["print", &target(env)]).ok()?;
+    if !out.success {
+        return None;
+    }
+    out.stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("pid = "))
+        .and_then(|p| p.trim().parse().ok())
+}
+
 /// Kill and restart the loaded agent in place (the supervisor too: in-flight requests drain
 /// first, and new ones get 503 meanwhile).
 pub fn restart(env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
