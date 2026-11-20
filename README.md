@@ -60,6 +60,7 @@ pooltime accounts relogin --dead      # re-sign-in every account that needs it, 
 pooltime accounts export pool.age     # move the pool to a new machine (then: accounts import)
 pooltime connect default --statusline --mcp   # status line segment + MCP tools in a profile
 pooltime open                         # dashboard
+pooltime unlock                       # one-time code to unlock an open dashboard tab
 pooltime doctor                       # what is wrong and how to fix it
 pooltime logs --request <id>          # why did this request fail
 pooltime update                       # latest release, service moved onto it without a dropped request

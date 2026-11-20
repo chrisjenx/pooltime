@@ -4,10 +4,12 @@
 //! Reads (`GET`) need nothing beyond the Host/Origin guard (spec §16); every mutation needs the
 //! management key as `Authorization: Bearer <key>` or the dashboard session cookie. The key is 32
 //! random bytes in hex at `run/mgmt.key` (0600, [`ensure_mgmt_key`]). `POST /api/v1/session`
-//! exchanges the key for the cookie `pooltime_mgmt`, whose value is **not** the key but a token
+//! exchanges the key (or a one-time code from `POST /api/v1/session/code`, see
+//! [`super::unlock`]) for the cookie `pooltime_mgmt`, whose value is **not** the key but a token
 //! derived from it ([`session_token`], SHA-256 over a fixed label and the key), so the cookie jar
 //! never holds the key itself. Cookie: `HttpOnly; SameSite=Strict; Path=/`, no `Secure` (plain
-//! http on localhost), no `Max-Age` (a browser session). There is no CORS: a foreign page cannot
+//! http on localhost), `Max-Age` 30 days ([`SESSION_MAX_AGE_SECS`]), so a bookmarked dashboard stays
+//! managing across browser restarts; `pooltime open` renews it. There is no CORS: a foreign page cannot
 //! read a response, and the Host/Origin guard refuses it before auth is even consulted.
 //!
 //! The debugging views (`/requests`, `/timeline`, `/stats`, `/debug`) live in
@@ -135,10 +137,13 @@ pub fn session_token(key: &str) -> String {
     hex::encode(h.finalize())
 }
 
+/// How long a dashboard session cookie lasts (30 days). It stays valid only while the key does.
+pub const SESSION_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// The `Set-Cookie` value that opens a dashboard session for `key`.
 pub fn session_cookie_header(key: &str) -> String {
     format!(
-        "{SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/",
+        "{SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_MAX_AGE_SECS}",
         session_token(key)
     )
 }
@@ -193,6 +198,7 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/api/v1/session",
             post(session).fallback(|| async { method_not_allowed("POST") }),
         )
+        .route("/api/v1/session/code", write(post(session_code), "POST"))
         .route("/api/v1/accounts", write(post(create_account), "POST"))
         .route(
             "/api/v1/accounts/{id}",
@@ -847,19 +853,40 @@ async fn session(State(app): State<Arc<AppState>>, headers: HeaderMap, body: Bod
         Ok(b) => b,
         Err(r) => return r,
     };
-    let presented = body.get("k").and_then(Value::as_str).unwrap_or("");
-    if app.mgmt_key.is_empty() || !keys_match(presented, &app.mgmt_key) {
-        return anthropic_error(
-            401,
-            "authentication_error",
-            "pooltime: invalid management key",
-        );
+    // Either the key itself (`pooltime open`) or a one-time code from `pooltime unlock`.
+    if let Some(code) = body.get("code").and_then(Value::as_str) {
+        if app.mgmt_key.is_empty() || !app.unlock.redeem(code, std::time::Instant::now()) {
+            return anthropic_error(
+                401,
+                "authentication_error",
+                "pooltime: invalid or expired unlock code (run `pooltime unlock` for a new one)",
+            );
+        }
+    } else {
+        let presented = body.get("k").and_then(Value::as_str).unwrap_or("");
+        if app.mgmt_key.is_empty() || !keys_match(presented, &app.mgmt_key) {
+            return anthropic_error(
+                401,
+                "authentication_error",
+                "pooltime: invalid management key",
+            );
+        }
     }
     let mut r = ok(json!({ "ok": true }));
     if let Ok(v) = HeaderValue::from_str(&session_cookie_header(&app.mgmt_key)) {
         r.headers_mut().insert(SET_COOKIE, v);
     }
     r
+}
+
+/// `POST /api/v1/session/code` (key required): a one-time code that unlocks an open dashboard
+/// tab ([`super::unlock`]). The code goes to the caller only, never to a log.
+async fn session_code(State(app): State<Arc<AppState>>) -> Response {
+    let code = app.unlock.mint(std::time::Instant::now());
+    ok(json!({
+        "code": code,
+        "expires_in_secs": super::unlock::CODE_TTL.as_secs(),
+    }))
 }
 
 // ---- accounts --------------------------------------------------------------------------------

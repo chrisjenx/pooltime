@@ -22,6 +22,7 @@ pub mod models_route;
 pub mod router;
 pub mod routing_preview;
 pub mod shutdown;
+pub mod unlock;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -78,6 +79,8 @@ pub struct AppState {
     pub(crate) config_write: tokio::sync::Mutex<()>,
     /// In-flight and finished sign-in flows, addressable by id (management API).
     pub signins: mgmt::SignIns,
+    /// The live one-time dashboard unlock code (`pooltime unlock`).
+    pub unlock: unlock::UnlockCodes,
     /// Dev/test hook: when set, `GET /api/v1/status` serves this document instead of the live
     /// state (`POOLTIME_FIXTURE_STATE`, see [`daemon`]). `None` in normal operation.
     pub fixture_state: Option<serde_json::Value>,
@@ -127,6 +130,7 @@ impl AppState {
             proxy_key,
             config_write: tokio::sync::Mutex::new(()),
             signins: mgmt::SignIns::default(),
+            unlock: Default::default(),
             fixture_state: None,
             model_usage: Default::default(),
             projects: Default::default(),

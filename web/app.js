@@ -309,7 +309,7 @@
   function lockedPanel(title) {
     return h("div", { class: "panel" },
       h("h2", { text: title }),
-      h("p", { class: "empty", text: "Only shown with the management key: run `pooltime open`, or unlock above." }));
+      h("p", { class: "empty", text: "Only shown when managing: run `pooltime unlock` and enter the code above, or `pooltime open`." }));
   }
   // The attempt chain of one request (cross-provider hops show as a provider change).
   function chainView(d) {
@@ -922,6 +922,10 @@
       ...(queue.length && manage
         ? [h("button", { type: "button", class: "small", onclick: () => relogin.start(queue) }, "Re-login all")]
         : []),
+      // Read-only view: say how to get the Re-login buttons rather than offering nothing.
+      ...(queue.length && !manage
+        ? [h("span", null, "run ", h("code", { text: "pooltime unlock" }), " and enter the code above to sign in from here")]
+        : []),
       h("a", { href: "#accounts" }, "View accounts"),
     );
   }
@@ -1346,7 +1350,8 @@
           ? statusDetail(a)
           : reasonText(a.reason) || (a.status === "ready" ? "usable" : "—")),
         a.until && a.status !== "expiring" ? kv("Until", clock(a.until) + " (" + rel(a.until) + ")") : null,
-        dead && !manage ? kv("Fix", h("code", { text: "pooltime accounts login " + a.id })) : null,
+        dead && !manage ? kv("Fix", h("span", null, h("code", { text: "pooltime accounts login " + a.id }),
+          " — or run ", h("code", { text: "pooltime unlock" }), " and enter the code at the top to sign in from this page")) : null,
         kv("7-day", week),
         kv("Login", expiry, expiryCls),
         token ? kv("Token", token) : null,
@@ -1594,7 +1599,8 @@
       const k = $("key-input").value.trim();
       if (!k) return;
       try {
-        await api("POST", "/api/v1/session", { k });
+        // A short one-time code from `pooltime unlock`, or the 64-hex management key itself.
+        await api("POST", "/api/v1/session", k.length <= 16 ? { code: k } : { k });
         location.reload();
       } catch (e) {
         $("key-msg").textContent = e.message;

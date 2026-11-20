@@ -15,6 +15,7 @@ pub mod setup;
 pub mod status;
 pub mod statusline;
 pub mod transfer;
+pub mod unlock;
 pub mod update;
 
 use std::ffi::OsString;
@@ -71,6 +72,8 @@ pub enum Command {
     Models(models::ModelsCmd),
     /// Print the dashboard URL and open it in the browser.
     Open,
+    /// Print a one-time code that unlocks an already open dashboard tab (instead of a new tab).
+    Unlock,
     /// Show the daemon's logs.
     Logs(logs::LogsArgs),
     /// Run the daemon as a background service (launchd on macOS, systemd on Linux).
@@ -194,6 +197,7 @@ pub fn run(args: Vec<OsString>) -> anyhow::Result<i32> {
             Command::Disconnect { profiles } => connect::disconnect(&paths, profiles).await,
             Command::Models(cmd) => models::run(&paths, cmd).await,
             Command::Open => open::run(&paths).await,
+            Command::Unlock => unlock::run(&paths).await,
             // Blocking file reads; nothing else runs on this runtime meanwhile.
             Command::Logs(args) => logs::run(&paths, args).await,
             // Short blocking calls to launchctl/systemctl.
