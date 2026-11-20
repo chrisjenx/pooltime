@@ -616,6 +616,7 @@ exit 0"#,
   enable) touch "$STATE" ;;
   disable) rm -f "$STATE" ;;
   is-active) if [ -f "$STATE" ]; then echo active; else echo inactive; exit 3; fi ;;
+  status) [ -f "$STATE" ] || exit 3 ;;
 esac
 exit 0"#,
         ),
