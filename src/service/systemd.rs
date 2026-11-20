@@ -270,6 +270,37 @@ pub fn status(env: &Env, r: &dyn Runner) -> anyhow::Result<Status> {
     })
 }
 
+/// The unit's main pid and whether its file changed since systemd loaded it
+/// (`systemctl --user show -p MainPID -p NeedDaemonReload`). If systemd cannot say, the unit
+/// counts as changed (so `service install` restarts it, as before).
+pub fn loaded(r: &dyn Runner) -> (Option<u32>, bool) {
+    let Ok(out) = run_checked(
+        r,
+        "systemctl",
+        &[
+            "--user",
+            "show",
+            "-p",
+            "MainPID",
+            "-p",
+            "NeedDaemonReload",
+            UNIT,
+        ],
+    ) else {
+        return (None, true);
+    };
+    let field = |k: &str| {
+        out.stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
+            .map(str::trim)
+    };
+    let pid = field("MainPID")
+        .and_then(|p| p.parse::<u32>().ok())
+        .filter(|p| *p > 0);
+    (pid, field("NeedDaemonReload") != Some("no"))
+}
+
 /// Ask the running supervisor for a new worker generation (`ExecReload`: `SIGHUP`). A unit
 /// still reloading through `/bin/kill` gets the portable `ExecReload=` first (the running
 /// service is not restarted for that: `daemon-reload` is enough). If that update cannot be made,

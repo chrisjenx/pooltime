@@ -11,13 +11,14 @@ use std::process::Command;
 use std::sync::Mutex;
 
 use pooltime::claude_code::{apply, is_connected, profile_of, EnvBlock, Pins, Profile};
-use pooltime::cli::service::{run_with, ServiceCmd};
+use pooltime::cli::service::{install, run_with, Ask, InstallArgs, ServiceCmd};
 use pooltime::config::{Config, Paths, ProfileRef};
+use pooltime::service::upgrade::Live;
 use pooltime::service::{
     launchd, render_launchd_plist, render_systemd_unit, restart, stable_bin, systemd,
     systemd::ExecReloadUpgrade, Backend, CmdOutput, Env, Restarted, Runner, Timing,
 };
-use pooltime::supervisor::proto::{RestartResult, SupervisorState};
+use pooltime::supervisor::proto::{RestartResult, SupervisorState, UpgradeResult};
 use serde_json::{json, Value};
 
 fn fake_paths() -> Paths {
@@ -113,6 +114,10 @@ struct Rec {
     on_reload: Option<Box<dyn Fn() + Send + Sync>>,
     /// The next N `launchctl print` calls die of a signal (a Ctrl-C reaching them).
     print_signals: Mutex<u32>,
+    /// systemd: the unit file changed since it was loaded (`NeedDaemonReload=yes`).
+    need_reload: bool,
+    /// launchd: what `launchctl print` adds about the loaded job (arguments, environment, ...).
+    job: Option<String>,
 }
 
 impl Rec {
@@ -120,6 +125,23 @@ impl Rec {
         Rec {
             loaded: Mutex::new(true),
             ..Rec::default()
+        }
+    }
+
+    /// launchd: the job `env`'s plist loads, running.
+    fn launchd_running(env: &Env) -> Rec {
+        let s = |p: &Path| p.display().to_string();
+        Rec {
+            job: Some(format!(
+                "\targuments = {{\n\t\t{}\n\t\tserve\n\t\t--supervise\n\t}}\n\
+                 \tstdout path = {}\n\tstderr path = {}\n\
+                 \tenvironment = {{\n\t\tPOOLTIME_HOME => {}\n\t\tXPC_SERVICE_NAME => x\n\t}}\n",
+                s(&env.bin),
+                s(&env.paths.logs.join("daemon.out")),
+                s(&env.paths.logs.join("daemon.err")),
+                s(&env.paths.home)
+            )),
+            ..Rec::launchd_loaded()
         }
     }
 
@@ -188,7 +210,14 @@ impl Runner for Rec {
             ("launchctl", "bootout") => {
                 reply(113, "", "Boot-out failed: 113: Could not find service")
             }
-            ("launchctl", "print") if *loaded => reply(0, "\tstate = running\n\tpid = 4242\n", ""),
+            ("launchctl", "print") if *loaded => reply(
+                0,
+                &format!(
+                    "\tstate = running\n\tpid = 4242\n{}",
+                    self.job.as_deref().unwrap_or("")
+                ),
+                "",
+            ),
             ("launchctl", "print") => reply(113, "", "Could not find service"),
             ("systemctl", "enable") => {
                 *active = true;
@@ -207,6 +236,15 @@ impl Runner for Rec {
             ("systemctl", "is-active") => reply(3, "inactive\n", ""),
             ("systemctl", "status") if *active => reply(0, "Active: active (running)\n", ""),
             ("systemctl", "status") => reply(3, "Active: inactive (dead)\n", ""),
+            ("systemctl", "show") if *active => reply(
+                0,
+                &format!(
+                    "MainPID=4242\nNeedDaemonReload={}\n",
+                    if self.need_reload { "yes" } else { "no" }
+                ),
+                "",
+            ),
+            ("systemctl", "show") => reply(0, "MainPID=0\nNeedDaemonReload=no\n", ""),
             ("launchctl", "kill") | ("systemctl", "reload") => {
                 if let Some(f) = &self.on_reload {
                     f();
@@ -604,6 +642,7 @@ exit 0"#,
   enable) touch "$STATE" ;;
   disable) rm -f "$STATE" ;;
   is-active) if [ -f "$STATE" ]; then echo active; else echo inactive; exit 3; fi ;;
+  status) [ -f "$STATE" ] || exit 3 ;;
 esac
 exit 0"#,
         ),
@@ -1134,4 +1173,443 @@ fn status_shows_the_supervisor_and_an_outdated_definition() {
     fs::write(&plist, old).unwrap();
     assert_eq!(Backend::Launchd.supervised(&env), Some(false));
     assert!(pooltime::cli::service::OLD_DEFINITION.contains("pooltime service install"));
+}
+
+// ---- service install over a running service ---------------------------------------------------
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The supervisor the recorder's service runs (`pid = 4242`), on `version`, its worker on
+/// `worker`, from the binary `env_in` names, listening on the default address.
+fn running_supervisor(version: &str, worker: &str) -> SupervisorState {
+    SupervisorState {
+        pid: 4242,
+        version: version.into(),
+        generation: 1,
+        worker_pid: Some(4243),
+        worker_version: Some(worker.into()),
+        can_upgrade: true,
+        binary: Some("/usr/local/bin/pooltime".into()),
+        listen: Some("127.0.0.1:3460".into()),
+        ..SupervisorState::default()
+    }
+}
+
+/// A scripted supervisor for the in-place upgrade, and a scripted terminal.
+#[derive(Default)]
+struct FakeLive {
+    sup: Option<SupervisorState>,
+    after: Option<SupervisorState>,
+    tty: bool,
+    answer: bool,
+    calls: Mutex<Vec<String>>,
+}
+
+impl FakeLive {
+    fn calls(&self) -> Vec<String> {
+        std::mem::take(&mut *self.calls.lock().unwrap())
+    }
+}
+
+impl Live for FakeLive {
+    fn supervisor(&self) -> Option<SupervisorState> {
+        self.sup.clone()
+    }
+    fn is_supervisor(&self, pid: u32) -> bool {
+        self.sup.as_ref().is_some_and(|s| s.pid == pid)
+    }
+    fn signal_upgrade(&self, pid: u32) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push(format!("usr2 {pid}"));
+        Ok(())
+    }
+    fn wait_upgrade(&self, after: u64) -> Option<SupervisorState> {
+        self.calls.lock().unwrap().push(format!("wait {after}"));
+        self.after.clone()
+    }
+}
+
+impl Ask for FakeLive {
+    fn tty(&self) -> bool {
+        self.tty
+    }
+    fn confirm(&self, q: &str) -> anyhow::Result<bool> {
+        self.calls.lock().unwrap().push(format!("ask {q}"));
+        Ok(self.answer)
+    }
+}
+
+fn install_with(
+    backend: Backend,
+    env: &Env,
+    rec: &Rec,
+    live: &FakeLive,
+    args: InstallArgs,
+) -> (i32, String) {
+    let mut out = Vec::new();
+    let code = install(backend, env, rec, live, live, &args, &mut out).unwrap();
+    (code, String::from_utf8(out).unwrap())
+}
+
+fn upgraded_to(from: &str) -> SupervisorState {
+    SupervisorState {
+        upgrades: 1,
+        last_upgrade: Some(UpgradeResult {
+            ok: true,
+            from_version: from.into(),
+            version: VERSION.into(),
+            error: None,
+        }),
+        generation: 2,
+        ..running_supervisor(VERSION, VERSION)
+    }
+}
+
+/// No `bootout`/`bootstrap`/`restart`/`disable`: the service was never stopped.
+fn assert_never_stopped(calls: &[String]) {
+    for c in calls {
+        for verb in [
+            "bootout",
+            "bootstrap",
+            "kickstart",
+            " restart ",
+            " disable ",
+            " stop ",
+        ] {
+            assert!(!c.contains(verb), "{c} in {calls:?}");
+        }
+    }
+}
+
+#[test]
+fn install_over_an_unchanged_definition_upgrades_the_supervisor_in_place() {
+    for backend in [Backend::Launchd, Backend::Systemd] {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_in(dir.path());
+        backend.install(&env, &Rec::default()).unwrap();
+        let def = fs::read_to_string(backend.definition_path(&env)).unwrap();
+        let rec = Rec {
+            active: Mutex::new(true),
+            ..Rec::launchd_running(&env)
+        };
+        let live = FakeLive {
+            sup: Some(running_supervisor("0.9.0", "0.9.0")),
+            after: Some(upgraded_to("0.9.0")),
+            ..FakeLive::default()
+        };
+        let (code, out) = install_with(backend, &env, &rec, &live, InstallArgs::default());
+        assert_eq!(code, 0, "{backend:?}: {out}");
+        assert_eq!(live.calls(), ["usr2 4242", "wait 0"], "{backend:?}");
+        assert_never_stopped(&rec.calls());
+        assert!(out.contains("definition is unchanged"), "{out}");
+        assert!(
+            out.contains(&format!(
+                "supervisor 0.9.0 -> {VERSION}, worker 0.9.0 -> {VERSION} (pid 4242 kept"
+            )),
+            "{out}"
+        );
+        assert_eq!(
+            fs::read_to_string(backend.definition_path(&env)).unwrap(),
+            def
+        );
+    }
+}
+
+#[test]
+fn install_hands_over_to_a_new_worker_when_only_the_worker_is_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    launchd::install(&env, &Rec::default()).unwrap();
+    let paths = env.paths.clone();
+    let rec = Rec {
+        on_reload: Some(Box::new(move || {
+            let mut st = running_supervisor(VERSION, VERSION);
+            st.generation = 2;
+            st.restarts = 1;
+            st.draining = vec![4243];
+            st.last_restart = Some(RestartResult {
+                ok: true,
+                generation: 2,
+                error: None,
+            });
+            write_supervisor(&paths, &st);
+        })),
+        ..Rec::launchd_running(&env)
+    };
+    let live = FakeLive {
+        sup: Some(running_supervisor(VERSION, "0.9.0")),
+        ..FakeLive::default()
+    };
+    let (code, out) = install_with(Backend::Launchd, &env, &rec, &live, InstallArgs::default());
+    assert_eq!(code, 0, "{out}");
+    assert!(live.calls().is_empty(), "no SIGUSR2");
+    let calls = rec.calls();
+    assert!(
+        calls.contains(&"launchctl kill SIGHUP gui/501/dev.pooltime.daemon".to_string()),
+        "{calls:?}"
+    );
+    assert_never_stopped(&calls);
+    assert!(
+        out.contains("restarted without closing the port: generation 2"),
+        "{out}"
+    );
+}
+
+#[test]
+fn install_with_everything_current_still_reloads_onto_the_installed_binary() {
+    // A rebuilt or reinstalled binary keeps its version: replace the supervisor in place anyway.
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    systemd::install(&env, &Rec::default()).unwrap();
+    let rec = Rec::systemd_active();
+    let live = FakeLive {
+        sup: Some(running_supervisor(VERSION, VERSION)),
+        after: Some(upgraded_to(VERSION)),
+        ..FakeLive::default()
+    };
+    let (code, out) = install_with(Backend::Systemd, &env, &rec, &live, InstallArgs::default());
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(live.calls(), ["usr2 4242", "wait 0"]);
+    assert_eq!(
+        rec.calls(),
+        [
+            "systemctl --user status pooltime.service",
+            "systemctl --user show -p MainPID -p NeedDaemonReload pooltime.service",
+            "systemctl --user enable pooltime.service"
+        ]
+    );
+    assert!(out.contains("already runs pooltime"), "{out}");
+    assert!(out.contains("reloaded onto the installed binary"), "{out}");
+}
+
+#[test]
+fn an_upgraded_supervisor_on_another_address_is_reported() {
+    // A 1.3.0 supervisor records no address; the pre-check (a connection to the configured
+    // one) cannot tell 0.0.0.0 from 127.0.0.1. The upgraded supervisor reports the socket.
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    launchd::install(&env, &Rec::default()).unwrap();
+    let rec = Rec::launchd_running(&env);
+    let mut before = running_supervisor("0.9.0", "0.9.0");
+    before.listen = Some("127.0.0.1:3460".into());
+    for (listen, says) in [
+        (
+            Some("0.0.0.0:3460"),
+            "still listens on 0.0.0.0:3460 but config.toml says 127.0.0.1:3460",
+        ),
+        (None, "did not report the address"),
+    ] {
+        let mut after = upgraded_to("0.9.0");
+        after.listen = listen.map(str::to_string);
+        let live = FakeLive {
+            sup: Some(before.clone()),
+            after: Some(after),
+            ..FakeLive::default()
+        };
+        let (code, out) = install_with(Backend::Launchd, &env, &rec, &live, InstallArgs::default());
+        assert_eq!(code, 1, "{out}");
+        assert!(out.contains(says), "{out}");
+        assert!(out.contains("service install --restart"), "{out}");
+        assert_never_stopped(&rec.calls());
+    }
+}
+
+#[test]
+fn a_failed_in_place_upgrade_exits_1_and_never_falls_back_to_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    launchd::install(&env, &Rec::default()).unwrap();
+    let mut after = running_supervisor("0.9.0", "0.9.0");
+    after.upgrades = 1;
+    after.last_upgrade = Some(UpgradeResult {
+        ok: false,
+        from_version: "0.9.0".into(),
+        version: "0.9.0".into(),
+        error: Some("config.toml could not be loaded".into()),
+    });
+    let rec = Rec::launchd_running(&env);
+    let live = FakeLive {
+        sup: Some(running_supervisor("0.9.0", "0.9.0")),
+        after: Some(after),
+        ..FakeLive::default()
+    };
+    let (code, out) = install_with(Backend::Launchd, &env, &rec, &live, InstallArgs::default());
+    assert_eq!(code, 1, "{out}");
+    assert_never_stopped(&rec.calls());
+    assert!(
+        out.contains("upgrade failed: config.toml could not be loaded"),
+        "{out}"
+    );
+    assert!(out.contains("--restart"), "{out}");
+
+    // Upgraded, but onto some other version (another binary at that path): exit 1, named.
+    let mut other = upgraded_to("0.9.0");
+    other.version = "9.9.9".into();
+    other.last_upgrade.as_mut().unwrap().version = "9.9.9".into();
+    let live = FakeLive {
+        sup: Some(running_supervisor("0.9.0", "0.9.0")),
+        after: Some(other),
+        ..FakeLive::default()
+    };
+    let (code, out) = install_with(Backend::Launchd, &env, &rec, &live, InstallArgs::default());
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("now runs 9.9.9"), "{out}");
+}
+
+#[test]
+fn a_changed_definition_is_a_full_restart_that_asks_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    let plist = launchd::plist_path(&env);
+    launchd::install(&env, &Rec::default()).unwrap();
+    let old = fs::read_to_string(&plist)
+        .unwrap()
+        .replace("<integer>10</integer>", "<integer>5</integer>");
+    fs::write(&plist, &old).unwrap();
+    let sup = || Some(running_supervisor(VERSION, VERSION));
+
+    // No terminal, no --yes: nothing happens.
+    let rec = Rec::launchd_loaded();
+    let live = FakeLive {
+        sup: sup(),
+        ..FakeLive::default()
+    };
+    let (code, out) = install_with(Backend::Launchd, &env, &rec, &live, InstallArgs::default());
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("the service definition changed"), "{out}");
+    assert!(out.contains("new requests get"), "{out}");
+    assert!(out.contains("pass --yes"), "{out}");
+    assert_never_stopped(&rec.calls());
+    assert_eq!(fs::read_to_string(&plist).unwrap(), old);
+
+    // A terminal and a "no".
+    let live = FakeLive {
+        sup: sup(),
+        tty: true,
+        ..FakeLive::default()
+    };
+    let (code, _) = install_with(Backend::Launchd, &env, &rec, &live, InstallArgs::default());
+    assert_eq!(code, 1);
+    assert_eq!(live.calls(), ["ask Restart the pooltime service now?"]);
+    assert_never_stopped(&rec.calls());
+
+    // A "yes": the old way (unload, wait, load).
+    let live = FakeLive {
+        sup: sup(),
+        tty: true,
+        answer: true,
+        ..FakeLive::default()
+    };
+    let (code, out) = install_with(Backend::Launchd, &env, &rec, &live, InstallArgs::default());
+    assert_eq!(code, 0, "{out}");
+    assert!(rec.calls().contains(&BOOTOUT.to_string()));
+    assert_ne!(fs::read_to_string(&plist).unwrap(), old);
+
+    // --yes without a terminal, and --restart with an unchanged definition: no question.
+    let live = FakeLive {
+        sup: sup(),
+        ..FakeLive::default()
+    };
+    let args = InstallArgs {
+        restart: true,
+        yes: true,
+    };
+    let (code, out) = install_with(Backend::Launchd, &env, &rec, &live, args);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("--restart was given"), "{out}");
+    assert!(live.calls().is_empty());
+    assert!(rec.calls().contains(&BOOTOUT.to_string()));
+}
+
+#[test]
+fn an_old_supervisor_or_a_stale_unit_is_a_full_restart() {
+    // A supervisor from before in-place upgrades.
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    launchd::install(&env, &Rec::default()).unwrap();
+    let mut old = running_supervisor("1.2.0", "1.2.0");
+    old.can_upgrade = false;
+    old.binary = None;
+    old.listen = None;
+    let rec = Rec::launchd_running(&env);
+    let live = FakeLive {
+        sup: Some(old),
+        ..FakeLive::default()
+    };
+    let (code, out) = install_with(Backend::Launchd, &env, &rec, &live, InstallArgs::default());
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("(1.2.0) predates in-place upgrades"), "{out}");
+
+    // systemd holds an older copy of the unit than the file.
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    systemd::install(&env, &Rec::default()).unwrap();
+    let rec = Rec {
+        need_reload: true,
+        ..Rec::systemd_active()
+    };
+    let live = FakeLive {
+        sup: Some(running_supervisor(VERSION, VERSION)),
+        ..FakeLive::default()
+    };
+    let args = InstallArgs {
+        yes: true,
+        ..InstallArgs::default()
+    };
+    let (code, out) = install_with(Backend::Systemd, &env, &rec, &live, args);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("loaded service differs"), "{out}");
+    assert!(rec
+        .calls()
+        .contains(&"systemctl --user restart pooltime.service".to_string()));
+
+    // A port changed in config.toml: the supervisor keeps the socket it bound.
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    launchd::install(&env, &Rec::default()).unwrap();
+    fs::write(&env.paths.config, "port = 3999\n").unwrap();
+    let live = FakeLive {
+        sup: Some(running_supervisor(VERSION, VERSION)),
+        ..FakeLive::default()
+    };
+    let (code, out) = install_with(
+        Backend::Launchd,
+        &env,
+        &Rec::launchd_running(&env),
+        &live,
+        InstallArgs::default(),
+    );
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("host or port in config.toml differs"), "{out}");
+
+    // launchd still runs a job loaded from another plist (edited, not reloaded).
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    launchd::install(&env, &Rec::default()).unwrap();
+    let mut rec = Rec::launchd_running(&env);
+    rec.job = rec.job.map(|j| {
+        j.replace(
+            "\t\t--supervise\n",
+            "\t\t--supervise\n\t\t--i-stopped-bro\n",
+        )
+    });
+    let live = FakeLive {
+        sup: Some(running_supervisor(VERSION, VERSION)),
+        ..FakeLive::default()
+    };
+    let (code, out) = install_with(Backend::Launchd, &env, &rec, &live, InstallArgs::default());
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("loaded service differs"), "{out}");
+}
+
+#[test]
+fn install_with_nothing_running_never_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = env_in(dir.path());
+    let rec = Rec::default();
+    let live = FakeLive::default();
+    let (code, out) = install_with(Backend::Launchd, &env, &rec, &live, InstallArgs::default());
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("installed and started"), "{out}");
+    assert!(live.calls().is_empty());
+    assert!(launchd::plist_path(&env).exists());
 }

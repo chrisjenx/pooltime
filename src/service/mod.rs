@@ -8,8 +8,10 @@
 //! real `launchctl` / `systemctl`. `service uninstall` first releases every connected Claude Code
 //! profile (see `cli::service`), so no profile is left pointing at a daemon that is gone.
 
+pub mod install;
 pub mod launchd;
 pub mod systemd;
+pub mod upgrade;
 
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -357,6 +359,24 @@ impl Backend {
         }
     }
 
+    /// The definition [`Backend::install`] writes for `bin`.
+    pub fn render(self, bin: &Path, paths: &Paths) -> String {
+        match self {
+            Backend::Launchd => render_launchd_plist(bin, paths),
+            Backend::Systemd => render_systemd_unit(bin, paths),
+        }
+    }
+
+    /// The loaded service's main pid, and whether what the manager loaded differs from the
+    /// definition for `bin` (launchd: the job's arguments, `POOLTIME_HOME` and log paths as
+    /// `launchctl print` shows them; systemd: `NeedDaemonReload`, the file changed since loaded).
+    pub fn loaded(self, env: &Env, r: &dyn Runner, bin: &Path) -> (Option<u32>, bool) {
+        match self {
+            Backend::Launchd => launchd::loaded(env, r, bin),
+            Backend::Systemd => systemd::loaded(r),
+        }
+    }
+
     /// Write the definition (replacing any old one) and load it.
     pub fn install(self, env: &Env, r: &dyn Runner) -> anyhow::Result<()> {
         match self {
@@ -479,6 +499,17 @@ pub fn restart(backend: Backend, env: &Env, r: &dyn Runner) -> anyhow::Result<Re
         backend.restart(env, r)?;
         return Ok(Restarted::Started);
     };
+    handover(backend, env, r, &before)
+}
+
+/// Ask the running supervisor (`before`, as read a moment ago) for a new worker generation and
+/// wait for its verdict: `Ok` only for a handover that succeeded.
+pub fn handover(
+    backend: Backend,
+    env: &Env,
+    r: &dyn Runner,
+    before: &SupervisorState,
+) -> anyhow::Result<Restarted> {
     backend
         .reload(env, r)
         .context("signalling the pooltime supervisor")?;

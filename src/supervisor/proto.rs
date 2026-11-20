@@ -118,6 +118,11 @@ pub struct SupervisorState {
     /// The binary path new workers (and an upgrade) run.
     #[serde(default)]
     pub binary: Option<String>,
+    /// The address the listening socket is bound to (`127.0.0.1:3460`), kept across in-place
+    /// upgrades: `service install` compares it with `config.toml` (a supervisor from 1.3.0
+    /// leaves it out).
+    #[serde(default)]
+    pub listen: Option<String>,
 }
 
 /// How the last in-place upgrade of the supervisor went.
@@ -237,6 +242,7 @@ mod tests {
                 error: None,
             }),
             binary: Some("/opt/homebrew/bin/pooltime".into()),
+            listen: Some("127.0.0.1:3460".into()),
         };
         write_state(&paths, &st).unwrap();
         assert_eq!(read_state(&paths).as_ref(), Some(&st));
