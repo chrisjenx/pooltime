@@ -859,7 +859,7 @@ async fn session(State(app): State<Arc<AppState>>, headers: HeaderMap, body: Bod
             return anthropic_error(
                 401,
                 "authentication_error",
-                "pooltime: invalid or expired unlock code (run `pooltime unlock` for a new one)",
+                "pooltime: invalid or expired unlock code (run `pooltime unlock` for a new one, or `pooltime open`)",
             );
         }
     } else {

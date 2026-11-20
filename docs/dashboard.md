@@ -22,7 +22,10 @@ pooltime unlock
 
 and type the code it prints (e.g. `K7Q2-9XMB`) into the **Unlock** field at the top of the
 read-only page. A code works once, for 5 minutes; five wrong tries cancel it, and a new
-`pooltime unlock` replaces it. Pasting the management key itself there works too. Requests whose `Host`/`Origin` is not `127.0.0.1:<port>` or `localhost:<port>` are
+`pooltime unlock` replaces it. Pasting the management key itself there works too.
+
+To end every dashboard session (e.g. on a shared machine), delete `~/.pooltime/run/mgmt.key` and
+run `pooltime service restart`: the new worker makes a fresh key, and old cookies stop working. Requests whose `Host`/`Origin` is not `127.0.0.1:<port>` or `localhost:<port>` are
 refused.
 
 ![Overview](img/dashboard-overview.png)

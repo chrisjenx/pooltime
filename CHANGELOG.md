@@ -9,13 +9,14 @@
   page, instead of opening a new tab with `pooltime open`. Codes work once, for 5 minutes, and
   five wrong tries cancel them. Only a caller with the management key can get one
   (`POST /api/v1/session/code`); the dashboard redeems it at `POST /api/v1/session`. The Unlock
-  field is now plain text and still accepts the management key.
+  field still accepts the management key too.
 
 ### Changed
 
 - The dashboard's management session now lasts 30 days instead of ending when the browser quits,
   so a bookmarked dashboard keeps its Re-login, routing and settings controls across browser
-  restarts. `pooltime open` renews it; it stops working if the management key changes.
+  restarts. `pooltime open` renews it; it stops working if the management key changes (to end
+  every dashboard session, delete `run/mgmt.key` and run `pooltime service restart`).
 
 ### Fixed
 
