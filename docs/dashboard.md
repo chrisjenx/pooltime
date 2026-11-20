@@ -8,9 +8,24 @@ pooltime open
 ```
 
 `open` prints `http://127.0.0.1:<port>/?k=<key>` and opens it. The key (`~/.pooltime/run/mgmt.key`)
-is traded for a browser-session cookie on first load and removed from the address bar. Opened
-without the key, the page is **read-only**: it shows the status overview only, with a hint to run
-`pooltime open`. Requests whose `Host`/`Origin` is not `127.0.0.1:<port>` or `localhost:<port>` are
+is traded for a session cookie on first load and removed from the address bar. The cookie lasts 30
+days (each `pooltime open` renews it), so a bookmarked `http://127.0.0.1:<port>/` keeps managing
+across browser restarts; it stops working if the key changes. Opened without it, the page is
+**read-only**: no Re-login, routing or settings controls. Accounts that need login show the
+`pooltime accounts login <id>` command and a hint to unlock the page.
+
+To unlock a tab that is already open instead of opening a new one, run
+
+```sh
+pooltime unlock
+```
+
+and type the code it prints (e.g. `K7Q2-9XMB`) into the **Unlock** field at the top of the
+read-only page. A code works once, for 5 minutes; five wrong tries cancel it, and a new
+`pooltime unlock` replaces it. Pasting the management key itself there works too.
+
+To end every dashboard session (e.g. on a shared machine), delete `~/.pooltime/run/mgmt.key` and
+run `pooltime service restart`: the new worker makes a fresh key, and old cookies stop working. Requests whose `Host`/`Origin` is not `127.0.0.1:<port>` or `localhost:<port>` are
 refused.
 
 ![Overview](img/dashboard-overview.png)

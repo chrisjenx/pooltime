@@ -1115,6 +1115,83 @@ mod mgmt {
     }
 
     #[tokio::test]
+    async fn unlock_code_opens_a_session_once() {
+        let pool = Pool::new();
+        let srv = pool.boot(Boot::default()).await;
+
+        // Minting needs the key; no code exists yet, so a guess gets nothing.
+        let r = raw(
+            srv.addr,
+            "POST",
+            "/api/v1/session/code",
+            Some(json!({})),
+            &[],
+        )
+        .await;
+        assert_eq!(r.status, 401);
+        let r = raw(
+            srv.addr,
+            "POST",
+            "/api/v1/session",
+            Some(json!({"code": "ABCD-EFGH"})),
+            &[],
+        )
+        .await;
+        assert_eq!(r.status, 401);
+        assert!(r.header("set-cookie").is_none());
+
+        let auth = format!("Bearer {KEY}");
+        let r = raw(
+            srv.addr,
+            "POST",
+            "/api/v1/session/code",
+            Some(json!({})),
+            &[("authorization", &auth)],
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let code = r.json()["code"].as_str().unwrap().to_string();
+        assert_eq!(code.len(), 9, "{code}");
+        assert_eq!(r.json()["expires_in_secs"], 300);
+
+        // Typed loosely (lower case, no dash) it still works, once, and sets the session cookie.
+        let typed = code.replace('-', "").to_lowercase();
+        let r = raw(
+            srv.addr,
+            "POST",
+            "/api/v1/session",
+            Some(json!({"code": typed})),
+            &[],
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let set = r.header("set-cookie").expect("set-cookie").to_string();
+        assert!(set.starts_with(&format!("{SESSION_COOKIE}=")), "{set}");
+        assert!(!set.contains(KEY) && !r.text().contains(KEY));
+        let pair = set.split(';').next().unwrap().to_string();
+        let r = raw(
+            srv.addr,
+            "POST",
+            "/api/v1/tuning",
+            Some(json!({"five_hour_exp": 2.0})),
+            &[("cookie", &pair)],
+        )
+        .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+
+        let r = raw(
+            srv.addr,
+            "POST",
+            "/api/v1/session",
+            Some(json!({"code": code})),
+            &[],
+        )
+        .await;
+        assert_eq!(r.status, 401, "single use");
+        assert!(r.header("set-cookie").is_none());
+    }
+
+    #[tokio::test]
     async fn session_exchange_sets_cookie() {
         let pool = Pool::new();
         let srv = pool.boot(Boot::default()).await;
@@ -1146,6 +1223,7 @@ mod mgmt {
         assert!(set.contains("HttpOnly"), "{set}");
         assert!(set.contains("SameSite=Strict"), "{set}");
         assert!(set.contains("Path=/"), "{set}");
+        assert!(set.contains("Max-Age=2592000"), "30-day session: {set}");
         assert!(!set.contains("Secure"), "plain http on localhost: {set}");
         assert!(
             !set.contains(KEY),
@@ -2682,6 +2760,10 @@ mod mgmt {
             let html = r.text();
             assert!(html.contains(r#"data-mode="read-only""#), "{path}: {html}");
             assert!(html.contains("pooltime open"), "{path}: hint missing");
+            assert!(
+                html.contains("pooltime unlock"),
+                "{path}: unlock hint missing"
+            );
             assert!(!html.contains("wrong"), "the rejected key is not echoed");
         }
         // A stale or forged cookie is read-only too.

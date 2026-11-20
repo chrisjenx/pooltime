@@ -10,6 +10,8 @@ Rules for agents:
 - The dashboard URL that `pooltime setup` and `pooltime open` print contains the local management
   key (`?k=...`). Never repeat or quote it, and never put it in logs, commits, issues or PRs. Tell
   the user to run `pooltime open` themselves to see the dashboard.
+- `pooltime unlock` prints a one-time code that grants dashboard management for its holder. Let the
+  user run it and type the code themselves; never put it in logs, commits, issues or PRs.
 - Signing in needs the human: they open a URL in a browser and sign in. Do not try to automate it,
   and do not run sign-in commands under a short tool timeout (see step 4).
 - Only connect the Claude Code profiles the user names. Do not use `pooltime connect --all` unless
