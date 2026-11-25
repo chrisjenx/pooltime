@@ -3,7 +3,7 @@
 //! Format (stable; scripts should use `--json`):
 //!
 //! ```text
-//! pooltime 1.3.2 on 127.0.0.1:3460
+//! pooltime 1.4.0 on 127.0.0.1:3460
 //! pool 2/3 ready · 7d 77% used
 //! this week: 1.4 subs used · on pace for ~2.6 of 3
 //! ⚠ runway: At the current rate the pool runs out ~14h before the next reset (Thu 09:00)

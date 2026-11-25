@@ -124,6 +124,7 @@ otherwise.
 | `anthropic.usage_refresh` | `true`: poll usage (Claude and Codex) |
 | `anthropic.usage_ttl` | `"2m"`: how long a usage poll stays fresh (Claude and Codex) |
 | `anthropic.usage_fetch_timeout` | `"2500ms"`: usage poll timeout, at least 250 ms (Claude and Codex) |
+| `anthropic.compress_requests` | `true`: gzip request bodies of 1 KiB and up (cuts upload ~5-10x on long conversations) |
 | `openai.api_base` | `"https://chatgpt.com/backend-api/codex"` |
 | `openai.usage_url` | `"https://chatgpt.com/backend-api/wham/usage"` |
 | `openai.token_url` | `"https://auth.openai.com/oauth/token"` |
@@ -134,6 +135,10 @@ otherwise.
 | `openai.originator` | `"codex_cli_rs"` |
 | `openai.callback_ports` | `[1455, 1457]`: sign-in redirect ports; only these are registered for the client id |
 | `openai.user_agent` | `"codex-cli"` |
+| `openai.compress_requests` | `true`: zstd request bodies of 1 KiB and up, as the Codex CLI does |
+
+If an upstream ever refuses a compressed body, pooltime resends that request uncompressed and stops
+compressing for that provider until the next restart, so a change upstream never fails a request.
 
 ## Other files
 

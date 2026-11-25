@@ -155,8 +155,9 @@ pub(crate) fn method_not_allowed(allow: &'static str) -> Response {
 }
 
 /// Read and parse a JSON request body: 413 past [`BODY_LIMIT`] (a declared oversize length is
-/// refused without reading), 400 `invalid_request_error` on malformed JSON. Returns the exact
-/// bytes (forwarded unchanged upstream) and the parsed value.
+/// refused without reading, and the limit also bounds a gzip/zstd body once inflated), 415 on
+/// another `Content-Encoding`, 400 `invalid_request_error` on malformed JSON. Returns the decoded
+/// bytes (forwarded upstream, compressed again per provider) and the parsed value.
 ///
 /// hyper has no ingress idle timer here, so an accepted inference request is never cut off while
 /// it waits on an upstream; this is the point where bro disabled its timer.
@@ -211,7 +212,22 @@ pub async fn read_json_limited(
         }
         buf.extend_from_slice(&chunk);
     }
-    let bytes = Bytes::from(buf);
+    let bytes = crate::compress::decode_inbound(headers, Bytes::from(buf), limit).map_err(|e| {
+        use crate::compress::DecodeError;
+        match e {
+            DecodeError::TooLarge => too_large(),
+            DecodeError::Unsupported => anthropic_error(
+                415,
+                "invalid_request_error",
+                "pooltime: unsupported Content-Encoding (send identity, gzip or zstd)",
+            ),
+            DecodeError::Corrupt => anthropic_error(
+                400,
+                "invalid_request_error",
+                "pooltime: request body does not match its Content-Encoding",
+            ),
+        }
+    })?;
     match serde_json::from_slice::<Value>(&bytes) {
         Ok(v) => Ok((bytes, v)),
         Err(_) => Err(anthropic_error(

@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.0 - 2026-11-25
+
+### Added
+
+- Request bodies are compressed on the way upstream, cutting upload bandwidth on long
+  conversations (Claude Code resends the whole conversation every turn) by roughly 5-10x:
+  gzip to `api.anthropic.com`, zstd (level 3, as the Codex CLI sends) to the ChatGPT Codex
+  backend. Only bodies of 1 KiB and up are compressed. On by default; turn off with
+  `anthropic.compress_requests = false` / `openai.compress_requests = false`. If an upstream
+  refuses the coding (415, or a 400 naming it), the request is resent uncompressed and
+  compression stays off for that provider until restart, so no request fails because of it.
+- Clients may send `Content-Encoding: gzip` or `zstd` request bodies to pooltime; they are
+  inflated (within the usual body limit) before routing. Other codings get a 415.
+
 ## 1.3.2 - 2026-11-20
 
 ### Added

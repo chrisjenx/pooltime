@@ -242,13 +242,17 @@ impl OpenAiProvider {
         account_id: Option<&str>,
         token: &str,
     ) -> Result<UpstreamResponse, TransportKind> {
-        let request = self.build_request(body, account_id, token)?;
-        ctx.upstream.send(request, &ctx.limits).await
+        self.compression
+            .send(ctx.upstream, &ctx.limits, body, |b, enc| {
+                self.build_request(b, enc, account_id, token)
+            })
+            .await
     }
 
     fn build_request(
         &self,
-        body: &Bytes,
+        body: Bytes,
+        encoding: Option<HeaderValue>,
         account_id: Option<&str>,
         token: &str,
     ) -> Result<reqwest::Request, TransportKind> {
@@ -290,9 +294,12 @@ impl OpenAiProvider {
                 HeaderValue::from_str(a).map_err(|_| bad("stored ChatGPT account id"))?,
             );
         }
+        if let Some(enc) = encoding {
+            h.insert(http::header::CONTENT_ENCODING, enc);
+        }
         let mut r = reqwest::Request::new(reqwest::Method::POST, url);
         *r.headers_mut() = h;
-        *r.body_mut() = Some(reqwest::Body::from(body.clone()));
+        *r.body_mut() = Some(reqwest::Body::from(body));
         Ok(r)
     }
 
