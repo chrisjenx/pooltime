@@ -76,6 +76,8 @@ const HOP_BY_HOP_REQUEST: &[&str] = &[
     "trailer",
     "transfer-encoding",
     "upgrade",
+    // The inbound body was decoded on arrival; the coding sent upstream is our own choice.
+    "content-encoding",
 ];
 
 /// Never copied from an upstream response onto ours.
@@ -349,14 +351,18 @@ impl AnthropicProvider {
         token: &str,
         path: &str,
     ) -> Result<crate::upstream::UpstreamResponse, TransportKind> {
-        let request = self.build_request(req, body, token, path)?;
-        ctx.upstream.send(request, &ctx.limits).await
+        self.compression
+            .send(ctx.upstream, &ctx.limits, body, |b, enc| {
+                self.build_request(req, b, enc, token, path)
+            })
+            .await
     }
 
     fn build_request(
         &self,
         req: &InboundRequest,
-        body: &Bytes,
+        body: Bytes,
+        encoding: Option<HeaderValue>,
         token: &str,
         path: &str,
     ) -> Result<reqwest::Request, TransportKind> {
@@ -370,8 +376,12 @@ impl AnthropicProvider {
         })?;
         auth.set_sensitive(true);
         let mut r = reqwest::Request::new(reqwest::Method::POST, url);
-        *r.headers_mut() = upstream_headers(&req.headers, auth);
-        *r.body_mut() = Some(reqwest::Body::from(body.clone()));
+        let mut h = upstream_headers(&req.headers, auth);
+        if let Some(enc) = encoding {
+            h.insert(http::header::CONTENT_ENCODING, enc);
+        }
+        *r.headers_mut() = h;
+        *r.body_mut() = Some(reqwest::Body::from(body));
         Ok(r)
     }
 

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::accounts::{AccountId, Registry, StateBook};
+use crate::compress::{Codec, RequestCompression};
 use crate::config::AnthropicCfg;
 use crate::upstream::Upstream;
 
@@ -62,6 +63,8 @@ pub struct AnthropicProvider {
     catalog: catalog::CatalogCache,
     /// How long a fetched model list is served (default [`MODELS_CACHE_TTL`]).
     catalog_ttl: Duration,
+    /// gzip of large request bodies (`anthropic.compress_requests`).
+    compression: RequestCompression,
 }
 
 impl AnthropicProvider {
@@ -74,6 +77,7 @@ impl AnthropicProvider {
         up: Arc<Upstream>,
     ) -> Self {
         AnthropicProvider {
+            compression: RequestCompression::new("anthropic", Codec::Gzip, cfg.compress_requests),
             cfg,
             reg,
             state,

@@ -289,6 +289,8 @@ pub struct AnthropicCfg {
     /// Floor 250 ms.
     #[serde(with = "humantime_serde")]
     pub usage_fetch_timeout: Duration,
+    /// gzip request bodies of 1 KiB and up (see [`crate::compress`]).
+    pub compress_requests: bool,
 }
 
 impl Default for AnthropicCfg {
@@ -307,6 +309,7 @@ impl Default for AnthropicCfg {
             usage_refresh: true,
             usage_ttl: SECS(120),
             usage_fetch_timeout: Duration::from_millis(2500),
+            compress_requests: true,
         }
     }
 }
@@ -331,6 +334,8 @@ pub struct OpenAiCfg {
     /// ports only, so change them only for tests (`0` = any free port).
     pub callback_ports: Vec<u16>,
     pub user_agent: String,
+    /// zstd request bodies of 1 KiB and up, like the Codex CLI (see [`crate::compress`]).
+    pub compress_requests: bool,
 }
 
 impl Default for OpenAiCfg {
@@ -348,6 +353,7 @@ impl Default for OpenAiCfg {
             originator: "codex_cli_rs".into(),
             callback_ports: vec![1455, 1457],
             user_agent: "codex-cli".into(),
+            compress_requests: true,
         }
     }
 }

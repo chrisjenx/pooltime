@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::accounts::{AccountId, Registry, StateBook};
+use crate::compress::{Codec, RequestCompression};
 use crate::config::OpenAiCfg;
 use crate::providers::anthropic::OverloadPolicy;
 use crate::upstream::Upstream;
@@ -76,6 +77,8 @@ pub struct OpenAiProvider {
     usage_fetch_timeout: Duration,
     /// One in-flight usage poll per account within this process (see [`usage`]).
     usage_gates: Mutex<HashMap<AccountId, Arc<tokio::sync::Mutex<()>>>>,
+    /// zstd of large request bodies (`openai.compress_requests`).
+    compression: RequestCompression,
 }
 
 impl OpenAiProvider {
@@ -89,6 +92,7 @@ impl OpenAiProvider {
         up: Arc<Upstream>,
     ) -> Self {
         OpenAiProvider {
+            compression: RequestCompression::new("openai", Codec::Zstd, cfg.compress_requests),
             cfg,
             reg,
             state,

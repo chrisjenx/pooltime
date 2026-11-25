@@ -4,6 +4,7 @@
 //! timeout. Instead three bounds apply: a header-wait bound on [`Upstream::send`], a per-read idle
 //! bound on [`WatchedBody::next_chunk`], and a per-attempt deadline that caps both. Automatic
 //! decompression is off (no gzip/brotli/deflate features), so bytes are relayed exactly as sent.
+//! Request bodies may be compressed on the way out ([`crate::compress`]).
 
 use std::error::Error as StdError;
 use std::pin::Pin;
@@ -187,6 +188,15 @@ pub struct WatchedBody {
 }
 
 impl WatchedBody {
+    /// A body already read into memory (handed back after inspecting an error response).
+    pub fn from_bytes(bytes: Bytes, lim: &Limits) -> Self {
+        WatchedBody {
+            stream: Box::pin(futures_util::stream::iter([Ok(bytes)])),
+            idle: lim.idle,
+            deadline: lim.deadline,
+        }
+    }
+
     /// Next non-empty chunk, `None` at end of body.
     ///
     /// The idle timer starts when this is called (idle is per demanded read, so a slow consumer is

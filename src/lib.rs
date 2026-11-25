@@ -3,6 +3,7 @@ pub mod analytics;
 pub mod background;
 pub mod claude_code;
 pub mod cli;
+pub mod compress;
 pub mod config;
 pub mod dnswatch;
 pub mod errors;
